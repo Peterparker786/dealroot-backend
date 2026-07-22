@@ -451,7 +451,10 @@ app.post("/api/orders", async (req, res) => {
         subtotal,
       });
     }
+const deliveryFee = totalAmount >= 499 ? 0 : 49;
+totalAmount += deliveryFee;
 
+const order = await Order.create({
     const order = await Order.create({
       orderNumber: createOrderNumber(),
       customer: {
