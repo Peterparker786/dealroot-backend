@@ -50,7 +50,63 @@ const productSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+const orderSchema = new mongoose.Schema(
+  {
+    orderNumber: {
+      type: String,
+      required: true,
+      unique: true,
+      index: true,
+    },
+    customer: {
+      name: { type: String, required: true, trim: true },
+      phone: { type: String, required: true, trim: true },
+      address: { type: String, required: true, trim: true },
+      city: { type: String, required: true, trim: true },
+      pincode: { type: String, required: true, trim: true },
+    },
+    items: [
+      {
+        product: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: "Product",
+          required: true,
+        },
+        brand: { type: String, default: "" },
+        title: { type: String, required: true },
+        image: { type: String, default: "" },
+        price: { type: Number, required: true, min: 0 },
+        quantity: { type: Number, required: true, min: 1 },
+        subtotal: { type: Number, required: true, min: 0 },
+      },
+    ],
+    totalAmount: { type: Number, required: true, min: 0 },
+    deliveryType: {
+      type: String,
+      enum: ["local", "courier"],
+      default: "courier",
+    },
+    paymentMethod: {
+      type: String,
+      enum: ["cod"],
+      default: "cod",
+    },
+    paymentStatus: {
+      type: String,
+      enum: ["pending", "paid", "failed"],
+      default: "pending",
+    },
+    orderStatus: {
+      type: String,
+      enum: ["placed", "confirmed", "packed", "shipped", "delivered", "cancelled"],
+      default: "placed",
+    },
+  },
+  { timestamps: true }
+);
+
 const Product = mongoose.model("Product", productSchema);
+const Order = mongoose.model("Order", orderSchema);
 
 const sanitizeMarketplaceLinks = (links) => {
   if (!Array.isArray(links)) return [];
@@ -119,6 +175,11 @@ const validateProduct = (product) => {
   return null;
 };
 
+const createOrderNumber = () => {
+  const randomPart = Math.floor(1000 + Math.random() * 9000);
+  return `DR-${Date.now()}-${randomPart}`;
+};
+
 app.get("/", (req, res) => {
   res.json({
     success: true,
@@ -158,7 +219,7 @@ app.get("/api/products", async (req, res) => {
       count: products.length,
       products,
     });
-  } catch (error) {
+  } catch {
     res.status(500).json({
       success: false,
       message: "Could not load products",
@@ -300,6 +361,189 @@ app.patch("/api/products/:id/stock", async (req, res) => {
     res.status(400).json({
       success: false,
       message: "Could not update stock",
+    });
+  }
+});
+
+/* ───────────── ORDERS / CHECKOUT ───────────── */
+
+app.post("/api/orders", async (req, res) => {
+  const reducedProducts = [];
+
+  try {
+    const { customer, items, deliveryType, paymentMethod } = req.body;
+
+    const name = String(customer?.name || "").trim();
+    const phone = String(customer?.phone || "").replace(/\D/g, "");
+    const address = String(customer?.address || "").trim();
+    const city = String(customer?.city || "").trim();
+    const pincode = String(customer?.pincode || "").replace(/\D/g, "");
+
+    if (!name || !address || !city || phone.length !== 10 || pincode.length !== 6) {
+      return res.status(400).json({
+        success: false,
+        message: "Please enter valid delivery details",
+      });
+    }
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Your cart is empty",
+      });
+    }
+
+    if (paymentMethod && paymentMethod !== "cod") {
+      return res.status(400).json({
+        success: false,
+        message: "Online payment is not available yet. Please choose Cash on Delivery.",
+      });
+    }
+
+    const orderItems = [];
+    let totalAmount = 0;
+
+    for (const item of items) {
+      const productId = item?.productId;
+      const quantity = Number(item?.quantity);
+
+      if (
+        !mongoose.Types.ObjectId.isValid(productId) ||
+        !Number.isInteger(quantity) ||
+        quantity < 1
+      ) {
+        throw new Error("Invalid product or quantity in cart");
+      }
+
+      // Stock is reduced only if enough stock is available.
+      const product = await Product.findOneAndUpdate(
+        { _id: productId, stock: { $gte: quantity } },
+        { $inc: { stock: -quantity } },
+        { new: true }
+      );
+
+      if (!product) {
+        const existingProduct = await Product.findById(productId);
+
+        if (!existingProduct) {
+          throw new Error("One of the products is no longer available");
+        }
+
+        throw new Error(`${existingProduct.title} does not have enough stock`);
+      }
+
+      reducedProducts.push({ productId, quantity });
+
+      const subtotal = product.price * quantity;
+      totalAmount += subtotal;
+
+      orderItems.push({
+        product: product._id,
+        brand: product.brand,
+        title: product.title,
+        image: product.image,
+        price: product.price,
+        quantity,
+        subtotal,
+      });
+    }
+
+    const order = await Order.create({
+      orderNumber: createOrderNumber(),
+      customer: {
+        name,
+        phone,
+        address,
+        city,
+        pincode,
+      },
+      items: orderItems,
+      totalAmount,
+      deliveryType: deliveryType === "local" ? "local" : "courier",
+      paymentMethod: "cod",
+      paymentStatus: "pending",
+      orderStatus: "placed",
+    });
+
+    res.status(201).json({
+      success: true,
+      message: "Your order has been placed successfully",
+      order,
+    });
+  } catch (error) {
+    // If order creation fails after stock was reduced, restore the stock.
+    for (const item of reducedProducts) {
+      await Product.findByIdAndUpdate(item.productId, {
+        $inc: { stock: item.quantity },
+      });
+    }
+
+    res.status(400).json({
+      success: false,
+      message: error.message || "Could not place your order",
+    });
+  }
+});
+
+app.get("/api/orders", async (req, res) => {
+  try {
+    const orders = await Order.find().sort({ createdAt: -1 });
+
+    res.json({
+      success: true,
+      count: orders.length,
+      orders,
+    });
+  } catch {
+    res.status(500).json({
+      success: false,
+      message: "Could not load orders",
+    });
+  }
+});
+
+app.patch("/api/orders/:id/status", async (req, res) => {
+  try {
+    const allowedStatuses = [
+      "placed",
+      "confirmed",
+      "packed",
+      "shipped",
+      "delivered",
+      "cancelled",
+    ];
+
+    const { orderStatus } = req.body;
+
+    if (!allowedStatuses.includes(orderStatus)) {
+      return res.status(400).json({
+        success: false,
+        message: "Please choose a valid order status",
+      });
+    }
+
+    const order = await Order.findByIdAndUpdate(
+      req.params.id,
+      { orderStatus },
+      { new: true, runValidators: true }
+    );
+
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Order status updated successfully",
+      order,
+    });
+  } catch {
+    res.status(400).json({
+      success: false,
+      message: "Could not update order status",
     });
   }
 });
