@@ -80,7 +80,9 @@ const orderSchema = new mongoose.Schema(
         subtotal: { type: Number, required: true, min: 0 },
       },
     ],
-    totalAmount: { type: Number, required: true, min: 0 },
+    deliveryFee: { type: Number, default: 0, min: 0 },
+totalAmount: { type: Number, required: true, min: 0 },
+totalAmount: { type: Number, required: true, min: 0 },
     deliveryType: {
       type: String,
       enum: ["local", "courier"],
@@ -258,7 +260,9 @@ app.post("/api/products", async (req, res) => {
       });
     }
 
-    const product = await Product.create({
+    const deliveryFee = totalAmount >= 499 ? 0 : 49;
+totalAmount += deliveryFee;
+const product = await Product.create({
       ...req.body,
       price: Number(req.body.price),
       mrp: Number(req.body.mrp),
@@ -458,6 +462,7 @@ app.post("/api/orders", async (req, res) => {
         pincode,
       },
       items: orderItems,
+      deliveryFee,
       totalAmount,
       deliveryType: deliveryType === "local" ? "local" : "courier",
       paymentMethod: "cod",
