@@ -82,7 +82,6 @@ const orderSchema = new mongoose.Schema(
     ],
     deliveryFee: { type: Number, default: 0, min: 0 },
 totalAmount: { type: Number, required: true, min: 0 },
-totalAmount: { type: Number, required: true, min: 0 },
     deliveryType: {
       type: String,
       enum: ["local", "courier"],
@@ -455,23 +454,22 @@ const deliveryFee = totalAmount >= 499 ? 0 : 49;
 totalAmount += deliveryFee;
 
 const order = await Order.create({
-    const order = await Order.create({
-      orderNumber: createOrderNumber(),
-      customer: {
-        name,
-        phone,
-        address,
-        city,
-        pincode,
-      },
-      items: orderItems,
-      deliveryFee,
-      totalAmount,
-      deliveryType: deliveryType === "local" ? "local" : "courier",
-      paymentMethod: "cod",
-      paymentStatus: "pending",
-      orderStatus: "placed",
-    });
+  orderNumber: createOrderNumber(),
+  customer: {
+    name,
+    phone,
+    address,
+    city,
+    pincode,
+  },
+  items: orderItems,
+  deliveryFee,
+  totalAmount,
+  deliveryType: deliveryType === "local" ? "local" : "courier",
+  paymentMethod: "cod",
+  paymentStatus: "pending",
+  orderStatus: "placed",
+});
 
     res.status(201).json({
       success: true,
