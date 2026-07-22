@@ -1,18 +1,50 @@
 require("dotenv").config();
 
+const crypto = require("crypto");
 const express = require("express");
 const cors = require("cors");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const clientUrl = process.env.CLIENT_URL || "http://localhost:5173";
+const jwtSecret = process.env.JWT_SECRET;
 
+if (
+  !process.env.MONGODB_URI ||
+  !jwtSecret ||
+  !process.env.ADMIN_EMAIL ||
+  !process.env.ADMIN_PASSWORD_HASH
+) {
+  throw new Error(
+    "Missing MONGODB_URI, JWT_SECRET, ADMIN_EMAIL, or ADMIN_PASSWORD_HASH environment variable"
+  );
+}
+
+app.set("trust proxy", 1);
+app.use(helmet());
 app.use(
   cors({
-    origin: process.env.CLIENT_URL || "http://localhost:5173",
+    origin: clientUrl,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
   })
 );
-app.use(express.json());
+app.use(express.json({ limit: "100kb" }));
+
+const adminLoginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: "Too many login attempts. Please try again after 15 minutes.",
+  },
+});
 
 const allowedCategories = [
   "Skincare",
@@ -20,6 +52,15 @@ const allowedCategories = [
   "Haircare",
   "Fragrance",
   "Bath & Body",
+];
+
+const orderStatuses = [
+  "placed",
+  "confirmed",
+  "packed",
+  "shipped",
+  "delivered",
+  "cancelled",
 ];
 
 const productSchema = new mongoose.Schema(
@@ -81,7 +122,7 @@ const orderSchema = new mongoose.Schema(
       },
     ],
     deliveryFee: { type: Number, default: 0, min: 0 },
-totalAmount: { type: Number, required: true, min: 0 },
+    totalAmount: { type: Number, required: true, min: 0 },
     deliveryType: {
       type: String,
       enum: ["local", "courier"],
@@ -89,25 +130,49 @@ totalAmount: { type: Number, required: true, min: 0 },
     },
     paymentMethod: {
       type: String,
-      enum: ["cod"],
+      enum: ["cod", "razorpay"],
       default: "cod",
     },
     paymentStatus: {
       type: String,
-      enum: ["pending", "paid", "failed"],
+      enum: ["pending", "paid", "failed", "refunded"],
       default: "pending",
     },
     orderStatus: {
       type: String,
-      enum: ["placed", "confirmed", "packed", "shipped", "delivered", "cancelled"],
+      enum: orderStatuses,
       default: "placed",
     },
+    stockRestored: { type: Boolean, default: false },
+    cancelledAt: { type: Date, default: null },
   },
   { timestamps: true }
 );
 
 const Product = mongoose.model("Product", productSchema);
 const Order = mongoose.model("Order", orderSchema);
+
+const requireAdmin = (req, res, next) => {
+  const token = req.headers.authorization?.startsWith("Bearer ")
+    ? req.headers.authorization.slice(7)
+    : "";
+
+  try {
+    const payload = jwt.verify(token, jwtSecret);
+
+    if (payload.role !== "admin") {
+      throw new Error("Invalid role");
+    }
+
+    req.admin = payload;
+    next();
+  } catch {
+    res.status(401).json({
+      success: false,
+      message: "Please log in as an admin.",
+    });
+  }
+};
 
 const sanitizeMarketplaceLinks = (links) => {
   if (!Array.isArray(links)) return [];
@@ -117,46 +182,11 @@ const sanitizeMarketplaceLinks = (links) => {
       platform: String(link?.platform || "").trim(),
       url: String(link?.url || "").trim(),
     }))
-    .filter(({ platform, url }) => platform && url)
+    .filter(({ platform, url }) => platform && /^https:\/\//i.test(url))
     .slice(0, 3);
 };
 
-const starterProducts = [
-  {
-    brand: "Minimalist",
-    title: "2% Hyaluronic Acid Face Serum",
-    description: "Hydrating serum for soft and healthy-looking skin.",
-    category: "Skincare",
-    price: 399,
-    mrp: 599,
-    rating: 4.7,
-    reviews: 1840,
-    image:
-      "https://images.unsplash.com/photo-1620916566398-39f1143ab7be?auto=format&fit=crop&w=700&q=85",
-    badge: "Bestseller",
-    stock: 30,
-    isFeatured: true,
-  },
-  {
-    brand: "Maybelline",
-    title: "Fit Me Matte + Poreless Foundation",
-    description: "Lightweight matte foundation with a natural finish.",
-    category: "Makeup",
-    price: 499,
-    mrp: 649,
-    rating: 4.6,
-    reviews: 2300,
-    image:
-      "https://images.unsplash.com/photo-1522335789203-aabd1fc54bc9?auto=format&fit=crop&w=700&q=85",
-    badge: "Top deal",
-    stock: 25,
-    isFeatured: true,
-  },
-];
-
-const validateProduct = (product) => {
-  const { brand, title, category, price, mrp } = product;
-
+const validateProduct = ({ brand, title, category, price, mrp }) => {
   if (!brand || !title || !category || price === "" || mrp === "") {
     return "Brand, title, category, price and MRP are required";
   }
@@ -165,8 +195,13 @@ const validateProduct = (product) => {
     return "Please choose a valid category";
   }
 
-  if (Number(price) < 0 || Number(mrp) < 0) {
-    return "Price and MRP cannot be negative";
+  if (
+    !Number.isFinite(Number(price)) ||
+    !Number.isFinite(Number(mrp)) ||
+    Number(price) < 0 ||
+    Number(mrp) < 0
+  ) {
+    return "Price and MRP must be valid positive numbers";
   }
 
   if (Number(mrp) < Number(price)) {
@@ -176,10 +211,19 @@ const validateProduct = (product) => {
   return null;
 };
 
-const createOrderNumber = () => {
-  const randomPart = Math.floor(1000 + Math.random() * 9000);
-  return `DR-${Date.now()}-${randomPart}`;
-};
+const productPayload = (body) => ({
+  ...body,
+  price: Number(body.price),
+  mrp: Number(body.mrp),
+  rating: Number(body.rating || 4.5),
+  reviews: Number(body.reviews || 0),
+  stock: Number(body.stock || 0),
+  isFeatured: Boolean(body.isFeatured),
+  marketplaceLinks: sanitizeMarketplaceLinks(body.marketplaceLinks),
+});
+
+const createOrderNumber = () =>
+  `DR-${Date.now()}-${crypto.randomInt(1000, 10000)}`;
 
 app.get("/", (req, res) => {
   res.json({
@@ -197,20 +241,65 @@ app.get("/api/health", (req, res) => {
   });
 });
 
+app.post("/api/admin/login", adminLoginLimiter, async (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const password = String(req.body?.password || "");
+
+  const normaliseForComparison = (value) =>
+    Buffer.from(String(value).slice(0, 256).padEnd(256));
+
+  const isCorrectEmail = crypto.timingSafeEqual(
+    normaliseForComparison(email),
+    normaliseForComparison(
+      String(process.env.ADMIN_EMAIL).toLowerCase()
+    )
+  );
+
+  const isCorrectPassword = await bcrypt.compare(
+    password,
+    process.env.ADMIN_PASSWORD_HASH
+  );
+
+  if (!isCorrectEmail || !isCorrectPassword) {
+    return res.status(401).json({
+      success: false,
+      message: "Invalid email or password",
+    });
+  }
+
+  const token = jwt.sign(
+    { role: "admin", email },
+    jwtSecret,
+    { expiresIn: "8h" }
+  );
+
+  res.json({
+    success: true,
+    token,
+    admin: { email },
+  });
+});
+
 app.get("/api/products", async (req, res) => {
   try {
     const { category, search, featured } = req.query;
     const filter = {};
 
-    if (category && category !== "All") filter.category = category;
-    if (featured === "true") filter.isFeatured = true;
+    if (category && category !== "All") {
+      filter.category = category;
+    }
+
+    if (featured === "true") {
+      filter.isFeatured = true;
+    }
 
     if (search) {
-      filter.$or = [
-        { title: { $regex: search, $options: "i" } },
-        { brand: { $regex: search, $options: "i" } },
-        { category: { $regex: search, $options: "i" } },
-      ];
+      filter.$or = ["title", "brand", "category"].map((key) => ({
+        [key]: {
+          $regex: String(search),
+          $options: "i",
+        },
+      }));
     }
 
     const products = await Product.find(filter).sort({ createdAt: -1 });
@@ -248,29 +337,18 @@ app.get("/api/products/:id", async (req, res) => {
   }
 });
 
-app.post("/api/products", async (req, res) => {
+app.post("/api/products", requireAdmin, async (req, res) => {
   try {
-    const validationError = validateProduct(req.body);
+    const error = validateProduct(req.body);
 
-    if (validationError) {
+    if (error) {
       return res.status(400).json({
         success: false,
-        message: validationError,
+        message: error,
       });
     }
 
-    const deliveryFee = totalAmount >= 499 ? 0 : 49;
-totalAmount += deliveryFee;
-const product = await Product.create({
-      ...req.body,
-      price: Number(req.body.price),
-      mrp: Number(req.body.mrp),
-      rating: Number(req.body.rating || 4.5),
-      reviews: Number(req.body.reviews || 0),
-      stock: Number(req.body.stock || 0),
-      isFeatured: Boolean(req.body.isFeatured),
-      marketplaceLinks: sanitizeMarketplaceLinks(req.body.marketplaceLinks),
-    });
+    const product = await Product.create(productPayload(req.body));
 
     res.status(201).json({
       success: true,
@@ -285,29 +363,20 @@ const product = await Product.create({
   }
 });
 
-app.put("/api/products/:id", async (req, res) => {
+app.put("/api/products/:id", requireAdmin, async (req, res) => {
   try {
-    const validationError = validateProduct(req.body);
+    const error = validateProduct(req.body);
 
-    if (validationError) {
+    if (error) {
       return res.status(400).json({
         success: false,
-        message: validationError,
+        message: error,
       });
     }
 
     const product = await Product.findByIdAndUpdate(
       req.params.id,
-      {
-        ...req.body,
-        price: Number(req.body.price),
-        mrp: Number(req.body.mrp),
-        rating: Number(req.body.rating || 4.5),
-        reviews: Number(req.body.reviews || 0),
-        stock: Number(req.body.stock || 0),
-        isFeatured: Boolean(req.body.isFeatured),
-        marketplaceLinks: sanitizeMarketplaceLinks(req.body.marketplaceLinks),
-      },
+      productPayload(req.body),
       { new: true, runValidators: true }
     );
 
@@ -331,14 +400,14 @@ app.put("/api/products/:id", async (req, res) => {
   }
 });
 
-app.patch("/api/products/:id/stock", async (req, res) => {
+app.patch("/api/products/:id/stock", requireAdmin, async (req, res) => {
   try {
     const stock = Number(req.body.stock);
 
-    if (!Number.isFinite(stock) || stock < 0) {
+    if (!Number.isInteger(stock) || stock < 0) {
       return res.status(400).json({
         success: false,
-        message: "Stock must be a valid positive number",
+        message: "Stock must be a whole positive number",
       });
     }
 
@@ -368,108 +437,128 @@ app.patch("/api/products/:id/stock", async (req, res) => {
   }
 });
 
-/* ───────────── ORDERS / CHECKOUT ───────────── */
+app.delete("/api/products/:id", requireAdmin, async (req, res) => {
+  try {
+    const product = await Product.findByIdAndDelete(req.params.id);
+
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        message: "Product not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Product deleted successfully",
+    });
+  } catch {
+    res.status(400).json({
+      success: false,
+      message: "Could not delete product",
+    });
+  }
+});
 
 app.post("/api/orders", async (req, res) => {
-  const reducedProducts = [];
+  const session = await mongoose.startSession();
 
   try {
     const { customer, items, deliveryType, paymentMethod } = req.body;
 
-    const name = String(customer?.name || "").trim();
-    const phone = String(customer?.phone || "").replace(/\D/g, "");
-    const address = String(customer?.address || "").trim();
-    const city = String(customer?.city || "").trim();
-    const pincode = String(customer?.pincode || "").replace(/\D/g, "");
+    const cleanCustomer = {
+      name: String(customer?.name || "").trim(),
+      phone: String(customer?.phone || "").replace(/\D/g, ""),
+      address: String(customer?.address || "").trim(),
+      city: String(customer?.city || "").trim(),
+      pincode: String(customer?.pincode || "").replace(/\D/g, ""),
+    };
 
-    if (!name || !address || !city || phone.length !== 10 || pincode.length !== 6) {
-      return res.status(400).json({
-        success: false,
-        message: "Please enter valid delivery details",
-      });
+    if (
+      !cleanCustomer.name ||
+      !cleanCustomer.address ||
+      !cleanCustomer.city ||
+      cleanCustomer.phone.length !== 10 ||
+      cleanCustomer.pincode.length !== 6
+    ) {
+      throw new Error("Please enter valid delivery details");
     }
 
-    if (!Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Your cart is empty",
-      });
+    if (!Array.isArray(items) || !items.length) {
+      throw new Error("Your cart is empty");
     }
 
     if (paymentMethod && paymentMethod !== "cod") {
-      return res.status(400).json({
-        success: false,
-        message: "Online payment is not available yet. Please choose Cash on Delivery.",
-      });
+      throw new Error(
+        "Online payment is not available yet. Please choose Cash on Delivery."
+      );
     }
 
-    const orderItems = [];
-    let totalAmount = 0;
+    let order;
 
-    for (const item of items) {
-      const productId = item?.productId;
-      const quantity = Number(item?.quantity);
+    await session.withTransaction(async () => {
+      const orderItems = [];
+      let subtotal = 0;
 
-      if (
-        !mongoose.Types.ObjectId.isValid(productId) ||
-        !Number.isInteger(quantity) ||
-        quantity < 1
-      ) {
-        throw new Error("Invalid product or quantity in cart");
-      }
+      for (const item of items) {
+        const productId = item?.productId;
+        const quantity = Number(item?.quantity);
 
-      // Stock is reduced only if enough stock is available.
-      const product = await Product.findOneAndUpdate(
-        { _id: productId, stock: { $gte: quantity } },
-        { $inc: { stock: -quantity } },
-        { new: true }
-      );
-
-      if (!product) {
-        const existingProduct = await Product.findById(productId);
-
-        if (!existingProduct) {
-          throw new Error("One of the products is no longer available");
+        if (
+          !mongoose.Types.ObjectId.isValid(productId) ||
+          !Number.isInteger(quantity) ||
+          quantity < 1
+        ) {
+          throw new Error("Invalid product or quantity in cart");
         }
 
-        throw new Error(`${existingProduct.title} does not have enough stock`);
+        const product = await Product.findOneAndUpdate(
+          {
+            _id: productId,
+            stock: { $gte: quantity },
+          },
+          { $inc: { stock: -quantity } },
+          { new: true, session }
+        );
+
+        if (!product) {
+          throw new Error(
+            "A product is unavailable or does not have enough stock"
+          );
+        }
+
+        const lineTotal = product.price * quantity;
+        subtotal += lineTotal;
+
+        orderItems.push({
+          product: product._id,
+          brand: product.brand,
+          title: product.title,
+          image: product.image,
+          price: product.price,
+          quantity,
+          subtotal: lineTotal,
+        });
       }
 
-      reducedProducts.push({ productId, quantity });
+      const deliveryFee = subtotal >= 499 ? 0 : 49;
 
-      const subtotal = product.price * quantity;
-      totalAmount += subtotal;
-
-      orderItems.push({
-        product: product._id,
-        brand: product.brand,
-        title: product.title,
-        image: product.image,
-        price: product.price,
-        quantity,
-        subtotal,
-      });
-    }
-const deliveryFee = totalAmount >= 499 ? 0 : 49;
-totalAmount += deliveryFee;
-
-const order = await Order.create({
-  orderNumber: createOrderNumber(),
-  customer: {
-    name,
-    phone,
-    address,
-    city,
-    pincode,
-  },
-  items: orderItems,
-  deliveryFee,
-  totalAmount,
-  deliveryType: deliveryType === "local" ? "local" : "courier",
-  paymentMethod: "cod",
-  paymentStatus: "pending",
-  orderStatus: "placed",
-});
+      [order] = await Order.create(
+        [
+          {
+            orderNumber: createOrderNumber(),
+            customer: cleanCustomer,
+            items: orderItems,
+            deliveryFee,
+            totalAmount: subtotal + deliveryFee,
+            deliveryType:
+              deliveryType === "local" ? "local" : "courier",
+            paymentMethod: "cod",
+          },
+        ],
+        { session }
+      );
+    });
 
     res.status(201).json({
       success: true,
@@ -477,21 +566,16 @@ const order = await Order.create({
       order,
     });
   } catch (error) {
-    // If order creation fails after stock was reduced, restore the stock.
-    for (const item of reducedProducts) {
-      await Product.findByIdAndUpdate(item.productId, {
-        $inc: { stock: item.quantity },
-      });
-    }
-
     res.status(400).json({
       success: false,
       message: error.message || "Could not place your order",
     });
+  } finally {
+    await session.endSession();
   }
 });
 
-app.get("/api/orders", async (req, res) => {
+app.get("/api/orders", requireAdmin, async (req, res) => {
   try {
     const orders = await Order.find().sort({ createdAt: -1 });
 
@@ -508,23 +592,21 @@ app.get("/api/orders", async (req, res) => {
   }
 });
 
-app.patch("/api/orders/:id/status", async (req, res) => {
+app.patch("/api/orders/:id/status", requireAdmin, async (req, res) => {
   try {
-    const allowedStatuses = [
-      "placed",
-      "confirmed",
-      "packed",
-      "shipped",
-      "delivered",
-      "cancelled",
-    ];
-
     const { orderStatus } = req.body;
 
-    if (!allowedStatuses.includes(orderStatus)) {
+    if (!orderStatuses.includes(orderStatus)) {
       return res.status(400).json({
         success: false,
         message: "Please choose a valid order status",
+      });
+    }
+
+    if (orderStatus === "cancelled") {
+      return res.status(400).json({
+        success: false,
+        message: "Use the cancel order action instead",
       });
     }
 
@@ -554,47 +636,66 @@ app.patch("/api/orders/:id/status", async (req, res) => {
   }
 });
 
-app.delete("/api/products/:id", async (req, res) => {
-  try {
-    const product = await Product.findByIdAndDelete(req.params.id);
+app.post("/api/orders/:id/cancel", requireAdmin, async (req, res) => {
+  const session = await mongoose.startSession();
 
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        message: "Product not found",
-      });
-    }
+  try {
+    let order;
+
+    await session.withTransaction(async () => {
+      order = await Order.findOne({ _id: req.params.id }).session(session);
+
+      if (!order) {
+        throw new Error("Order not found");
+      }
+
+      if (order.orderStatus === "cancelled") {
+        throw new Error("This order has already been cancelled");
+      }
+
+      if (["shipped", "delivered"].includes(order.orderStatus)) {
+        throw new Error(
+          "A shipped or delivered order cannot be cancelled from admin"
+        );
+      }
+
+      for (const item of order.items) {
+        await Product.findByIdAndUpdate(
+          item.product,
+          { $inc: { stock: item.quantity } },
+          { session }
+        );
+      }
+
+      order.orderStatus = "cancelled";
+      order.stockRestored = true;
+      order.cancelledAt = new Date();
+
+      await order.save({ session });
+    });
 
     res.json({
       success: true,
-      message: "Product deleted successfully",
+      message: "Order cancelled and stock restored",
+      order,
     });
-  } catch {
+  } catch (error) {
     res.status(400).json({
       success: false,
-      message: "Could not delete product",
+      message: error.message || "Could not cancel order",
     });
+  } finally {
+    await session.endSession();
   }
 });
-
-const seedProducts = async () => {
-  const count = await Product.countDocuments();
-
-  if (count === 0) {
-    await Product.insertMany(starterProducts);
-    console.log("Starter products added to MongoDB");
-  }
-};
 
 const startServer = async () => {
   try {
     await mongoose.connect(process.env.MONGODB_URI);
     console.log("MongoDB connected");
 
-    await seedProducts();
-
     app.listen(PORT, () => {
-      console.log(`DEALROOT backend running on http://localhost:${PORT}`);
+      console.log(`DEALROOT backend running on ${PORT}`);
     });
   } catch (error) {
     console.error("Server startup failed:", error.message);
