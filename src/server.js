@@ -10,8 +10,8 @@ const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
 
 const app = express();
-
 const PORT = process.env.PORT || 5000;
+const clientUrl = process.env.CLIENT_URL || "http://localhost:5173";
 const jwtSecret = process.env.JWT_SECRET;
 
 if (
@@ -25,32 +25,14 @@ if (
   );
 }
 
-/* -------------------- Middleware -------------------- */
-
-const allowedOrigins = [
-  "http://localhost:5173",
-  "https://dealroot-shopping.vercel.app",
-  process.env.CLIENT_URL,
-].filter(Boolean);
-
 app.set("trust proxy", 1);
-
 app.use(helmet());
-
 app.use(
   cors({
-    origin(origin, callback) {
-      if (!origin || allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
-
-      return callback(new Error("Not allowed by CORS"));
-    },
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
+    origin: clientUrl,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
   })
 );
-
 app.use(express.json({ limit: "100kb" }));
 
 const adminLoginLimiter = rateLimit({
@@ -60,8 +42,7 @@ const adminLoginLimiter = rateLimit({
   legacyHeaders: false,
   message: {
     success: false,
-    message:
-      "Too many login attempts. Please try again after 15 minutes.",
+    message: "Too many login attempts. Please try again after 15 minutes.",
   },
 });
 
@@ -76,8 +57,6 @@ const customerAuthLimiter = rateLimit({
   },
 });
 
-/* -------------------- Constants -------------------- */
-
 const allowedCategories = [
   "Skincare",
   "Makeup",
@@ -85,6 +64,8 @@ const allowedCategories = [
   "Fragrance",
   "Bath & Body",
 ];
+
+const allowedDealTypes = ["none", "99", "199"];
 
 const orderStatuses = [
   "placed",
@@ -95,96 +76,38 @@ const orderStatuses = [
   "cancelled",
 ];
 
-/* -------------------- Schemas -------------------- */
-
 const productSchema = new mongoose.Schema(
   {
-    brand: {
-      type: String,
-      required: true,
-      trim: true,
-    },
-
-    title: {
-      type: String,
-      required: true,
-      trim: true,
-    },
-
-    description: {
-      type: String,
-      default: "",
-    },
-
+    brand: { type: String, required: true, trim: true },
+    title: { type: String, required: true, trim: true },
+    description: { type: String, default: "" },
     category: {
       type: String,
       required: true,
       enum: allowedCategories,
     },
-
-    price: {
-      type: Number,
-      required: true,
-      min: 0,
-    },
-
-    mrp: {
-      type: Number,
-      required: true,
-      min: 0,
-    },
-
-    rating: {
-      type: Number,
-      default: 4.5,
-      min: 0,
-      max: 5,
-    },
-
-    reviews: {
-      type: Number,
-      default: 0,
-      min: 0,
-    },
-
-    image: {
+    price: { type: Number, required: true, min: 0 },
+    mrp: { type: Number, required: true, min: 0 },
+    rating: { type: Number, default: 4.5, min: 0, max: 5 },
+    reviews: { type: Number, default: 0, min: 0 },
+    image: { type: String, default: "" },
+    badge: { type: String, default: "" },
+    stock: { type: Number, default: 20, min: 0 },
+    isFeatured: { type: Boolean, default: false },
+    dealType: {
       type: String,
-      default: "",
+      enum: allowedDealTypes,
+      default: "none",
+      index: true,
     },
-
-    badge: {
-      type: String,
-      default: "",
-    },
-
-    stock: {
-      type: Number,
-      default: 20,
-      min: 0,
-    },
-
-    isFeatured: {
-      type: Boolean,
-      default: false,
-    },
-
     marketplaceLinks: [
       {
-        platform: {
-          type: String,
-          trim: true,
-        },
-
-        url: {
-          type: String,
-          trim: true,
-        },
+        platform: { type: String, trim: true },
+        url: { type: String, trim: true },
       },
     ],
   },
-  {
-    timestamps: true,
-  }
+  { timestamps: true }
 );
 
 const orderSchema = new mongoose.Schema(
@@ -195,46 +118,19 @@ const orderSchema = new mongoose.Schema(
       default: null,
       index: true,
     },
-
     orderNumber: {
       type: String,
       required: true,
       unique: true,
       index: true,
     },
-
     customer: {
-      name: {
-        type: String,
-        required: true,
-        trim: true,
-      },
-
-      phone: {
-        type: String,
-        required: true,
-        trim: true,
-      },
-
-      address: {
-        type: String,
-        required: true,
-        trim: true,
-      },
-
-      city: {
-        type: String,
-        required: true,
-        trim: true,
-      },
-
-      pincode: {
-        type: String,
-        required: true,
-        trim: true,
-      },
+      name: { type: String, required: true, trim: true },
+      phone: { type: String, required: true, trim: true },
+      address: { type: String, required: true, trim: true },
+      city: { type: String, required: true, trim: true },
+      pincode: { type: String, required: true, trim: true },
     },
-
     items: [
       {
         product: {
@@ -242,102 +138,52 @@ const orderSchema = new mongoose.Schema(
           ref: "Product",
           required: true,
         },
-
-        brand: {
-          type: String,
-          default: "",
-        },
-
-        title: {
-          type: String,
-          required: true,
-        },
-
-        image: {
-          type: String,
-          default: "",
-        },
-
-        price: {
-          type: Number,
-          required: true,
-          min: 0,
-        },
-
-        quantity: {
-          type: Number,
-          required: true,
-          min: 1,
-        },
-
-        subtotal: {
-          type: Number,
-          required: true,
-          min: 0,
-        },
+        brand: { type: String, default: "" },
+        title: { type: String, required: true },
+        image: { type: String, default: "" },
+        price: { type: Number, required: true, min: 0 },
+        quantity: { type: Number, required: true, min: 1 },
+        subtotal: { type: Number, required: true, min: 0 },
       },
     ],
-
-    deliveryFee: {
-      type: Number,
-      default: 0,
-      min: 0,
+    deliveryFee: { type: Number, default: 0, min: 0 },
+    couponCode: {
+      type: String,
+      default: "",
+      trim: true,
+      uppercase: true,
     },
-
-    totalAmount: {
-      type: Number,
-      required: true,
-      min: 0,
-    },
-
+    discountAmount: { type: Number, default: 0, min: 0 },
+    totalAmount: { type: Number, required: true, min: 0 },
     deliveryType: {
       type: String,
       enum: ["local", "courier"],
       default: "courier",
     },
-
     paymentMethod: {
       type: String,
       enum: ["cod", "razorpay"],
       default: "cod",
     },
-
     paymentStatus: {
       type: String,
       enum: ["pending", "paid", "failed", "refunded"],
       default: "pending",
     },
-
     orderStatus: {
       type: String,
       enum: orderStatuses,
       default: "placed",
     },
-
-    stockRestored: {
-      type: Boolean,
-      default: false,
-    },
-
-    cancelledAt: {
-      type: Date,
-      default: null,
-    },
+    stockRestored: { type: Boolean, default: false },
+    cancelledAt: { type: Date, default: null },
   },
-  {
-    timestamps: true,
-  }
+  { timestamps: true }
 );
 
 const userSchema = new mongoose.Schema(
   {
-    name: {
-      type: String,
-      required: true,
-      trim: true,
-      maxlength: 80,
-    },
-
+    name: { type: String, required: true, trim: true, maxlength: 80 },
     email: {
       type: String,
       required: true,
@@ -346,57 +192,23 @@ const userSchema = new mongoose.Schema(
       trim: true,
       index: true,
     },
-
-    passwordHash: {
-      type: String,
-      required: true,
-      select: false,
-    },
-
-    phone: {
-      type: String,
-      default: "",
-      trim: true,
-    },
-
-    address: {
-      type: String,
-      default: "",
-      trim: true,
-    },
-
-    city: {
-      type: String,
-      default: "Kanpur",
-      trim: true,
-    },
-
-    pincode: {
-      type: String,
-      default: "",
-      trim: true,
-    },
+    passwordHash: { type: String, required: true, select: false },
+    phone: { type: String, default: "", trim: true },
+    address: { type: String, default: "", trim: true },
+    city: { type: String, default: "Kanpur", trim: true },
+    pincode: { type: String, default: "", trim: true },
   },
-  {
-    timestamps: true,
-  }
+  { timestamps: true }
 );
-
-/* -------------------- Models -------------------- */
 
 const Product = mongoose.model("Product", productSchema);
 const Order = mongoose.model("Order", orderSchema);
 const User = mongoose.model("User", userSchema);
 
-/* -------------------- Authentication Helpers -------------------- */
-
-const readBearerToken = (req) => {
-  if (!req.headers.authorization?.startsWith("Bearer ")) {
-    return "";
-  }
-
-  return req.headers.authorization.slice(7);
-};
+const readBearerToken = (req) =>
+  req.headers.authorization?.startsWith("Bearer ")
+    ? req.headers.authorization.slice(7)
+    : "";
 
 const publicUser = (user) => ({
   id: user._id,
@@ -446,16 +258,13 @@ const requireUser = (req, res, next) => {
   }
 };
 
-const optionalUser = (req, res, next) => {
+const optionalUser = (req, _res, next) => {
   const token = readBearerToken(req);
 
   if (token) {
     try {
       const payload = jwt.verify(token, jwtSecret);
-
-      if (payload.role === "user" && payload.userId) {
-        req.user = payload;
-      }
+      if (payload.role === "user" && payload.userId) req.user = payload;
     } catch {
       req.user = null;
     }
@@ -464,22 +273,15 @@ const optionalUser = (req, res, next) => {
   next();
 };
 
-/* -------------------- Product Helpers -------------------- */
-
 const sanitizeMarketplaceLinks = (links) => {
-  if (!Array.isArray(links)) {
-    return [];
-  }
+  if (!Array.isArray(links)) return [];
 
   return links
     .map((link) => ({
       platform: String(link?.platform || "").trim(),
       url: String(link?.url || "").trim(),
     }))
-    .filter(
-      ({ platform, url }) =>
-        platform && /^https:\/\//i.test(url)
-    )
+    .filter(({ platform, url }) => platform && /^https:\/\//i.test(url))
     .slice(0, 3);
 };
 
@@ -489,14 +291,13 @@ const validateProduct = ({
   category,
   price,
   mrp,
+  dealType = "none",
 }) => {
-  if (
-    !brand ||
-    !title ||
-    !category ||
-    price === "" ||
-    mrp === ""
-  ) {
+  const normalizedDealType = String(dealType);
+  const effectivePrice =
+    normalizedDealType === "none" ? Number(price) : Number(normalizedDealType);
+
+  if (!brand || !title || !category || price === "" || mrp === "") {
     return "Brand, title, category, price and MRP are required";
   }
 
@@ -504,39 +305,46 @@ const validateProduct = ({
     return "Please choose a valid category";
   }
 
+  if (!allowedDealTypes.includes(normalizedDealType)) {
+    return "Please choose a valid deal section";
+  }
+
   if (
-    !Number.isFinite(Number(price)) ||
+    !Number.isFinite(effectivePrice) ||
     !Number.isFinite(Number(mrp)) ||
-    Number(price) < 0 ||
+    effectivePrice < 0 ||
     Number(mrp) < 0
   ) {
     return "Price and MRP must be valid positive numbers";
   }
 
-  if (Number(mrp) < Number(price)) {
+  if (Number(mrp) < effectivePrice) {
     return "MRP cannot be lower than selling price";
   }
 
   return null;
 };
 
-const productPayload = (body) => ({
-  ...body,
-  price: Number(body.price),
-  mrp: Number(body.mrp),
-  rating: Number(body.rating || 4.5),
-  reviews: Number(body.reviews || 0),
-  stock: Number(body.stock || 0),
-  isFeatured: Boolean(body.isFeatured),
-  marketplaceLinks: sanitizeMarketplaceLinks(
-    body.marketplaceLinks
-  ),
-});
+const productPayload = (body) => {
+  const dealType = allowedDealTypes.includes(String(body.dealType))
+    ? String(body.dealType)
+    : "none";
+
+  return {
+    ...body,
+    dealType,
+    price: dealType === "none" ? Number(body.price) : Number(dealType),
+    mrp: Number(body.mrp),
+    rating: Number(body.rating || 4.5),
+    reviews: Number(body.reviews || 0),
+    stock: Number(body.stock || 0),
+    isFeatured: Boolean(body.isFeatured),
+    marketplaceLinks: sanitizeMarketplaceLinks(body.marketplaceLinks),
+  };
+};
 
 const createOrderNumber = () =>
   `DR-${Date.now()}-${crypto.randomInt(1000, 10000)}`;
-
-/* -------------------- Basic Routes -------------------- */
 
 app.get("/", (req, res) => {
   res.json({
@@ -550,247 +358,114 @@ app.get("/api/health", (req, res) => {
     success: true,
     service: "dealroot-backend",
     database:
-      mongoose.connection.readyState === 1
-        ? "connected"
-        : "not connected",
+      mongoose.connection.readyState === 1 ? "connected" : "not connected",
   });
 });
 
-/* -------------------- Admin Authentication -------------------- */
+app.post("/api/admin/login", adminLoginLimiter, async (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const password = String(req.body?.password || "");
 
-app.post(
-  "/api/admin/login",
-  adminLoginLimiter,
-  async (req, res) => {
-    try {
-      const email = String(req.body?.email || "")
-        .trim()
-        .toLowerCase();
+  const normaliseForComparison = (value) =>
+    Buffer.from(String(value).slice(0, 256).padEnd(256));
 
-      const password = String(req.body?.password || "");
+  const isCorrectEmail = crypto.timingSafeEqual(
+    normaliseForComparison(email),
+    normaliseForComparison(
+      String(process.env.ADMIN_EMAIL).toLowerCase()
+    )
+  );
 
-      const normaliseForComparison = (value) =>
-        Buffer.from(
-          String(value).slice(0, 256).padEnd(256)
-        );
+  const isCorrectPassword = await bcrypt.compare(
+    password,
+    process.env.ADMIN_PASSWORD_HASH
+  );
 
-      const isCorrectEmail = crypto.timingSafeEqual(
-        normaliseForComparison(email),
-        normaliseForComparison(
-          String(process.env.ADMIN_EMAIL).toLowerCase()
-        )
-      );
-
-      const isCorrectPassword = await bcrypt.compare(
-        password,
-        process.env.ADMIN_PASSWORD_HASH
-      );
-
-      if (!isCorrectEmail || !isCorrectPassword) {
-        return res.status(401).json({
-          success: false,
-          message: "Invalid email or password",
-        });
-      }
-
-      const token = jwt.sign(
-        {
-          role: "admin",
-          email,
-        },
-        jwtSecret,
-        {
-          expiresIn: "8h",
-        }
-      );
-
-      res.json({
-        success: true,
-        token,
-        admin: {
-          email,
-        },
-      });
-    } catch {
-      res.status(500).json({
-        success: false,
-        message: "Could not sign in as admin",
-      });
-    }
+  if (!isCorrectEmail || !isCorrectPassword) {
+    return res.status(401).json({
+      success: false,
+      message: "Invalid email or password",
+    });
   }
-);
 
-/* -------------------- Customer Authentication -------------------- */
+  const token = jwt.sign(
+    { role: "admin", email },
+    jwtSecret,
+    { expiresIn: "8h" }
+  );
 
-app.post(
-  "/api/auth/signup",
-  customerAuthLimiter,
-  async (req, res) => {
-    try {
-      const name = String(req.body?.name || "").trim();
+  res.json({
+    success: true,
+    token,
+    admin: { email },
+  });
+});
 
-      const email = String(req.body?.email || "")
-        .trim()
-        .toLowerCase();
+app.post("/api/auth/signup", customerAuthLimiter, async (req, res) => {
+  try {
+    const name = String(req.body?.name || "").trim();
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const password = String(req.body?.password || "");
 
-      const password = String(req.body?.password || "");
-
-      if (name.length < 2) {
-        return res.status(400).json({
-          success: false,
-          message: "Please enter your full name",
-        });
-      }
-
-      if (!/^\S+@\S+\.\S+$/.test(email)) {
-        return res.status(400).json({
-          success: false,
-          message: "Please enter a valid email address",
-        });
-      }
-
-      if (password.length < 8) {
-        return res.status(400).json({
-          success: false,
-          message: "Password must be at least 8 characters",
-        });
-      }
-
-      const existingUser = await User.exists({ email });
-
-      if (existingUser) {
-        return res.status(409).json({
-          success: false,
-          message:
-            "An account with this email already exists",
-        });
-      }
-
-      const passwordHash = await bcrypt.hash(password, 12);
-
-      const user = await User.create({
-        name,
-        email,
-        passwordHash,
-      });
-
-      const token = jwt.sign(
-        {
-          role: "user",
-          userId: user._id,
-        },
-        jwtSecret,
-        {
-          expiresIn: "7d",
-        }
-      );
-
-      res.status(201).json({
-        success: true,
-        token,
-        user: publicUser(user),
-      });
-    } catch (error) {
-      if (error?.code === 11000) {
-        return res.status(409).json({
-          success: false,
-          message:
-            "An account with this email already exists",
-        });
-      }
-
-      res.status(500).json({
-        success: false,
-        message: "Could not create your account",
-      });
+    if (name.length < 2) {
+      return res.status(400).json({ success: false, message: "Please enter your full name" });
     }
-  }
-);
 
-app.post(
-  "/api/auth/login",
-  customerAuthLimiter,
-  async (req, res) => {
-    try {
-      const email = String(req.body?.email || "")
-        .trim()
-        .toLowerCase();
-
-      const password = String(req.body?.password || "");
-
-      const user = await User.findOne({ email }).select(
-        "+passwordHash"
-      );
-
-      if (
-        !user ||
-        !(await bcrypt.compare(password, user.passwordHash))
-      ) {
-        return res.status(401).json({
-          success: false,
-          message: "Invalid email or password",
-        });
-      }
-
-      const token = jwt.sign(
-        {
-          role: "user",
-          userId: user._id,
-        },
-        jwtSecret,
-        {
-          expiresIn: "7d",
-        }
-      );
-
-      res.json({
-        success: true,
-        token,
-        user: publicUser(user),
-      });
-    } catch {
-      res.status(500).json({
-        success: false,
-        message: "Could not log in",
-      });
+    if (!/^\S+@\S+\.\S+$/.test(email)) {
+      return res.status(400).json({ success: false, message: "Please enter a valid email address" });
     }
+
+    if (password.length < 8) {
+      return res.status(400).json({ success: false, message: "Password must be at least 8 characters" });
+    }
+
+    if (await User.exists({ email })) {
+      return res.status(409).json({ success: false, message: "An account with this email already exists" });
+    }
+
+    const user = await User.create({
+      name,
+      email,
+      passwordHash: await bcrypt.hash(password, 12),
+    });
+    const token = jwt.sign({ role: "user", userId: user._id }, jwtSecret, { expiresIn: "7d" });
+
+    res.status(201).json({ success: true, token, user: publicUser(user) });
+  } catch (error) {
+    if (error?.code === 11000) {
+      return res.status(409).json({ success: false, message: "An account with this email already exists" });
+    }
+    res.status(500).json({ success: false, message: "Could not create your account" });
   }
-);
+});
+
+app.post("/api/auth/login", customerAuthLimiter, async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const password = String(req.body?.password || "");
+    const user = await User.findOne({ email }).select("+passwordHash");
+
+    if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
+      return res.status(401).json({ success: false, message: "Invalid email or password" });
+    }
+
+    const token = jwt.sign({ role: "user", userId: user._id }, jwtSecret, { expiresIn: "7d" });
+    res.json({ success: true, token, user: publicUser(user) });
+  } catch {
+    res.status(500).json({ success: false, message: "Could not log in" });
+  }
+});
 
 app.get("/api/auth/me", requireUser, async (req, res) => {
-  try {
-    const user = await User.findById(req.user.userId);
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: "Account not found",
-      });
-    }
-
-    res.json({
-      success: true,
-      user: publicUser(user),
-    });
-  } catch {
-    res.status(500).json({
-      success: false,
-      message: "Could not load your account",
-    });
-  }
+  const user = await User.findById(req.user.userId);
+  if (!user) return res.status(404).json({ success: false, message: "Account not found" });
+  res.json({ success: true, user: publicUser(user) });
 });
 
 app.put("/api/auth/me", requireUser, async (req, res) => {
   try {
-    const phone = String(req.body?.phone || "").replace(
-      /\D/g,
-      ""
-    );
-
-    const pincode = String(
-      req.body?.pincode || ""
-    ).replace(/\D/g, "");
-
+    const phone = String(req.body?.phone || "").replace(/\D/g, "");
+    const pincode = String(req.body?.pincode || "").replace(/\D/g, "");
     const update = {
       name: String(req.body?.name || "").trim(),
       phone,
@@ -799,82 +474,29 @@ app.put("/api/auth/me", requireUser, async (req, res) => {
       pincode,
     };
 
-    if (update.name.length < 2) {
-      throw new Error("Please enter your full name");
-    }
+    if (update.name.length < 2) throw new Error("Please enter your full name");
+    if (phone && phone.length !== 10) throw new Error("Please enter a valid 10-digit mobile number");
+    if (pincode && pincode.length !== 6) throw new Error("Please enter a valid 6-digit pincode");
 
-    if (phone && phone.length !== 10) {
-      throw new Error(
-        "Please enter a valid 10-digit mobile number"
-      );
-    }
-
-    if (pincode && pincode.length !== 6) {
-      throw new Error(
-        "Please enter a valid 6-digit pincode"
-      );
-    }
-
-    const user = await User.findByIdAndUpdate(
-      req.user.userId,
-      update,
-      {
-        new: true,
-        runValidators: true,
-      }
-    );
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: "Account not found",
-      });
-    }
-
-    res.json({
-      success: true,
-      user: publicUser(user),
+    const user = await User.findByIdAndUpdate(req.user.userId, update, {
+      new: true,
+      runValidators: true,
     });
+    if (!user) return res.status(404).json({ success: false, message: "Account not found" });
+    res.json({ success: true, user: publicUser(user) });
   } catch (error) {
-    res.status(400).json({
-      success: false,
-      message:
-        error.message || "Could not save profile",
-    });
+    res.status(400).json({ success: false, message: error.message || "Could not save profile" });
   }
 });
 
-app.get(
-  "/api/auth/orders",
-  requireUser,
-  async (req, res) => {
-    try {
-      const orders = await Order.find({
-        user: req.user.userId,
-      }).sort({
-        createdAt: -1,
-      });
-
-      res.json({
-        success: true,
-        count: orders.length,
-        orders,
-      });
-    } catch {
-      res.status(500).json({
-        success: false,
-        message: "Could not load your orders",
-      });
-    }
-  }
-);
-
-/* -------------------- Product Routes -------------------- */
+app.get("/api/auth/orders", requireUser, async (req, res) => {
+  const orders = await Order.find({ user: req.user.userId }).sort({ createdAt: -1 });
+  res.json({ success: true, count: orders.length, orders });
+});
 
 app.get("/api/products", async (req, res) => {
   try {
-    const { category, search, featured } = req.query;
-
+    const { category, search, featured, dealType } = req.query;
     const filter = {};
 
     if (category && category !== "All") {
@@ -885,20 +507,27 @@ app.get("/api/products", async (req, res) => {
       filter.isFeatured = true;
     }
 
-    if (search) {
-      filter.$or = ["title", "brand", "category"].map(
-        (key) => ({
-          [key]: {
-            $regex: String(search),
-            $options: "i",
-          },
-        })
-      );
+    if (dealType && dealType !== "none") {
+      if (!allowedDealTypes.includes(String(dealType))) {
+        return res.status(400).json({
+          success: false,
+          message: "Please choose a valid deal section",
+        });
+      }
+
+      filter.dealType = String(dealType);
     }
 
-    const products = await Product.find(filter).sort({
-      createdAt: -1,
-    });
+    if (search) {
+      filter.$or = ["title", "brand", "category"].map((key) => ({
+        [key]: {
+          $regex: String(search),
+          $options: "i",
+        },
+      }));
+    }
+
+    const products = await Product.find(filter).sort({ createdAt: -1 });
 
     res.json({
       success: true,
@@ -924,10 +553,7 @@ app.get("/api/products/:id", async (req, res) => {
       });
     }
 
-    res.json({
-      success: true,
-      product,
-    });
+    res.json({ success: true, product });
   } catch {
     res.status(400).json({
       success: false,
@@ -936,185 +562,144 @@ app.get("/api/products/:id", async (req, res) => {
   }
 });
 
-app.post(
-  "/api/products",
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const error = validateProduct(req.body);
+app.post("/api/products", requireAdmin, async (req, res) => {
+  try {
+    const error = validateProduct(req.body);
 
-      if (error) {
-        return res.status(400).json({
-          success: false,
-          message: error,
-        });
-      }
-
-      const product = await Product.create(
-        productPayload(req.body)
-      );
-
-      res.status(201).json({
-        success: true,
-        message: "Product added successfully",
-        product,
-      });
-    } catch {
-      res.status(500).json({
+    if (error) {
+      return res.status(400).json({
         success: false,
-        message: "Could not add product",
+        message: error,
       });
     }
+
+    const product = await Product.create(productPayload(req.body));
+
+    res.status(201).json({
+      success: true,
+      message: "Product added successfully",
+      product,
+    });
+  } catch {
+    res.status(500).json({
+      success: false,
+      message: "Could not add product",
+    });
   }
-);
+});
 
-app.put(
-  "/api/products/:id",
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const error = validateProduct(req.body);
+app.put("/api/products/:id", requireAdmin, async (req, res) => {
+  try {
+    const error = validateProduct(req.body);
 
-      if (error) {
-        return res.status(400).json({
-          success: false,
-          message: error,
-        });
-      }
-
-      const product = await Product.findByIdAndUpdate(
-        req.params.id,
-        productPayload(req.body),
-        {
-          new: true,
-          runValidators: true,
-        }
-      );
-
-      if (!product) {
-        return res.status(404).json({
-          success: false,
-          message: "Product not found",
-        });
-      }
-
-      res.json({
-        success: true,
-        message: "Product updated successfully",
-        product,
-      });
-    } catch {
-      res.status(400).json({
+    if (error) {
+      return res.status(400).json({
         success: false,
-        message: "Could not update product",
+        message: error,
       });
     }
-  }
-);
 
-app.patch(
-  "/api/products/:id/stock",
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const stock = Number(req.body.stock);
+    const product = await Product.findByIdAndUpdate(
+      req.params.id,
+      productPayload(req.body),
+      { new: true, runValidators: true }
+    );
 
-      if (!Number.isInteger(stock) || stock < 0) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Stock must be a whole positive number",
-        });
-      }
-
-      const product = await Product.findByIdAndUpdate(
-        req.params.id,
-        { stock },
-        {
-          new: true,
-          runValidators: true,
-        }
-      );
-
-      if (!product) {
-        return res.status(404).json({
-          success: false,
-          message: "Product not found",
-        });
-      }
-
-      res.json({
-        success: true,
-        message: "Stock updated successfully",
-        product,
-      });
-    } catch {
-      res.status(400).json({
+    if (!product) {
+      return res.status(404).json({
         success: false,
-        message: "Could not update stock",
+        message: "Product not found",
       });
     }
+
+    res.json({
+      success: true,
+      message: "Product updated successfully",
+      product,
+    });
+  } catch {
+    res.status(400).json({
+      success: false,
+      message: "Could not update product",
+    });
   }
-);
+});
 
-app.delete(
-  "/api/products/:id",
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const product = await Product.findByIdAndDelete(
-        req.params.id
-      );
+app.patch("/api/products/:id/stock", requireAdmin, async (req, res) => {
+  try {
+    const stock = Number(req.body.stock);
 
-      if (!product) {
-        return res.status(404).json({
-          success: false,
-          message: "Product not found",
-        });
-      }
-
-      res.json({
-        success: true,
-        message: "Product deleted successfully",
-      });
-    } catch {
-      res.status(400).json({
+    if (!Number.isInteger(stock) || stock < 0) {
+      return res.status(400).json({
         success: false,
-        message: "Could not delete product",
+        message: "Stock must be a whole positive number",
       });
     }
-  }
-);
 
-/* -------------------- Order Routes -------------------- */
+    const product = await Product.findByIdAndUpdate(
+      req.params.id,
+      { stock },
+      { new: true, runValidators: true }
+    );
+
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        message: "Product not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Stock updated successfully",
+      product,
+    });
+  } catch {
+    res.status(400).json({
+      success: false,
+      message: "Could not update stock",
+    });
+  }
+});
+
+app.delete("/api/products/:id", requireAdmin, async (req, res) => {
+  try {
+    const product = await Product.findByIdAndDelete(req.params.id);
+
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        message: "Product not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Product deleted successfully",
+    });
+  } catch {
+    res.status(400).json({
+      success: false,
+      message: "Could not delete product",
+    });
+  }
+});
 
 app.post("/api/orders", optionalUser, async (req, res) => {
   const session = await mongoose.startSession();
 
   try {
-    const {
-      customer,
-      items,
-      deliveryType,
-      paymentMethod,
-    } = req.body;
+    const { customer, items, paymentMethod, couponCode } = req.body;
+    const normalizedCoupon = String(couponCode || "")
+      .trim()
+      .toUpperCase();
 
     const cleanCustomer = {
       name: String(customer?.name || "").trim(),
-
-      phone: String(customer?.phone || "").replace(
-        /\D/g,
-        ""
-      ),
-
+      phone: String(customer?.phone || "").replace(/\D/g, ""),
       address: String(customer?.address || "").trim(),
-
       city: String(customer?.city || "").trim(),
-
-      pincode: String(customer?.pincode || "").replace(
-        /\D/g,
-        ""
-      ),
+      pincode: String(customer?.pincode || "").replace(/\D/g, ""),
     };
 
     if (
@@ -1124,9 +709,7 @@ app.post("/api/orders", optionalUser, async (req, res) => {
       cleanCustomer.phone.length !== 10 ||
       cleanCustomer.pincode.length !== 6
     ) {
-      throw new Error(
-        "Please enter valid delivery details"
-      );
+      throw new Error("Please enter valid delivery details");
     }
 
     if (!Array.isArray(items) || !items.length) {
@@ -1137,6 +720,10 @@ app.post("/api/orders", optionalUser, async (req, res) => {
       throw new Error(
         "Online payment is not available yet. Please choose Cash on Delivery."
       );
+    }
+
+    if (normalizedCoupon && normalizedCoupon !== "WELCOME10") {
+      throw new Error("Invalid coupon code");
     }
 
     let order;
@@ -1154,27 +741,16 @@ app.post("/api/orders", optionalUser, async (req, res) => {
           !Number.isInteger(quantity) ||
           quantity < 1
         ) {
-          throw new Error(
-            "Invalid product or quantity in cart"
-          );
+          throw new Error("Invalid product or quantity in cart");
         }
 
         const product = await Product.findOneAndUpdate(
           {
             _id: productId,
-            stock: {
-              $gte: quantity,
-            },
+            stock: { $gte: quantity },
           },
-          {
-            $inc: {
-              stock: -quantity,
-            },
-          },
-          {
-            new: true,
-            session,
-          }
+          { $inc: { stock: -quantity } },
+          { new: true, session }
         );
 
         if (!product) {
@@ -1184,7 +760,6 @@ app.post("/api/orders", optionalUser, async (req, res) => {
         }
 
         const lineTotal = product.price * quantity;
-
         subtotal += lineTotal;
 
         orderItems.push({
@@ -1198,7 +773,23 @@ app.post("/api/orders", optionalUser, async (req, res) => {
         });
       }
 
-      const deliveryFee = subtotal >= 499 ? 0 : 49;
+      const normalizedCity = cleanCustomer.city
+        .toLowerCase()
+        .replace(/\s+/g, " ");
+      const isKanpurAddress = normalizedCity.includes("kanpur");
+      const deliveryFee =
+        subtotal >= 499 ? 0 : isKanpurAddress ? 29 : 49;
+      let discountAmount = 0;
+
+      if (normalizedCoupon === "WELCOME10") {
+        if (subtotal <= 499) {
+          throw new Error(
+            "WELCOME10 applies only when the cart subtotal is above â‚¹499"
+          );
+        }
+
+        discountAmount = Math.round(subtotal * 0.1);
+      }
 
       [order] = await Order.create(
         [
@@ -1208,29 +799,21 @@ app.post("/api/orders", optionalUser, async (req, res) => {
             customer: cleanCustomer,
             items: orderItems,
             deliveryFee,
-            totalAmount: subtotal + deliveryFee,
-            deliveryType:
-              deliveryType === "local"
-                ? "local"
-                : "courier",
+            couponCode: normalizedCoupon,
+            discountAmount,
+            totalAmount: subtotal - discountAmount + deliveryFee,
+            deliveryType: isKanpurAddress ? "local" : "courier",
             paymentMethod: "cod",
           },
         ],
-        {
-          session,
-        }
+        { session }
       );
 
       if (req.user?.userId) {
         await User.findByIdAndUpdate(
           req.user.userId,
-          {
-            $set: cleanCustomer,
-          },
-          {
-            session,
-            runValidators: true,
-          }
+          { $set: cleanCustomer },
+          { session, runValidators: true }
         );
       }
     });
@@ -1243,8 +826,7 @@ app.post("/api/orders", optionalUser, async (req, res) => {
   } catch (error) {
     res.status(400).json({
       success: false,
-      message:
-        error.message || "Could not place your order",
+      message: error.message || "Could not place your order",
     });
   } finally {
     await session.endSession();
@@ -1253,9 +835,7 @@ app.post("/api/orders", optionalUser, async (req, res) => {
 
 app.get("/api/orders", requireAdmin, async (req, res) => {
   try {
-    const orders = await Order.find().sort({
-      createdAt: -1,
-    });
+    const orders = await Order.find().sort({ createdAt: -1 });
 
     res.json({
       success: true,
@@ -1270,168 +850,113 @@ app.get("/api/orders", requireAdmin, async (req, res) => {
   }
 });
 
-app.patch(
-  "/api/orders/:id/status",
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const { orderStatus } = req.body;
+app.patch("/api/orders/:id/status", requireAdmin, async (req, res) => {
+  try {
+    const { orderStatus } = req.body;
 
-      if (!orderStatuses.includes(orderStatus)) {
-        return res.status(400).json({
-          success: false,
-          message: "Please choose a valid order status",
-        });
-      }
-
-      if (orderStatus === "cancelled") {
-        return res.status(400).json({
-          success: false,
-          message: "Use the cancel order action instead",
-        });
-      }
-
-      const order = await Order.findByIdAndUpdate(
-        req.params.id,
-        {
-          orderStatus,
-        },
-        {
-          new: true,
-          runValidators: true,
-        }
-      );
-
-      if (!order) {
-        return res.status(404).json({
-          success: false,
-          message: "Order not found",
-        });
-      }
-
-      res.json({
-        success: true,
-        message: "Order status updated successfully",
-        order,
-      });
-    } catch {
-      res.status(400).json({
+    if (!orderStatuses.includes(orderStatus)) {
+      return res.status(400).json({
         success: false,
-        message: "Could not update order status",
+        message: "Please choose a valid order status",
       });
     }
-  }
-);
 
-app.post(
-  "/api/orders/:id/cancel",
-  requireAdmin,
-  async (req, res) => {
-    const session = await mongoose.startSession();
-
-    try {
-      let order;
-
-      await session.withTransaction(async () => {
-        order = await Order.findOne({
-          _id: req.params.id,
-        }).session(session);
-
-        if (!order) {
-          throw new Error("Order not found");
-        }
-
-        if (order.orderStatus === "cancelled") {
-          throw new Error(
-            "This order has already been cancelled"
-          );
-        }
-
-        if (
-          ["shipped", "delivered"].includes(
-            order.orderStatus
-          )
-        ) {
-          throw new Error(
-            "A shipped or delivered order cannot be cancelled from admin"
-          );
-        }
-
-        for (const item of order.items) {
-          await Product.findByIdAndUpdate(
-            item.product,
-            {
-              $inc: {
-                stock: item.quantity,
-              },
-            },
-            {
-              session,
-            }
-          );
-        }
-
-        order.orderStatus = "cancelled";
-        order.stockRestored = true;
-        order.cancelledAt = new Date();
-
-        await order.save({
-          session,
-        });
-      });
-
-      res.json({
-        success: true,
-        message: "Order cancelled and stock restored",
-        order,
-      });
-    } catch (error) {
-      res.status(400).json({
+    if (orderStatus === "cancelled") {
+      return res.status(400).json({
         success: false,
-        message:
-          error.message || "Could not cancel order",
+        message: "Use the cancel order action instead",
       });
-    } finally {
-      await session.endSession();
     }
-  }
-);
 
-/* -------------------- Error Handler -------------------- */
+    const order = await Order.findByIdAndUpdate(
+      req.params.id,
+      { orderStatus },
+      { new: true, runValidators: true }
+    );
 
-app.use((error, req, res, next) => {
-  console.error(error.message);
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found",
+      });
+    }
 
-  if (error.message === "Not allowed by CORS") {
-    return res.status(403).json({
+    res.json({
+      success: true,
+      message: "Order status updated successfully",
+      order,
+    });
+  } catch {
+    res.status(400).json({
       success: false,
-      message: "This website is not allowed to access the API",
+      message: "Could not update order status",
     });
   }
-
-  res.status(500).json({
-    success: false,
-    message: "Something went wrong on the server",
-  });
 });
 
-/* -------------------- Start Server -------------------- */
+app.post("/api/orders/:id/cancel", requireAdmin, async (req, res) => {
+  const session = await mongoose.startSession();
+
+  try {
+    let order;
+
+    await session.withTransaction(async () => {
+      order = await Order.findOne({ _id: req.params.id }).session(session);
+
+      if (!order) {
+        throw new Error("Order not found");
+      }
+
+      if (order.orderStatus === "cancelled") {
+        throw new Error("This order has already been cancelled");
+      }
+
+      if (["shipped", "delivered"].includes(order.orderStatus)) {
+        throw new Error(
+          "A shipped or delivered order cannot be cancelled from admin"
+        );
+      }
+
+      for (const item of order.items) {
+        await Product.findByIdAndUpdate(
+          item.product,
+          { $inc: { stock: item.quantity } },
+          { session }
+        );
+      }
+
+      order.orderStatus = "cancelled";
+      order.stockRestored = true;
+      order.cancelledAt = new Date();
+
+      await order.save({ session });
+    });
+
+    res.json({
+      success: true,
+      message: "Order cancelled and stock restored",
+      order,
+    });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      message: error.message || "Could not cancel order",
+    });
+  } finally {
+    await session.endSession();
+  }
+});
 
 const startServer = async () => {
   try {
     await mongoose.connect(process.env.MONGODB_URI);
-
     console.log("MongoDB connected");
 
     app.listen(PORT, () => {
-      console.log(`DEALROOT backend running on port ${PORT}`);
+      console.log(`DEALROOT backend running on ${PORT}`);
     });
   } catch (error) {
-    console.error(
-      "Server startup failed:",
-      error.message
-    );
-
+    console.error("Server startup failed:", error.message);
     process.exit(1);
   }
 };
