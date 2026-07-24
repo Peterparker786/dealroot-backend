@@ -44,8 +44,14 @@ app.set("trust proxy", 1);
 app.use(helmet());
 app.use(
   cors({
-    origin: clientUrl,
+    origin: [
+      "https://www.dealroot.store",
+      "https://dealroot.store",
+      "https://dealroot-shopping.vercel.app",
+      "http://localhost:5173"
+    ],
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
+    credentials: true,
   })
 );
 app.use(
