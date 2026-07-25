@@ -1434,7 +1434,7 @@ app.post("/api/payments/razorpay/webhook", async (req, res) => {
   }
 });
 
-app.post("/api/orders", optionalUser, async (req, res) => {
+app.post("/api/orders", requireUser, async (req, res) => {
   const session = await mongoose.startSession();
 
   try {
