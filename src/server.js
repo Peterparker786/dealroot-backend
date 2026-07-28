@@ -68,7 +68,9 @@ app.use(
       "https://www.dealroot.store",
       "https://dealroot.store",
       "https://dealroot-shopping.vercel.app",
-      "http://localhost:5173"
+      "http://localhost:5173",
+      "http://localhost:5174",
+      "http://localhost:5175"
     ],
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
     credentials: true,
@@ -131,6 +133,42 @@ const orderStatuses = [
   "delivered",
   "cancelled",
 ];
+const couponSchema = new mongoose.Schema(
+  {
+    code: {
+      type: String,
+      unique: true,
+      uppercase: true,
+      trim: true,
+    },
+
+    discountType: {
+      type: String,
+      enum: ["percentage", "flat"],
+      default: "percentage",
+    },
+
+    discountValue: Number,
+
+    minimumOrder: {
+      type: Number,
+      default: 0,
+    },
+
+    maximumDiscount: {
+      type: Number,
+      default: 0,
+    },
+
+    expiryDate: Date,
+
+    active: {
+      type: Boolean,
+      default: true,
+    },
+  },
+  { timestamps: true }
+);
 
 const productSchema = new mongoose.Schema(
   {
@@ -429,6 +467,7 @@ const userSchema = new mongoose.Schema(
 );
 
 const Product = mongoose.model("Product", productSchema);
+const Coupon = mongoose.model("Coupon", couponSchema);
 const Review = mongoose.model("Review", reviewSchema);
 const Order = mongoose.model("Order", orderSchema);
 const PaymentSession = mongoose.model(
@@ -1324,6 +1363,155 @@ app.post(
   }
 );
 
+app.post("/api/coupons", requireAdmin, async (req, res) => {
+  try {
+    const {
+      code,
+      discountType,
+      discountValue,
+      minimumOrder,
+      maximumDiscount,
+      expiryDate,
+    } = req.body;
+
+    if (!code || !discountValue) {
+      return res.status(400).json({
+        success: false,
+        message: "Coupon code and discount are required",
+      });
+    }
+
+    const exists = await Coupon.findOne({
+      code: code.toUpperCase(),
+    });
+
+    if (exists) {
+      return res.status(400).json({
+        success: false,
+        message: "Coupon already exists",
+      });
+    }
+
+    const coupon = await Coupon.create({
+      code: code.toUpperCase(),
+      discountType,
+      discountValue,
+      minimumOrder,
+      maximumDiscount,
+      expiryDate,
+    });
+
+    res.status(201).json({
+      success: true,
+      message: "Coupon created successfully",
+      coupon,
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+app.get("/api/coupons", async (req, res) => {
+  const coupons = await Coupon.find().sort({
+    createdAt: -1,
+  });
+
+  res.json({
+    success: true,
+    coupons,
+  });
+});
+
+app.post("/api/coupons/apply", async (req, res) => {
+  try {
+    const { code, subtotal } = req.body;
+
+    const coupon = await Coupon.findOne({
+      code: code.toUpperCase(),
+      active: true,
+    });
+
+    if (!coupon) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid coupon code",
+      });
+    }
+
+    if (
+      coupon.expiryDate &&
+      new Date(coupon.expiryDate) < new Date()
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Coupon expired",
+      });
+    }
+
+    if (subtotal < coupon.minimumOrder) {
+      return res.status(400).json({
+        success: false,
+        message: `Minimum order ₹${coupon.minimumOrder}`,
+      });
+    }
+
+    let discount = 0;
+
+    if (coupon.discountType === "percentage") {
+      discount =
+        subtotal * coupon.discountValue / 100;
+
+      if (
+        coupon.maximumDiscount &&
+        discount > coupon.maximumDiscount
+      ) {
+        discount = coupon.maximumDiscount;
+      }
+    } else {
+      discount = coupon.discountValue;
+    }
+
+    res.json({
+      success: true,
+      coupon,
+      discount,
+    });
+
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+
+app.delete("/api/coupons/:id", requireAdmin, async (req, res) => {
+  try {
+    const coupon = await Coupon.findByIdAndDelete(req.params.id);
+
+    if (!coupon) {
+      return res.status(404).json({
+        success: false,
+        message: "Coupon not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Coupon deleted successfully",
+    });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      message: error.message,
+    });
+  }
+});
+
 app.post("/api/products", requireAdmin, async (req, res) => {
   try {
     const error = validateProduct(req.body);
@@ -1929,7 +2117,14 @@ app.post("/api/orders/:id/cancel", requireAdmin, async (req, res) => {
       order.stockRestored = true;
       order.cancelledAt = new Date();
 
-      await order.save({ session });
+if (!order.customer.state) {
+  order.customer.state = "Uttar Pradesh";
+}
+
+      await order.save({
+  session,
+  validateBeforeSave: false,
+});
     });
 
     res.json({
@@ -1937,12 +2132,18 @@ app.post("/api/orders/:id/cancel", requireAdmin, async (req, res) => {
       message: "Order cancelled and stock restored",
       order,
     });
-  } catch (error) {
-    res.status(400).json({
-      success: false,
-      message: error.message || "Could not cancel order",
-    });
-  } finally {
+} catch (error) {
+  console.log("=================================");
+  console.log("CANCEL ORDER ERROR");
+  console.log(error);
+  console.log(error.message);
+  console.log("=================================");
+
+  res.status(400).json({
+    success: false,
+    message: error.message || "Could not cancel order",
+  });
+} finally {
     await session.endSession();
   }
 });
