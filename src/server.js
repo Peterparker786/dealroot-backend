@@ -9,8 +9,28 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
 const Razorpay = require("razorpay");
+const multer = require("multer");
+const { v2: cloudinary } = require("cloudinary");
 
 const app = express();
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+console.log({
+  cloud: process.env.CLOUDINARY_CLOUD_NAME,
+  key: process.env.CLOUDINARY_API_KEY,
+  secret: process.env.CLOUDINARY_API_SECRET ? "Loaded" : "Missing",
+});
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB
+  },
+});
 const PORT = process.env.PORT || 5000;
 const clientUrl = process.env.CLIENT_URL || "http://localhost:5173";
 const jwtSecret = process.env.JWT_SECRET;
@@ -124,9 +144,22 @@ const productSchema = new mongoose.Schema(
     },
     price: { type: Number, required: true, min: 0 },
     mrp: { type: Number, required: true, min: 0 },
-    rating: { type: Number, default: 4.5, min: 0, max: 5 },
-    reviews: { type: Number, default: 0, min: 0 },
-    image: { type: String, default: "" },
+   rating: {
+  type: Number,
+  default: 0,
+  min: 0,
+  max: 5,
+},
+
+reviews: {
+  type: Number,
+  default: 0,
+},
+    images: [
+  {
+    type: String,
+  },
+],
     badge: { type: String, default: "" },
     stock: { type: Number, default: 20, min: 0 },
     isFeatured: { type: Boolean, default: false },
@@ -142,6 +175,44 @@ const productSchema = new mongoose.Schema(
         url: { type: String, trim: true },
       },
     ],
+  },
+  { timestamps: true }
+);
+const reviewSchema = new mongoose.Schema(
+  {
+    product: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Product",
+      required: true,
+      index: true,
+    },
+    user: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+      index: true,
+    },
+    order: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Order",
+      required: true,
+    },
+    rating: {
+      type: Number,
+      required: true,
+      min: 1,
+      max: 5,
+    },
+    review: {
+      type: String,
+      required: true,
+      trim: true,
+      maxlength: 1000,
+    },
+    verifiedPurchase: {
+      type: Boolean,
+      default: true,
+    },
   },
   { timestamps: true }
 );
@@ -163,6 +234,7 @@ const orderSchema = new mongoose.Schema(
     customer: {
       name: { type: String, required: true, trim: true },
       phone: { type: String, required: true, trim: true },
+      state: { type: String, required: true, trim: true },
       address: { type: String, required: true, trim: true },
       city: { type: String, required: true, trim: true },
       pincode: { type: String, required: true, trim: true },
@@ -176,7 +248,11 @@ const orderSchema = new mongoose.Schema(
         },
         brand: { type: String, default: "" },
         title: { type: String, required: true },
-        image: { type: String, default: "" },
+        images: [
+  {
+    type: String,
+  },
+],
         price: { type: Number, required: true, min: 0 },
         quantity: { type: Number, required: true, min: 1 },
         subtotal: { type: Number, required: true, min: 0 },
@@ -255,6 +331,7 @@ const paymentSessionSchema = new mongoose.Schema(
     customer: {
       name: { type: String, required: true, trim: true },
       phone: { type: String, required: true, trim: true },
+      state: { type: String, required: true, trim: true },
       address: { type: String, required: true, trim: true },
       city: { type: String, required: true, trim: true },
       pincode: { type: String, required: true, trim: true },
@@ -268,7 +345,11 @@ const paymentSessionSchema = new mongoose.Schema(
         },
         brand: { type: String, default: "" },
         title: { type: String, required: true },
-        image: { type: String, default: "" },
+        images: [
+  {
+    type: String,
+  },
+],
         price: { type: Number, required: true, min: 0 },
         quantity: { type: Number, required: true, min: 1 },
         subtotal: { type: Number, required: true, min: 0 },
@@ -340,6 +421,7 @@ const userSchema = new mongoose.Schema(
     passwordHash: { type: String, required: true, select: false },
     phone: { type: String, default: "", trim: true },
     address: { type: String, default: "", trim: true },
+    state: { type: String, default: "Uttar Pradesh", trim: true },
     city: { type: String, default: "Kanpur", trim: true },
     pincode: { type: String, default: "", trim: true },
   },
@@ -347,6 +429,7 @@ const userSchema = new mongoose.Schema(
 );
 
 const Product = mongoose.model("Product", productSchema);
+const Review = mongoose.model("Review", reviewSchema);
 const Order = mongoose.model("Order", orderSchema);
 const PaymentSession = mongoose.model(
   "PaymentSession",
@@ -363,9 +446,10 @@ const publicUser = (user) => ({
   id: user._id,
   name: user.name,
   email: user.email,
-  phone: user.phone,
-  address: user.address,
-  city: user.city,
+phone: user.phone,
+address: user.address,
+state: user.state,
+city: user.city,
   pincode: user.pincode,
 });
 
@@ -484,9 +568,16 @@ const productPayload = (body) => {
     dealType,
     price: dealType === "none" ? Number(body.price) : Number(dealType),
     mrp: Number(body.mrp),
-    rating: Number(body.rating || 4.5),
+    rating: Number(body.rating || 0),
     reviews: Number(body.reviews || 0),
     stock: Number(body.stock || 0),
+
+    images: Array.isArray(body.images)
+      ? body.images
+          .map((img) => String(img).trim())
+          .filter(Boolean)
+      : [],
+
     isFeatured: Boolean(body.isFeatured),
     marketplaceLinks: sanitizeMarketplaceLinks(body.marketplaceLinks),
   };
@@ -584,7 +675,7 @@ const buildOnlinePaymentQuote = async ({
       product: product._id,
       brand: product.brand,
       title: product.title,
-      image: product.image,
+     images: product.images || [],
       price: product.price,
       quantity,
       subtotal: lineTotal,
@@ -978,13 +1069,14 @@ app.put("/api/auth/me", requireUser, async (req, res) => {
   try {
     const phone = String(req.body?.phone || "").replace(/\D/g, "");
     const pincode = String(req.body?.pincode || "").replace(/\D/g, "");
-    const update = {
-      name: String(req.body?.name || "").trim(),
-      phone,
-      address: String(req.body?.address || "").trim(),
-      city: String(req.body?.city || "").trim(),
-      pincode,
-    };
+   const update = {
+  name: String(req.body?.name || "").trim(),
+  phone,
+  address: String(req.body?.address || "").trim(),
+  state: String(req.body?.state || "").trim(),
+  city: String(req.body?.city || "").trim(),
+  pincode,
+};
 
     if (update.name.length < 2) throw new Error("Please enter your full name");
     if (phone && phone.length !== 10) throw new Error("Please enter a valid 10-digit mobile number");
@@ -1073,6 +1165,164 @@ app.get("/api/products/:id", async (req, res) => {
     });
   }
 });
+
+app.get("/api/reviews/:productId", async (req, res) => {
+  try {
+    const reviews = await Review.find({
+      product: req.params.productId,
+    })
+      .populate("user", "name")
+      .sort({ createdAt: -1 });
+
+    res.json({
+      success: true,
+      reviews,
+    });
+  } catch {
+    res.status(500).json({
+      success: false,
+      message: "Could not load reviews",
+    });
+  }
+});
+app.post("/api/reviews", requireUser, async (req, res) => {
+  try {
+    const productId = String(req.body?.productId || "");
+    const rating = Number(req.body?.rating);
+    const review = String(req.body?.review || "").trim();
+
+    if (!mongoose.Types.ObjectId.isValid(productId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid product",
+      });
+    }
+
+    if (
+      !Number.isInteger(rating) ||
+      rating < 1 ||
+      rating > 5
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Rating must be between 1 and 5",
+      });
+    }
+
+    if (review.length < 5) {
+      return res.status(400).json({
+        success: false,
+        message: "Please write a longer review",
+      });
+    }
+
+    const product = await Product.findById(productId);
+
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        message: "Product not found",
+      });
+    }
+
+    const purchasedOrder = await Order.findOne({
+      user: req.user.userId,
+      orderStatus: "delivered",
+      "items.product": productId,
+    });
+
+    if (!purchasedOrder) {
+      return res.status(403).json({
+        success: false,
+        message: "Only customers who purchased this product can review it",
+      });
+    }
+
+    const alreadyReviewed = await Review.findOne({
+      user: req.user.userId,
+      product: productId,
+    });
+
+    if (alreadyReviewed) {
+      return res.status(409).json({
+        success: false,
+        message: "You have already reviewed this product",
+      });
+    }
+
+    const newReview = await Review.create({
+      product: productId,
+      user: req.user.userId,
+      order: purchasedOrder._id,
+      rating,
+      review,
+      verifiedPurchase: true,
+    });
+
+    await updateProductRating(productId);
+
+    const populatedReview = await Review.findById(newReview._id)
+      .populate("user", "name");
+
+    res.status(201).json({
+      success: true,
+      message: "Review submitted successfully",
+      review: populatedReview,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message || "Could not submit review",
+    });
+  }
+});
+app.post(
+  "/api/upload",
+  requireAdmin,
+  upload.array("images", 10),
+  async (req, res) => {
+    try {
+      if (!req.files || req.files.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message: "No images selected",
+        });
+      }
+
+      const uploadedImages = [];
+
+      for (const file of req.files) {
+        const result = await new Promise((resolve, reject) => {
+          cloudinary.uploader
+            .upload_stream(
+              {
+                folder: "dealroot-products",
+              },
+              (error, result) => {
+                if (error) reject(error);
+                else resolve(result);
+              }
+            )
+            .end(file.buffer);
+        });
+
+        uploadedImages.push(result.secure_url);
+      }
+
+      res.json({
+        success: true,
+        images: uploadedImages,
+      });
+    } catch (err) {
+  console.error("UPLOAD ERROR:", err);
+
+  res.status(500).json({
+    success: false,
+    message: err.message,
+  });
+}
+  }
+);
 
 app.post("/api/products", requireAdmin, async (req, res) => {
   try {
@@ -1443,13 +1693,14 @@ app.post("/api/orders", requireUser, async (req, res) => {
       .trim()
       .toUpperCase();
 
-    const cleanCustomer = {
-      name: String(customer?.name || "").trim(),
-      phone: String(customer?.phone || "").replace(/\D/g, ""),
-      address: String(customer?.address || "").trim(),
-      city: String(customer?.city || "").trim(),
-      pincode: String(customer?.pincode || "").replace(/\D/g, ""),
-    };
+   const cleanCustomer = {
+  name: String(customer?.name || "").trim(),
+  phone: String(customer?.phone || "").replace(/\D/g, ""),
+  state: String(customer?.state || "").trim(),
+  address: String(customer?.address || "").trim(),
+  city: String(customer?.city || "").trim(),
+  pincode: String(customer?.pincode || "").replace(/\D/g, ""),
+};
 
     if (
       !cleanCustomer.name ||
@@ -1515,7 +1766,7 @@ app.post("/api/orders", requireUser, async (req, res) => {
           product: product._id,
           brand: product.brand,
           title: product.title,
-          image: product.image,
+          images: product.images || [],
           price: product.price,
           quantity,
           subtotal: lineTotal,
@@ -1695,6 +1946,23 @@ app.post("/api/orders/:id/cancel", requireAdmin, async (req, res) => {
     await session.endSession();
   }
 });
+
+const updateProductRating = async (productId) => {
+  const reviews = await Review.find({ product: productId });
+
+  const totalReviews = reviews.length;
+
+  const averageRating =
+    totalReviews === 0
+      ? 0
+      : reviews.reduce((sum, review) => sum + review.rating, 0) /
+        totalReviews;
+
+  await Product.findByIdAndUpdate(productId, {
+    rating: Number(averageRating.toFixed(1)),
+    reviews: totalReviews,
+  });
+};
 
 const startServer = async () => {
   try {
