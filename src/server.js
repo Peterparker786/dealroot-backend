@@ -134,6 +134,7 @@ const orderStatuses = [
   "cancelled",
 ];
 const couponSchema = new mongoose.Schema(
+  
   {
     code: {
       type: String,
@@ -161,6 +162,51 @@ const couponSchema = new mongoose.Schema(
     },
 
     expiryDate: Date,
+
+    active: {
+      type: Boolean,
+      default: true,
+    },
+  },
+  { timestamps: true }
+);
+const bannerSchema = new mongoose.Schema(
+  {
+    title: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+
+    subtitle: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+
+    couponCode: {
+      type: String,
+      default: "",
+      trim: true,
+      uppercase: true,
+    },
+
+    buttonText: {
+      type: String,
+      default: "Shop Now",
+      trim: true,
+    },
+
+    buttonLink: {
+      type: String,
+      default: "/products",
+      trim: true,
+    },
+
+    image: {
+      type: String,
+      default: "",
+    },
 
     active: {
       type: Boolean,
@@ -304,7 +350,12 @@ const orderSchema = new mongoose.Schema(
       uppercase: true,
     },
     discountAmount: { type: Number, default: 0, min: 0 },
-    totalAmount: { type: Number, required: true, min: 0 },
+    totalAmount: {
+  type: Number,
+  required: true,
+  min: 0,
+},
+  
     deliveryType: {
       type: String,
       enum: ["local", "courier"],
@@ -317,9 +368,30 @@ const orderSchema = new mongoose.Schema(
     },
     paymentStatus: {
       type: String,
-      enum: ["pending", "paid", "failed", "refunded"],
+      enum: [
+  "pending",
+  "partially_paid",
+  "paid",
+  "failed",
+  "refunded",
+],
       default: "pending",
     },
+    deliveryChargePaid: {
+  type: Boolean,
+  default: false,
+},
+
+deliveryChargeAmount: {
+  type: Number,
+  default: 0,
+},
+
+codAmount: {
+  type: Number,
+  default: 0,
+},
+
     razorpayOrderId: {
       type: String,
       default: "",
@@ -402,7 +474,25 @@ const paymentSessionSchema = new mongoose.Schema(
     },
     discountAmount: { type: Number, default: 0, min: 0 },
     totalAmount: { type: Number, required: true, min: 0 },
-    amountInPaise: { type: Number, required: true, min: 1 },
+
+payableNow: {
+  type: Number,
+  required: true,
+  min: 0,
+},
+
+codAmount: {
+  type: Number,
+  default: 0,
+},
+
+paymentMethod: {
+  type: String,
+  enum: ["cod", "razorpay"],
+  default: "razorpay",
+},
+
+amountInPaise: { type: Number, required: true, min: 1 },
     deliveryType: {
       type: String,
       enum: ["local", "courier"],
@@ -468,6 +558,7 @@ const userSchema = new mongoose.Schema(
 
 const Product = mongoose.model("Product", productSchema);
 const Coupon = mongoose.model("Coupon", couponSchema);
+const Banner = mongoose.model("Banner", bannerSchema);
 const Review = mongoose.model("Review", reviewSchema);
 const Order = mongoose.model("Order", orderSchema);
 const PaymentSession = mongoose.model(
@@ -640,6 +731,7 @@ const getRazorpay = () => {
 const cleanDeliveryCustomer = (customer) => ({
   name: String(customer?.name || "").trim(),
   phone: String(customer?.phone || "").replace(/\D/g, ""),
+  state: String(customer?.state || "").trim(),
   address: String(customer?.address || "").trim(),
   city: String(customer?.city || "").trim(),
   pincode: String(customer?.pincode || "").replace(/\D/g, ""),
@@ -647,12 +739,14 @@ const cleanDeliveryCustomer = (customer) => ({
 
 const validateDeliveryCustomer = (customer) => {
   if (
-    !customer.name ||
-    !customer.address ||
-    !customer.city ||
-    customer.phone.length !== 10 ||
-    customer.pincode.length !== 6
-  ) {
+  !customer.name ||
+  !customer.state ||
+  !customer.address ||
+  !customer.city ||
+  customer.phone.length !== 10 ||
+  customer.pincode.length !== 6
+)
+  {
     throw new Error("Please enter valid delivery details");
   }
 };
@@ -667,6 +761,7 @@ const buildOnlinePaymentQuote = async ({
   customer,
   items,
   couponCode,
+  paymentMethod = "razorpay",
 }) => {
   const cleanCustomer = cleanDeliveryCustomer(customer);
   validateDeliveryCustomer(cleanCustomer);
@@ -745,11 +840,21 @@ const buildOnlinePaymentQuote = async ({
   const isKanpurAddress = normalizedCity.includes("kanpur");
   const deliveryFee =
     subtotal >= 499 ? 0 : isKanpurAddress ? 29 : 49;
-  const totalAmount = roundMoney(
-    subtotal - discountAmount + deliveryFee
-  );
-  const amountInPaise = Math.round(totalAmount * 100);
+ const totalAmount = roundMoney(
+  subtotal - discountAmount + deliveryFee
+);
 
+const isCod = paymentMethod === "cod";
+
+const payableNow = roundMoney(
+  isCod ? deliveryFee : totalAmount
+);
+
+const codAmount = roundMoney(
+  isCod ? totalAmount - deliveryFee : 0
+);
+
+const amountInPaise = Math.round(payableNow * 100);
   if (amountInPaise < 1) {
     throw new Error("Order total must be greater than zero");
   }
@@ -763,6 +868,8 @@ const buildOnlinePaymentQuote = async ({
     discountAmount,
     totalAmount,
     amountInPaise,
+    payableNow,
+    codAmount,
     deliveryType: isKanpurAddress ? "local" : "courier",
   };
 };
@@ -893,8 +1000,22 @@ const finaliseRazorpayPayment = async ({
             discountAmount: currentPaymentSession.discountAmount,
             totalAmount: currentPaymentSession.totalAmount,
             deliveryType: currentPaymentSession.deliveryType,
-            paymentMethod: "razorpay",
-            paymentStatus: "paid",
+            paymentMethod: currentPaymentSession.paymentMethod,
+
+paymentStatus:
+  currentPaymentSession.paymentMethod === "cod"
+    ? "partially_paid"
+    : "paid",
+
+deliveryChargePaid:
+  currentPaymentSession.paymentMethod === "cod",
+
+deliveryChargeAmount:
+  currentPaymentSession.paymentMethod === "cod"
+    ? currentPaymentSession.payableNow
+    : currentPaymentSession.deliveryFee,
+
+codAmount: currentPaymentSession.codAmount,
             razorpayOrderId: currentPaymentSession.razorpayOrderId,
             razorpayPaymentId: payment.id,
             razorpaySignature,
@@ -1363,6 +1484,149 @@ app.post(
   }
 );
 
+// ===========================
+// BANNER APIS
+// ===========================
+
+// Create Banner
+app.post("/api/banners", requireAdmin, async (req, res) => {
+  try {
+    const {
+      title,
+      subtitle,
+      couponCode,
+      buttonText,
+      buttonLink,
+      image,
+      active,
+    } = req.body;
+
+    if (!title) {
+      return res.status(400).json({
+        success: false,
+        message: "Banner title is required",
+      });
+    }
+
+    const banner = await Banner.create({
+      title,
+      subtitle,
+      couponCode,
+      buttonText,
+      buttonLink,
+      image,
+      active,
+    });
+
+    res.status(201).json({
+      success: true,
+      banner,
+      message: "Banner created successfully",
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+// Get All Banners
+app.get("/api/banners", async (req, res) => {
+  try {
+    const banners = await Banner.find().sort({
+      createdAt: -1,
+    });
+
+    res.json({
+      success: true,
+      banners,
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+// Get Active Banner
+app.get("/api/banners/active", async (req, res) => {
+  try {
+    const banner = await Banner.findOne({
+      active: true,
+    }).sort({
+      createdAt: -1,
+    });
+
+    res.json({
+      success: true,
+      banner,
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+// Update Banner
+app.put("/api/banners/:id", requireAdmin, async (req, res) => {
+  try {
+    const banner = await Banner.findByIdAndUpdate(
+      req.params.id,
+      req.body,
+      {
+        new: true,
+        runValidators: true,
+      }
+    );
+
+    if (!banner) {
+      return res.status(404).json({
+        success: false,
+        message: "Banner not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Banner updated successfully",
+      banner,
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+// Delete Banner
+app.delete("/api/banners/:id", requireAdmin, async (req, res) => {
+  try {
+    const banner = await Banner.findByIdAndDelete(req.params.id);
+
+    if (!banner) {
+      return res.status(404).json({
+        success: false,
+        message: "Banner not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Banner deleted successfully",
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+
 app.post("/api/coupons", requireAdmin, async (req, res) => {
   try {
     const {
@@ -1642,7 +1906,10 @@ app.post(
   async (req, res) => {
     try {
       const instance = getRazorpay();
-      const quote = await buildOnlinePaymentQuote(req.body);
+      const quote = await buildOnlinePaymentQuote({
+  ...req.body,
+  paymentMethod: req.body.paymentMethod,
+});
       const orderNumber = createOrderNumber();
 
       const razorpayOrder = await instance.orders.create({
@@ -1663,6 +1930,9 @@ app.post(
         couponCode: quote.couponCode,
         discountAmount: quote.discountAmount,
         totalAmount: quote.totalAmount,
+        payableNow: quote.payableNow,
+codAmount: quote.codAmount,
+paymentMethod: req.body.paymentMethod || "razorpay",
         amountInPaise: quote.amountInPaise,
         deliveryType: quote.deliveryType,
         razorpayOrderId: razorpayOrder.id,
