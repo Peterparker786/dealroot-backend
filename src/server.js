@@ -1449,25 +1449,35 @@ app.post(
         });
       }
 
-      const uploadedImages = [];
+     const uploadedImages = [];
 
-      for (const file of req.files) {
-        const result = await new Promise((resolve, reject) => {
-          cloudinary.uploader
-            .upload_stream(
-              {
-                folder: "dealroot-products",
-              },
-              (error, result) => {
-                if (error) reject(error);
-                else resolve(result);
-              }
-            )
-            .end(file.buffer);
-        });
-
-        uploadedImages.push(result.secure_url);
+for (const file of req.files) {
+  const result = await new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        folder: "dealroot-products",
+        transformation: [
+          {
+            width: 800,
+            height: 800,
+            crop: "fill",
+            gravity: "auto",
+            quality: "auto",
+            fetch_format: "auto",
+          },
+        ],
+      },
+      (error, result) => {
+        if (error) return reject(error);
+        resolve(result);
       }
+    );
+
+    stream.end(file.buffer);
+  });
+
+  uploadedImages.push(result.secure_url);
+}
 
       res.json({
         success: true,
