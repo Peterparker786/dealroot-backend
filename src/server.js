@@ -6,6 +6,7 @@ const cors = require("cors");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const bcrypt = require("bcryptjs");
+const nodemailer = require("nodemailer");
 const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
 const Razorpay = require("razorpay");
@@ -13,6 +14,39 @@ const multer = require("multer");
 const { v2: cloudinary } = require("cloudinary");
 
 const app = express();
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+});
+async function sendOTP(email, otp) {
+  await transporter.sendMail({
+    from: `"Dealroot" <${process.env.EMAIL_USER}>`,
+    to: email,
+    subject: "Dealroot Password Reset OTP",
+    html: `
+      <div style="font-family:Arial;padding:30px">
+        <h2>Reset your password</h2>
+
+        <p>Your Dealroot verification code is:</p>
+
+        <h1 style="
+          letter-spacing:8px;
+          color:#2563eb;
+        ">
+          ${otp}
+        </h1>
+
+        <p>This OTP will expire in 10 minutes.</p>
+
+        <p>If you didn't request this, ignore this email.</p>
+      </div>
+    `,
+  });
+}
+
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
@@ -259,6 +293,13 @@ reviews: {
         url: { type: String, trim: true },
       },
     ],
+    specifications: [
+      {
+        label: { type: String, trim: true },
+        value: { type: String, trim: true },
+      },
+    ],
+    highlights: [{ type: String, trim: true }],
   },
   { timestamps: true }
 );
@@ -547,6 +588,23 @@ const userSchema = new mongoose.Schema(
       index: true,
     },
     passwordHash: { type: String, required: true, select: false },
+    resetOTP: {
+  type: String,
+  default: null,
+  resetOTP: {
+  type: String,
+  default: "",
+},
+
+otpExpiry: {
+  type: Date,
+},
+},
+
+otpExpiry: {
+  type: Date,
+  default: null,
+},
     phone: { type: String, default: "", trim: true },
     address: { type: String, default: "", trim: true },
     state: { type: String, default: "Uttar Pradesh", trim: true },
@@ -710,6 +768,23 @@ const productPayload = (body) => {
 
     isFeatured: Boolean(body.isFeatured),
     marketplaceLinks: sanitizeMarketplaceLinks(body.marketplaceLinks),
+
+    specifications: Array.isArray(body.specifications)
+      ? body.specifications
+          .map((spec) => ({
+            label: String(spec?.label || "").trim(),
+            value: String(spec?.value || "").trim(),
+          }))
+          .filter((spec) => spec.label && spec.value)
+          .slice(0, 30)
+      : [],
+
+    highlights: Array.isArray(body.highlights)
+      ? body.highlights
+          .map((item) => String(item || "").trim())
+          .filter(Boolean)
+          .slice(0, 15)
+      : [],
   };
 };
 
@@ -1218,6 +1293,137 @@ app.post("/api/auth/login", customerAuthLimiter, async (req, res) => {
     res.status(500).json({ success: false, message: "Could not log in" });
   }
 });
+app.post("/api/auth/forgot-password", async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    const user = await User.findOne({ email });
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "Email not found",
+      });
+    }
+
+    const otp = Math.floor(
+      100000 + Math.random() * 900000
+    ).toString();
+
+    user.resetOTP = otp;
+    user.otpExpiry = Date.now() + 10 * 60 * 1000;
+
+    await user.save();
+
+    await sendOTP(email, otp);
+
+    res.json({
+      success: true,
+      message: "OTP sent successfully",
+    });
+
+  } catch (err) {
+
+    console.log(err);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to send OTP",
+    });
+  }
+});
+
+app.post("/api/auth/verify-otp", async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+
+    const user = await User.findOne({ email });
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    if (user.resetOTP !== otp) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid OTP",
+      });
+    }
+
+    if (!user.otpExpiry || user.otpExpiry < Date.now()) {
+      return res.status(400).json({
+        success: false,
+        message: "OTP expired",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "OTP verified",
+    });
+
+  } catch (err) {
+    console.log(err);
+
+    res.status(500).json({
+      success: false,
+      message: "Server Error",
+    });
+  }
+});
+
+app.post("/api/auth/reset-password", async (req, res) => {
+  try {
+    const { email, otp, password } = req.body;
+
+    const user = await User.findOne({
+      email,
+    }).select("+passwordHash");
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    if (
+      user.resetOTP !== otp ||
+      !user.otpExpiry ||
+      user.otpExpiry < Date.now()
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid or expired OTP",
+      });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    user.passwordHash = hashedPassword;
+    user.resetOTP = "";
+    user.otpExpiry = null;
+
+    await user.save();
+
+    res.json({
+      success: true,
+      message: "Password reset successfully",
+    });
+
+  } catch (err) {
+    console.log(err);
+
+    res.status(500).json({
+      success: false,
+      message: "Server Error",
+    });
+  }
+});
+
 
 app.get("/api/auth/me", requireUser, async (req, res) => {
   const user = await User.findById(req.user.userId);
@@ -1436,6 +1642,436 @@ app.post("/api/reviews", requireUser, async (req, res) => {
     });
   }
 });
+// ===========================
+// AI SCREENSHOT EXTRACTION
+// ===========================
+
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+
+// Extract product info (specs + highlights) from a product screenshot
+// using Google Gemini vision. Returns structured JSON.
+const extractProductFromScreenshot = async (imageBuffer, mimeType) => {
+  const model = "gemini-flash-latest";
+  const prompt = `
+You are a product data extraction assistant for an e-commerce store.
+Look at this product screenshot (from Amazon, Flipkart, Myntra or any store)
+and extract the product details into strict JSON with this EXACT shape:
+
+{
+  "brand": "string",
+  "title": "string",
+  "price": 0,
+  "mrp": 0,
+  "description": "string",
+  "specifications": [ { "label": "string", "value": "string" } ],
+  "highlights": [ "string" ]
+}
+
+Rules:
+- specifications: key-value pairs like { "label": "Hair Type", "value": "All" },
+  { "label": "Scent", "value": "Rosemary Oil Shots" }, { "label": "Liquid Volume", "value": "48 Millilitres" },
+  { "label": "Brand", "value": "..." }, { "label": "Number of Items", "value": "8" },
+  { "label": "Net Quantity", "value": "..." }, { "label": "Item Form", "value": "Oil" }.
+  Extract as many real labels/values as visible. Skip unknown ones.
+- highlights: short bullet phrases like "Improves blood circulation to the scalp",
+  "Deeply nourishes the scalp", "Strengthens hair follicles reducing breakage" (max 8).
+- price/mrp: numeric values only (strip currency symbols). Use 0 when unknown.
+- Return ONLY valid JSON. No markdown, no extra text.
+`;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 45000);
+
+  let response;
+
+  try {
+    response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": GEMINI_API_KEY,
+        },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                { text: prompt },
+                {
+                  inline_data: {
+                    mime_type: mimeType,
+                    data: imageBuffer.toString("base64"),
+                  },
+                },
+              ],
+            },
+          ],
+          generationConfig: {
+            temperature: 0.2,
+            maxOutputTokens: 2048,
+            responseMimeType: "application/json",
+          },
+        }),
+        signal: controller.signal,
+      }
+    );
+  } catch (fetchError) {
+    if (fetchError.name === "AbortError") {
+      throw new Error("AI request timed out. Please try again.");
+    }
+    throw fetchError;
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Gemini API error (${response.status}): ${errorText.slice(0, 300)}`);
+  }
+
+  const data = await response.json();
+  const text =
+    data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+
+  // Strip markdown fences if present, then parse JSON
+  const cleaned = text
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "")
+    .trim();
+
+  let parsed;
+
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch {
+    throw new Error(
+      "AI se sahi data nahi mila. Clear / close-up screenshot try karein."
+    );
+  }
+
+  return {
+    brand: String(parsed.brand || ""),
+    title: String(parsed.title || ""),
+    price: Number(parsed.price) || 0,
+    mrp: Number(parsed.mrp) || 0,
+    description: String(parsed.description || ""),
+    specifications: Array.isArray(parsed.specifications)
+      ? parsed.specifications
+          .map((spec) => ({
+            label: String(spec?.label || "").trim(),
+            value: String(spec?.value || "").trim(),
+          }))
+          .filter((spec) => spec.label && spec.value)
+          .slice(0, 30)
+      : [],
+    highlights: Array.isArray(parsed.highlights)
+      ? parsed.highlights
+          .map((item) => String(item).trim())
+          .filter(Boolean)
+          .slice(0, 15)
+      : [],
+  };
+};
+
+// Upload a single image buffer to Cloudinary and return the secure URL
+const uploadBufferToCloudinary = (buffer) =>
+  new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        folder: "dealroot-products",
+        transformation: [
+          {
+            width: 800,
+            height: 800,
+            crop: "fill",
+            gravity: "auto",
+            quality: "auto",
+            fetch_format: "auto",
+          },
+        ],
+      },
+      (error, result) => {
+        if (error) return reject(error);
+        resolve(result.secure_url);
+      }
+    );
+    stream.end(buffer);
+  });
+
+// Pull product image URLs (og:image, twitter:image, JSON-LD, common patterns)
+// out of raw page HTML so we can reuse the original product photos.
+const extractProductImagesFromHtml = (html, baseUrl) => {
+  const images = [];
+
+  const ogMatch = html.match(
+    /<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']+)["']/i
+  );
+  if (ogMatch) images.push(ogMatch[1]);
+
+  const twitterMatch = html.match(
+    /<meta[^>]*name=["']twitter:image["'][^>]*content=["']([^"']+)["']/i
+  );
+  if (twitterMatch && !images.includes(twitterMatch[1])) {
+    images.push(twitterMatch[1]);
+  }
+
+  const jsonLdBlocks =
+    html.match(
+      /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi
+    ) || [];
+
+  for (const block of jsonLdBlocks) {
+    const text = block.replace(/<\/?script[^>]*>/gi, "");
+    try {
+      const parsed = JSON.parse(text);
+      const collect = (node) => {
+        if (!node || typeof node !== "object") return;
+        if (Array.isArray(node)) {
+          node.forEach(collect);
+          return;
+        }
+        const nodeTypes = Array.isArray(node["@type"])
+          ? node["@type"]
+          : [node["@type"]];
+
+        if (nodeTypes.includes("Product") && node.image) {
+          const imgs = Array.isArray(node.image)
+            ? node.image
+            : [node.image];
+          imgs.forEach((img) => {
+            const src = typeof img === "string" ? img : img?.url;
+            if (src) images.push(src);
+          });
+        }
+        Object.values(node).forEach(collect);
+      };
+      collect(parsed);
+    } catch {
+      // ignore malformed JSON-LD
+    }
+  }
+
+  const srcMatches =
+    html.match(
+      /(?:data-src|src)=["'](https?:\/\/[^"']*(?:large|product|image)[^"']*\.(?:jpg|jpeg|png|webp))["']/gi
+    ) || [];
+
+  srcMatches.slice(0, 8).forEach((match) => {
+    const url = match.match(/["']([^"']+)["']/)?.[1];
+    if (url && !images.includes(url)) images.push(url);
+  });
+
+  return images
+    .map((img) => {
+      try {
+        return new URL(img, baseUrl).href;
+      } catch {
+        return img;
+      }
+    })
+    .filter((img) => /^https?:\/\//i.test(img))
+    .filter((url, index, array) => array.indexOf(url) === index)
+    .slice(0, 10);
+};
+
+app.post(
+  "/api/products/extract-info",
+  requireAdmin,
+  upload.single("image"),
+  async (req, res) => {
+    try {
+      if (!GEMINI_API_KEY) {
+        return res.status(503).json({
+          success: false,
+          message:
+            "GEMINI_API_KEY is not set in the backend .env file. Get a free key at https://aistudio.google.com/apikey and add it, then restart the backend.",
+        });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({
+          success: false,
+          message: "Please choose a screenshot image",
+        });
+      }
+
+      const info = await extractProductFromScreenshot(
+        req.file.buffer,
+        req.file.mimetype || "image/png"
+      );
+
+      // Also keep the screenshot itself as a product image candidate
+      let screenshotUrl = "";
+
+      try {
+        screenshotUrl = await uploadBufferToCloudinary(req.file.buffer);
+      } catch {
+        screenshotUrl = "";
+      }
+
+      res.json({
+        success: true,
+        info,
+        images: screenshotUrl ? [screenshotUrl] : [],
+      });
+    } catch (error) {
+      console.error("AI extraction failed:", error.message);
+      res.status(500).json({
+        success: false,
+        message: error.message || "Could not extract product info",
+      });
+    }
+  }
+);
+
+app.post(
+  "/api/products/extract-from-link",
+  requireAdmin,
+  async (req, res) => {
+    try {
+      if (!GEMINI_API_KEY) {
+        return res.status(503).json({
+          success: false,
+          message:
+            "GEMINI_API_KEY is not set in the backend .env file. Get a free key at https://aistudio.google.com/apikey and add it, then restart the backend.",
+        });
+      }
+
+      const url = String(req.body?.url || "").trim();
+
+      if (!/^https?:\/\//i.test(url)) {
+        return res.status(400).json({
+          success: false,
+          message: "Valid product link paste karein (https://...)",
+        });
+      }
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 30000);
+
+      let pageResponse;
+
+      try {
+        pageResponse = await fetch(url, {
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+            "Accept-Language": "en-IN,en;q=0.9,hi;q=0.8",
+          },
+          redirect: "follow",
+          signal: controller.signal,
+        });
+      } catch (fetchError) {
+        if (fetchError.name === "AbortError") {
+          throw new Error("Link se page load nahi hua — timeout. Dobara try karein.");
+        }
+        throw new Error("Product page khul nahi paayi. Link check karein.");
+      } finally {
+        clearTimeout(timeout);
+      }
+
+      if (!pageResponse.ok) {
+        throw new Error(
+          `Product page khul nahi paayi (status ${pageResponse.status}). Link check karein.`
+        );
+      }
+
+      const html = (await pageResponse.text()).slice(0, 3000000);
+      const pageImages = extractProductImagesFromHtml(html, url);
+
+      if (pageImages.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Is link se product image nahi mili — screenshot option use karein",
+        });
+      }
+
+      // Download the main product image and run the same vision extraction
+      const mainImage = pageImages[0];
+      const imageController = new AbortController();
+      const imageTimeout = setTimeout(
+        () => imageController.abort(),
+        30000
+      );
+
+      let imageResponse;
+
+      try {
+        imageResponse = await fetch(mainImage, {
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+          },
+          signal: imageController.signal,
+        });
+      } catch {
+        throw new Error("Product image download nahi ho payi — screenshot try karein");
+      } finally {
+        clearTimeout(imageTimeout);
+      }
+
+      const imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
+      const mimeType =
+        imageResponse.headers.get("content-type") || "image/jpeg";
+
+      const info = await extractProductFromScreenshot(
+        imageBuffer,
+        mimeType
+      );
+
+      // Upload the extracted product photos to Cloudinary so the storefront
+      // can use them directly.
+      const uploadedImages = [];
+
+      for (const imgUrl of pageImages.slice(0, 5)) {
+        const controller2 = new AbortController();
+        const timeout2 = setTimeout(() => controller2.abort(), 20000);
+
+        try {
+          const response2 = await fetch(imgUrl, {
+            headers: {
+              "User-Agent":
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+            },
+            signal: controller2.signal,
+          });
+
+          const buffer2 = Buffer.from(await response2.arrayBuffer());
+          const type2 = response2.headers.get("content-type") || "";
+          const looksLikeImage =
+            /^image\//i.test(type2) ||
+            (!type2 && /\.(jpe?g|png|webp|gif)$/i.test(imgUrl));
+
+          if (buffer2.length > 20000 && looksLikeImage) {
+            const secureUrl = await uploadBufferToCloudinary(buffer2);
+            if (secureUrl && !uploadedImages.includes(secureUrl)) {
+              uploadedImages.push(secureUrl);
+            }
+          }
+        } catch {
+          // skip broken images
+        } finally {
+          clearTimeout(timeout2);
+        }
+      }
+
+      res.json({
+        success: true,
+        info,
+        images: uploadedImages,
+      });
+    } catch (error) {
+      console.error("Link extraction failed:", error.message);
+      res.status(500).json({
+        success: false,
+        message: error.message || "Could not extract from link",
+      });
+    }
+  }
+);
+
 app.post(
   "/api/upload",
   requireAdmin,
