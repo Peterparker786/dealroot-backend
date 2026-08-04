@@ -208,7 +208,7 @@ const bannerSchema = new mongoose.Schema(
   {
     title: {
       type: String,
-      required: true,
+      default: "Offer Banner",
       trim: true,
     },
 
@@ -1485,7 +1485,15 @@ app.get("/api/products", async (req, res) => {
         });
       }
 
-      filter.dealType = String(dealType);
+      // Price-based automatic filtering: the ₹99 deal shows every
+      // product priced at or below ₹99, the ₹199 deal everything
+      // at or below ₹199 — no manual dealType tagging needed.
+      const dealLimit = Number(dealType);
+      if (Number.isFinite(dealLimit) && dealLimit > 0) {
+        filter.price = { $lte: dealLimit };
+      } else {
+        filter.dealType = String(dealType);
+      }
     }
 
     if (search) {
@@ -1650,11 +1658,15 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 
 // Extract product info (specs + highlights) from a product screenshot
 // using Google Gemini vision. Returns structured JSON.
-const extractProductFromScreenshot = async (imageBuffer, mimeType) => {
+const extractProductFromScreenshot = async (
+  imageBuffer,
+  mimeType,
+  contextText = ""
+) => {
   const model = "gemini-flash-latest";
   const prompt = `
 You are a product data extraction assistant for an e-commerce store.
-Look at this product screenshot (from Amazon, Flipkart, Myntra or any store)
+Look at this product image (from Amazon, Flipkart, Myntra or any store)
 and extract the product details into strict JSON with this EXACT shape:
 
 {
@@ -1667,6 +1679,11 @@ and extract the product details into strict JSON with this EXACT shape:
   "highlights": [ "string" ]
 }
 
+${
+    contextText
+      ? `Known context about this product (use it to fill brand/title/specs even if the image is a packshot):\n${contextText}\n\n`
+      : ""
+  }
 Rules:
 - specifications: key-value pairs like { "label": "Hair Type", "value": "All" },
   { "label": "Scent", "value": "Rosemary Oil Shots" }, { "label": "Liquid Volume", "value": "48 Millilitres" },
@@ -1750,14 +1767,31 @@ Rules:
     );
   }
 
+  // Some models return an array of detected products — pick the first/main one
+  if (Array.isArray(parsed)) {
+    parsed = parsed[0] && typeof parsed[0] === "object" ? parsed[0] : {};
+  }
+
+  const pick = (node, key) =>
+    node && typeof node === "object" ? node[key] : undefined;
+
+  // If brand/title/price are nested (e.g. inside .product or .data), unwrap
+  let dataNode = parsed;
+  if (
+    !pick(dataNode, "title") &&
+    typeof dataNode.product === "object"
+  ) {
+    dataNode = dataNode.product;
+  }
+
   return {
-    brand: String(parsed.brand || ""),
-    title: String(parsed.title || ""),
-    price: Number(parsed.price) || 0,
-    mrp: Number(parsed.mrp) || 0,
-    description: String(parsed.description || ""),
-    specifications: Array.isArray(parsed.specifications)
-      ? parsed.specifications
+    brand: String(pick(dataNode, "brand") || ""),
+    title: String(pick(dataNode, "title") || ""),
+    price: Number(pick(dataNode, "price")) || 0,
+    mrp: Number(pick(dataNode, "mrp")) || 0,
+    description: String(pick(dataNode, "description") || ""),
+    specifications: Array.isArray(pick(dataNode, "specifications"))
+      ? pick(dataNode, "specifications")
           .map((spec) => ({
             label: String(spec?.label || "").trim(),
             value: String(spec?.value || "").trim(),
@@ -1765,8 +1799,8 @@ Rules:
           .filter((spec) => spec.label && spec.value)
           .slice(0, 30)
       : [],
-    highlights: Array.isArray(parsed.highlights)
-      ? parsed.highlights
+    highlights: Array.isArray(pick(dataNode, "highlights"))
+      ? pick(dataNode, "highlights")
           .map((item) => String(item).trim())
           .filter(Boolean)
           .slice(0, 15)
@@ -1799,23 +1833,82 @@ const uploadBufferToCloudinary = (buffer) =>
     stream.end(buffer);
   });
 
-// Pull product image URLs (og:image, twitter:image, JSON-LD, common patterns)
-// out of raw page HTML so we can reuse the original product photos.
+// Pull REAL product image URLs out of raw page HTML.
+// Strategy (highest priority first):
+//   1. Amazon "colorImages" JSON — the actual product gallery (MAIN variant first)
+//   2. og:image / twitter:image
+//   3. JSON-LD Product images
+//   4. Generic m.media-amazon.com/images/I/... photos (suffix stripped)
+//   5. Generic src patterns (de-prioritized)
+// Junk (CSS/JS/sprites/logos/promos) is filtered out.
 const extractProductImagesFromHtml = (html, baseUrl) => {
-  const images = [];
+  const found = [];
 
+  const push = (url, priority) => {
+    if (!url || typeof url !== "string") return;
+    url = url.trim();
+    if (!/^https?:\/\//i.test(url)) return;
+    if (/\.(css|js|gif|svg)(\?|$)/i.test(url)) return;
+    if (/sprite|sprites|logo|icon|badge|promo|banner|_CB\d/i.test(url)) return;
+    const clean = url.split("?")[0];
+    if (!found.some((f) => f.url === clean)) {
+      found.push({ url: clean, priority });
+    }
+  };
+
+  // 1) Amazon colorImages JSON — e.g.
+  //    "colorImages":{"6 ml (Pack of 8)":[{"large":"...jpg","variant":"MAIN",...}]}
+  const colorIndex = html.indexOf('"colorImages"');
+  if (colorIndex !== -1) {
+    const colon = html.indexOf(":", colorIndex + 12);
+    const start = html.indexOf("{", colon);
+    if (start !== -1) {
+      let depth = 0;
+      let end = start;
+      for (; end < Math.min(html.length, start + 3000000); end++) {
+        if (html[end] === "{") depth++;
+        else if (html[end] === "}") {
+          depth--;
+          if (depth === 0) break;
+        }
+      }
+      try {
+        const parsed = JSON.parse(html.slice(start, end + 1));
+        const entries = [];
+        Object.values(parsed).forEach((arr) => {
+          if (!Array.isArray(arr)) return;
+          arr.forEach((img) => {
+            if (img && typeof img === "object") {
+              const large = img.large || img.hiRes || "";
+              if (large) {
+                entries.push({
+                  url: large,
+                  isMain: img.variant === "MAIN",
+                });
+              }
+            }
+          });
+        });
+        entries.sort((a, b) => Number(b.isMain) - Number(a.isMain));
+        entries.forEach((e) => push(e.url, 10));
+      } catch {
+        // ignore malformed JSON
+      }
+    }
+  }
+
+  // 2) og:image / twitter:image
   const ogMatch = html.match(
     /<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']+)["']/i
   );
-  if (ogMatch) images.push(ogMatch[1]);
+  if (ogMatch) push(ogMatch[1], 6);
 
   const twitterMatch = html.match(
     /<meta[^>]*name=["']twitter:image["'][^>]*content=["']([^"']+)["']/i
   );
-  if (twitterMatch && !images.includes(twitterMatch[1])) {
-    images.push(twitterMatch[1]);
-  }
+  if (twitterMatch) push(twitterMatch[1], 5);
 
+  // 3) JSON-LD Product images
   const jsonLdBlocks =
     html.match(
       /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi
@@ -1841,7 +1934,7 @@ const extractProductImagesFromHtml = (html, baseUrl) => {
             : [node.image];
           imgs.forEach((img) => {
             const src = typeof img === "string" ? img : img?.url;
-            if (src) images.push(src);
+            if (src) push(src, 4);
           });
         }
         Object.values(node).forEach(collect);
@@ -1852,6 +1945,22 @@ const extractProductImagesFromHtml = (html, baseUrl) => {
     }
   }
 
+  // 4) Amazon media images (images/I/....jpg), suffix stripped to the base photo
+  const amazonRe =
+    /https:\/\/m\.media-amazon\.com\/images\/I\/[A-Za-z0-9+\-_.]+\.(?:jpg|jpeg|webp|png)/g;
+  const bases = new Set();
+  for (const m of html.match(amazonRe) || []) {
+    const base = m.replace(
+      /\._[A-Z0-9_,-]+_\.(jpg|jpeg|webp|png)$/i,
+      ".$1"
+    );
+    if (!/\.(css|js|gif)(\?|$)/i.test(base)) bases.add(base);
+  }
+  [...bases].slice(0, 10).forEach((b) => push(b, 3));
+
+  // 5) Generic src patterns (large/product/image keywords) as last resort.
+  // NOTE: srcset is deliberately excluded — it contains comma-separated URLs
+  // with size descriptors that would produce malformed URLs.
   const srcMatches =
     html.match(
       /(?:data-src|src)=["'](https?:\/\/[^"']*(?:large|product|image)[^"']*\.(?:jpg|jpeg|png|webp))["']/gi
@@ -1859,20 +1968,21 @@ const extractProductImagesFromHtml = (html, baseUrl) => {
 
   srcMatches.slice(0, 8).forEach((match) => {
     const url = match.match(/["']([^"']+)["']/)?.[1];
-    if (url && !images.includes(url)) images.push(url);
+    if (url) push(url, 2);
   });
 
-  return images
-    .map((img) => {
+  return found
+    .map((f) => {
       try {
-        return new URL(img, baseUrl).href;
+        return { url: new URL(f.url, baseUrl).href, priority: f.priority };
       } catch {
-        return img;
+        return f;
       }
     })
-    .filter((img) => /^https?:\/\//i.test(img))
-    .filter((url, index, array) => array.indexOf(url) === index)
-    .slice(0, 10);
+    .filter((f, index, array) => array.findIndex((x) => x.url === f.url) === index)
+    .sort((a, b) => b.priority - a.priority)
+    .slice(0, 10)
+    .map((f) => f.url);
 };
 
 app.post(
@@ -1980,6 +2090,43 @@ app.post(
       const html = (await pageResponse.text()).slice(0, 3000000);
       const pageImages = extractProductImagesFromHtml(html, url);
 
+      // Pull page title / meta description as extra context for the AI
+      const titleMatch = html.match(
+        /<title[^>]*>([^<]+)<\/title>/i
+      );
+      const descMatch = html.match(
+        /<meta[^>]*name=["']description["'][^>]*content=["']([^"']+)["']/i
+      );
+
+      // Try to grab the price from HTML / JSON-LD so AI doesn't return 0.
+      let priceHint = "";
+      const pricePatterns = [
+        /"offers":\s*{[^}]*"price":\s*"?([0-9,.]+)"?/i,
+        /"priceToPay":\s*{\s*"price":\s*([0-9.]+)/i,
+        /"priceAmount":\s*"?([0-9,.]+)"?/i,
+      ];
+      for (const pattern of pricePatterns) {
+        const match = html.match(pattern);
+        if (match?.[1]) {
+          const value = String(match[1]).replace(/,/g, "");
+          if (Number(value) > 0) {
+            priceHint = `Price: Rs ${value}`;
+            break;
+          }
+        }
+      }
+
+      const contextText = [
+        titleMatch?.[1],
+        descMatch?.[1],
+        priceHint,
+      ]
+        .filter(Boolean)
+        .map((s) => s.trim())
+        .filter((s) => s.length > 3)
+        .join("\n")
+        .slice(0, 1000);
+
       if (pageImages.length === 0) {
         return res.status(400).json({
           success: false,
@@ -2018,7 +2165,8 @@ app.post(
 
       const info = await extractProductFromScreenshot(
         imageBuffer,
-        mimeType
+        mimeType,
+        contextText
       );
 
       // Upload the extracted product photos to Cloudinary so the storefront
@@ -2147,15 +2295,8 @@ app.post("/api/banners", requireAdmin, async (req, res) => {
       active,
     } = req.body;
 
-    if (!title) {
-      return res.status(400).json({
-        success: false,
-        message: "Banner title is required",
-      });
-    }
-
     const banner = await Banner.create({
-      title,
+      title: title || "Offer Banner",
       subtitle,
       couponCode,
       buttonText,
@@ -2198,7 +2339,7 @@ app.get("/api/banners", async (req, res) => {
 // Get Active Banner
 app.get("/api/banners/active", async (req, res) => {
   try {
-    const banner = await Banner.findOne({
+    const banners = await Banner.find({
       active: true,
     }).sort({
       createdAt: -1,
@@ -2206,7 +2347,9 @@ app.get("/api/banners/active", async (req, res) => {
 
     res.json({
       success: true,
-      banner,
+      banners,
+      // Backward-compatible: single banner = first active one
+      banner: banners[0] || null,
     });
   } catch (err) {
     res.status(500).json({
