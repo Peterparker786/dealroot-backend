@@ -358,6 +358,7 @@ const orderSchema = new mongoose.Schema(
     },
     customer: {
       name: { type: String, required: true, trim: true },
+      email: { type: String, default: "", trim: true, lowercase: true },
       phone: { type: String, required: true, trim: true },
       state: { type: String, required: true, trim: true },
       address: { type: String, required: true, trim: true },
@@ -1531,6 +1532,71 @@ app.put("/api/auth/me", requireUser, async (req, res) => {
 app.get("/api/auth/orders", requireUser, async (req, res) => {
   const orders = await Order.find({ user: req.user.userId }).sort({ createdAt: -1 });
   res.json({ success: true, count: orders.length, orders });
+});
+
+// Public order tracking — no login needed. Look up by order number or email.
+app.post("/api/orders/track", async (req, res) => {
+  try {
+    const orderId = String(req.body?.orderId || "").trim().toUpperCase();
+    const email = String(req.body?.email || "").trim().toLowerCase();
+
+    if (!orderId && !email) {
+      return res.status(400).json({
+        success: false,
+        message: "Please enter your order ID or email to track your order",
+      });
+    }
+
+    let orders = [];
+
+    if (orderId) {
+      const order = await Order.findOne({ orderNumber: orderId });
+      if (order) orders.push(order);
+    }
+
+    if (email) {
+      const emailMatches = await Order.find({
+        "customer.email": email,
+      }).sort({ createdAt: -1 });
+
+      for (const order of emailMatches) {
+        if (!orders.some((o) => String(o._id) === String(order._id))) {
+          orders.push(order);
+        }
+      }
+
+      // Older orders may not store the email on the customer record —
+      // also match orders placed by a registered account with this email.
+      const account = await User.findOne({ email }).select("_id");
+
+      if (account) {
+        const accountOrders = await Order.find({
+          user: account._id,
+        }).sort({ createdAt: -1 });
+
+        for (const order of accountOrders) {
+          if (!orders.some((o) => String(o._id) === String(order._id))) {
+            orders.push(order);
+          }
+        }
+      }
+    }
+
+    if (orders.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "No order found. Please double-check your order ID or email.",
+      });
+    }
+
+    res.json({ success: true, count: orders.length, orders });
+  } catch (error) {
+    console.error("Track order failed:", error.message);
+    res.status(500).json({
+      success: false,
+      message: "Could not track your order. Please try again.",
+    });
+  }
 });
 
 app.get("/api/products", async (req, res) => {
@@ -3011,6 +3077,7 @@ app.post("/api/orders", requireUser, async (req, res) => {
 
    const cleanCustomer = {
   name: String(customer?.name || "").trim(),
+  email: String(customer?.email || req.user?.email || "").trim().toLowerCase(),
   phone: String(customer?.phone || "").replace(/\D/g, ""),
   state: String(customer?.state || "").trim(),
   address: String(customer?.address || "").trim(),
