@@ -258,7 +258,7 @@ const productSchema = new mongoose.Schema(
     category: {
       type: String,
       required: true,
-      enum: allowedCategories,
+      trim: true,
     },
     price: { type: Number, required: true, min: 0 },
     mrp: { type: Number, required: true, min: 0 },
@@ -625,6 +625,75 @@ const PaymentSession = mongoose.model(
 );
 const User = mongoose.model("User", userSchema);
 
+const categorySchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true, unique: true, trim: true },
+    emoji: { type: String, default: "✨" },
+    color: { type: String, default: "#f5f5f5" },
+  },
+  { timestamps: true }
+);
+
+const Category = mongoose.model("Category", categorySchema);
+
+// Categories API — stored server-side so every browser/device sees the same list.
+app.get("/api/categories", async (req, res) => {
+  try {
+    const list = await Category.find().sort({ createdAt: 1 });
+    res.json({ success: true, categories: list });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Could not load categories" });
+  }
+});
+
+app.post("/api/categories", async (req, res) => {
+  try {
+    const name = String(req.body.name || "").trim();
+
+    if (!name) {
+      return res.status(400).json({ success: false, message: "Category name is required" });
+    }
+
+    const existing = (await Category.find({}).select("name")).find(
+      (c) => c.name.toLowerCase() === name.toLowerCase()
+    );
+
+    if (existing) {
+      return res
+        .status(409)
+        .json({ success: false, message: `Category "${name}" already exists` });
+    }
+
+    const category = await Category.create({
+      name,
+      emoji: String(req.body.emoji || "✨").trim() || "✨",
+      color: String(req.body.color || "#f5f5f5").trim() || "#f5f5f5",
+    });
+
+    res.json({ success: true, category });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Could not add category" });
+  }
+});
+
+app.delete("/api/categories/:name", async (req, res) => {
+  try {
+    const name = String(req.params.name || "").trim();
+
+    const result = await Category.deleteOne({ name });
+
+    if (!result.deletedCount) {
+      return res.status(404).json({ success: false, message: "Category not found" });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Could not remove category" });
+  }
+});
+
+
+
 const readBearerToken = (req) =>
   req.headers.authorization?.startsWith("Bearer ")
     ? req.headers.authorization.slice(7)
@@ -722,7 +791,7 @@ const validateProduct = ({
     return "Brand, title, category, price and MRP are required";
   }
 
-  if (!allowedCategories.includes(category)) {
+  if (!category || String(category).trim().length > 60) {
     return "Please choose a valid category";
   }
 
@@ -3228,6 +3297,24 @@ const startServer = async () => {
   try {
     await mongoose.connect(process.env.MONGODB_URI);
     console.log("MongoDB connected");
+
+    try {
+      const count = await Category.countDocuments();
+
+      if (count === 0) {
+        await Category.insertMany([
+          { name: "Makeup", emoji: "💄", color: "#FFE4EC" },
+          { name: "Skincare", emoji: "✨", color: "#E4F3FF" },
+          { name: "Haircare", emoji: "🧴", color: "#FFF1D8" },
+          { name: "Fragrance", emoji: "🌸", color: "#EEE9FF" },
+          { name: "Bath & Body", emoji: "🫧", color: "#E2F8F0" },
+        ]);
+      }
+    } catch (error) {
+      console.error("Could not seed categories:", error.message);
+    }
+
+
 
     app.listen(PORT, () => {
       console.log(`DEALROOT backend running on ${PORT}`);
