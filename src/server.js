@@ -21,16 +21,22 @@ const transporter = nodemailer.createTransport({
     pass: process.env.EMAIL_PASS,
   },
 });
-async function sendOTP(email, otp) {
+async function sendOTP(
+  email,
+  otp,
+  subject = "Dealroot Password Reset OTP",
+  heading = "Reset your password",
+  intro = "Your Dealroot verification code is:"
+) {
   await transporter.sendMail({
     from: `"Dealroot" <${process.env.EMAIL_USER}>`,
     to: email,
-    subject: "Dealroot Password Reset OTP",
+    subject,
     html: `
       <div style="font-family:Arial;padding:30px">
-        <h2>Reset your password</h2>
+        <h2>${heading}</h2>
 
-        <p>Your Dealroot verification code is:</p>
+        <p>${intro}</p>
 
         <h1 style="
           letter-spacing:8px;
@@ -45,6 +51,123 @@ async function sendOTP(email, otp) {
       </div>
     `,
   });
+}
+
+// Send order confirmation emails: one to the customer (Amazon/Nykaa style)
+// and one to the store owner so they know an order was placed.
+async function sendOrderEmails(order) {
+  if (!order) return;
+
+  const customerEmail =
+    String(order.customer?.email || "").trim() ||
+    (order.user ? (await User.findOne({ _id: order.user }).select("email"))?.email : "") ||
+    "";
+
+  const ownerEmail = String(process.env.ADMIN_EMAIL || "").trim();
+  const from = `"DEALROOT Beauty" <${process.env.EMAIL_USER}>`;
+
+  const money = (n) => `₹${Number(n || 0).toLocaleString("en-IN")}`;
+  const paymentLabel =
+    order.paymentMethod === "razorpay" ? "Paid online (Razorpay)" : "Cash on Delivery";
+
+  const itemsHtml = (order.items || [])
+    .map(
+      (item) => `
+        <tr>
+          <td style="padding:10px 12px;border-bottom:1px solid #eee;font-size:13px;color:#333;">
+            <strong>${item.title}</strong><br/>
+            <span style="color:#999;font-size:12px;">${item.brand || ""} &bull; Qty: ${item.quantity}</span>
+          </td>
+          <td style="padding:10px 12px;border-bottom:1px solid #eee;font-size:13px;color:#333;text-align:right;white-space:nowrap;">${money(item.subtotal)}</td>
+        </tr>`
+    )
+    .join("");
+
+  const trackUrl = `${process.env.CLIENT_URL || "http://localhost:5173"}/account`;
+
+  const summaryHtml = `
+    <tr><td style="padding:6px 12px;font-size:13px;color:#666;">Item total</td><td style="padding:6px 12px;font-size:13px;color:#333;text-align:right;">${money((order.totalAmount || 0) - (order.deliveryFee || 0) + (order.discountAmount || 0))}</td></tr>
+    ${order.discountAmount
+      ? `<tr><td style="padding:6px 12px;font-size:13px;color:#059669;">Coupon (${order.couponCode || ""})</td><td style="padding:6px 12px;font-size:13px;color:#059669;text-align:right;">-${money(order.discountAmount)}</td></tr>`
+      : ""}
+    <tr><td style="padding:6px 12px;font-size:13px;color:#666;">Delivery fee</td><td style="padding:6px 12px;font-size:13px;color:#333;text-align:right;">${order.deliveryFee ? money(order.deliveryFee) : "FREE"}</td></tr>
+    <tr><td style="padding:10px 12px;font-size:15px;font-weight:700;color:#111;">Order total</td><td style="padding:10px 12px;font-size:15px;font-weight:700;color:#111;text-align:right;">${money(order.totalAmount)}</td></tr>
+  `;
+
+  const address = order.customer || {};
+
+  const customerSubject = `Thank you for your order ${order.orderNumber}`;
+  const customerHtml = `
+    <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;background:#fff;">
+      <div style="background:#e21c48;padding:24px 28px;text-align:center;">
+        <h1 style="color:#fff;margin:0;font-size:22px;">DEALROOT BEAUTY</h1>
+        <p style="color:#ffe4e9;margin:6px 0 0;font-size:13px;">Thank you for placing your order!</p>
+      </div>
+      <div style="padding:28px;">
+        <p style="font-size:14px;color:#333;">Hi ${address.name || "there"},</p>
+        <p style="font-size:14px;color:#555;line-height:1.6;">
+          Your order has been received and is being processed. Here are your order details:
+        </p>
+        <div style="background:#fff5f7;border:1px solid #ffd6de;border-radius:10px;padding:14px 18px;margin:18px 0;">
+          <span style="font-size:12px;color:#999;display:block;">ORDER ID</span>
+          <strong style="font-size:18px;color:#e21c48;">${order.orderNumber}</strong>
+          <span style="font-size:12px;color:#999;display:block;margin-top:8px;">PAYMENT</span>
+          <span style="font-size:14px;color:#333;">${paymentLabel}</span>
+        </div>
+        <table style="width:100%;border-collapse:collapse;">
+          <thead><tr><th style="text-align:left;padding:8px 12px;background:#fafafa;font-size:12px;color:#999;text-transform:uppercase;">Item</th><th style="text-align:right;padding:8px 12px;background:#fafafa;font-size:12px;color:#999;text-transform:uppercase;">Amount</th></tr></thead>
+          <tbody>${itemsHtml}${summaryHtml}</tbody>
+        </table>
+        <div style="background:#fafafa;border-radius:10px;padding:14px 18px;margin:20px 0;">
+          <strong style="font-size:12px;color:#999;display:block;margin-bottom:6px;">DELIVER TO</strong>
+          <p style="margin:0;font-size:13px;color:#333;line-height:1.6;">
+            ${address.name}<br/>${address.address || ""}<br/>${address.city || ""}, ${address.state || ""} ${address.pincode || ""}<br/>Phone: ${address.phone || ""}
+          </p>
+        </div>
+        <a href="${trackUrl}" style="display:block;text-align:center;background:#e21c48;color:#fff;text-decoration:none;padding:14px;border-radius:999px;font-size:14px;font-weight:700;">Track Your Order</a>
+        <p style="font-size:12px;color:#999;margin-top:20px;line-height:1.6;text-align:center;">
+          Questions? Reach us at dealroot.store@gmail.com or @Tom_andrew72 on Telegram.
+        </p>
+      </div>
+    </div>
+  `;
+
+  const ownerSubject = `🛒 New order placed: ${order.orderNumber}`;
+  const ownerHtml = `
+    <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;background:#fff;">
+      <div style="background:#111;padding:22px 28px;text-align:center;">
+        <h1 style="color:#fff;margin:0;font-size:20px;">🛒 New Order Placed</h1>
+        <p style="color:#aaa;margin:6px 0 0;font-size:13px;">A customer just placed an order on DEALROOT</p>
+      </div>
+      <div style="padding:28px;">
+        <div style="background:#fff5f7;border:1px solid #ffd6de;border-radius:10px;padding:14px 18px;margin-bottom:18px;">
+          <strong style="font-size:16px;color:#e21c48;">${order.orderNumber}</strong><br/>
+          <span style="font-size:12px;color:#666;">${new Date(order.createdAt || Date.now()).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</span><br/>
+          <span style="font-size:13px;color:#333;">${paymentLabel} &bull; Total ${money(order.totalAmount)}</span>
+        </div>
+        <p style="font-size:13px;color:#555;margin:0 0 4px;"><strong>Customer:</strong> ${address.name} (${customerEmail || "no email"})</p>
+        <p style="font-size:13px;color:#555;margin:0 0 4px;"><strong>Phone:</strong> ${address.phone || "-"}</p>
+        <p style="font-size:13px;color:#555;margin:0 0 16px;"><strong>Address:</strong> ${address.address || ""}, ${address.city || ""}, ${address.state || ""} ${address.pincode || ""}</p>
+        <table style="width:100%;border-collapse:collapse;">
+          <thead><tr><th style="text-align:left;padding:8px 12px;background:#fafafa;font-size:12px;color:#999;text-transform:uppercase;">Item</th><th style="text-align:right;padding:8px 12px;background:#fafafa;font-size:12px;color:#999;text-transform:uppercase;">Amount</th></tr></thead>
+          <tbody>${itemsHtml}${summaryHtml}</tbody>
+        </table>
+      </div>
+    </div>
+  `;
+
+  const send = (to, subject, html) =>
+    transporter.sendMail({ from, to, subject, html });
+
+  // Send to the customer if we have an email.
+  if (customerEmail) {
+    await send(customerEmail, customerSubject, customerHtml);
+  }
+
+  // Notify the store owner.
+  if (ownerEmail) {
+    await send(ownerEmail, ownerSubject, ownerHtml);
+  }
 }
 
 cloudinary.config({
@@ -611,6 +734,25 @@ otpExpiry: {
     state: { type: String, default: "Uttar Pradesh", trim: true },
     city: { type: String, default: "Kanpur", trim: true },
     pincode: { type: String, default: "", trim: true },
+    pendingEmail: {
+      type: String,
+      default: "",
+      trim: true,
+      lowercase: true,
+    },
+    pendingPhone: { type: String, default: "", trim: true },
+    changeOTP: { type: String, default: "" },
+    addresses: [
+      {
+        name: { type: String, default: "", trim: true },
+        phone: { type: String, default: "", trim: true },
+        address: { type: String, default: "", trim: true },
+        state: { type: String, default: "", trim: true },
+        city: { type: String, default: "", trim: true },
+        pincode: { type: String, default: "", trim: true },
+        isDefault: { type: Boolean, default: false },
+      },
+    ],
   },
   { timestamps: true }
 );
@@ -709,6 +851,7 @@ address: user.address,
 state: user.state,
 city: user.city,
   pincode: user.pincode,
+  addresses: user.addresses || [],
 });
 
 const requireAdmin = (req, res, next) => {
@@ -875,6 +1018,7 @@ const getRazorpay = () => {
 
 const cleanDeliveryCustomer = (customer) => ({
   name: String(customer?.name || "").trim(),
+  email: String(customer?.email || "").trim().toLowerCase(),
   phone: String(customer?.phone || "").replace(/\D/g, ""),
   state: String(customer?.state || "").trim(),
   address: String(customer?.address || "").trim(),
@@ -1183,6 +1327,13 @@ codAmount: currentPaymentSession.codAmount,
         );
       }
     });
+
+    // Notify customer + owner after a paid order is created.
+    if (completedOrder) {
+      sendOrderEmails(completedOrder).catch((error) =>
+        console.error("Order email failed:", error.message)
+      );
+    }
 
     return completedOrder;
   } catch (error) {
@@ -1495,6 +1646,222 @@ app.post("/api/auth/reset-password", async (req, res) => {
 });
 
 
+
+// ===========================
+// LOGIN & SECURITY
+// ===========================
+// Change email: the OTP is emailed to the CURRENT email address first, so an
+// account can only be moved to a new email by someone who can read its inbox.
+app.post("/api/auth/request-email-change", requireUser, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId);
+    if (!user) return res.status(404).json({ success: false, message: "Account not found" });
+
+    const newEmail = String(req.body?.newEmail || "").trim().toLowerCase();
+
+    if (!/^\S+@\S+\.\S+$/.test(newEmail)) {
+      return res.status(400).json({ success: false, message: "Please enter a valid email address" });
+    }
+
+    if (newEmail === user.email) {
+      return res.status(400).json({ success: false, message: "This is already your email address" });
+    }
+
+    if (await User.exists({ email: newEmail })) {
+      return res.status(409).json({ success: false, message: "An account with this email already exists" });
+    }
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    user.pendingEmail = newEmail;
+    user.pendingPhone = "";
+    user.changeOTP = otp;
+    user.otpExpiry = Date.now() + 10 * 60 * 1000;
+    await user.save();
+
+    await sendOTP(
+      user.email,
+      otp,
+      "Dealroot Email Change OTP",
+      "Change your email address",
+      "Enter this code to confirm changing your DEALROOT email to the new one:"
+    );
+
+    res.json({ success: true, message: "OTP sent to your current email" });
+  } catch (err) {
+    console.log(err);
+    res.status(500).json({ success: false, message: "Failed to send OTP" });
+  }
+});
+
+app.post("/api/auth/verify-email-change", requireUser, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId);
+    if (!user) return res.status(404).json({ success: false, message: "Account not found" });
+
+    const otp = String(req.body?.otp || "").trim();
+
+    if (!user.pendingEmail) {
+      return res.status(400).json({ success: false, message: "No email change requested. Please request an OTP first." });
+    }
+
+    if (user.changeOTP !== otp) {
+      return res.status(400).json({ success: false, message: "Invalid OTP" });
+    }
+
+    if (!user.otpExpiry || user.otpExpiry < Date.now()) {
+      return res.status(400).json({ success: false, message: "OTP expired. Please request a new one." });
+    }
+
+    // Re-check the new email is still free (another account may have taken
+    // it between the request and the verification).
+    const takenEmail = await User.exists({
+      email: user.pendingEmail,
+      _id: { $ne: user._id },
+    });
+
+    if (takenEmail) {
+      user.pendingEmail = "";
+      user.changeOTP = "";
+      user.otpExpiry = null;
+      await user.save();
+      return res.status(409).json({ success: false, message: "An account with this email already exists" });
+    }
+
+    user.email = user.pendingEmail;
+    user.pendingEmail = "";
+    user.changeOTP = "";
+    user.otpExpiry = null;
+    await user.save();
+
+    res.json({ success: true, message: "Email changed successfully", user: publicUser(user) });
+  } catch (err) {
+    console.log(err);
+    res.status(500).json({ success: false, message: "Server Error" });
+  }
+});
+
+// Change mobile number: same pattern — OTP emailed to the current email.
+app.post("/api/auth/request-phone-change", requireUser, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId);
+    if (!user) return res.status(404).json({ success: false, message: "Account not found" });
+
+    const newPhone = String(req.body?.newPhone || "").replace(/\D/g, "");
+
+    if (newPhone.length !== 10) {
+      return res.status(400).json({ success: false, message: "Please enter a valid 10-digit mobile number" });
+    }
+
+    if (newPhone === user.phone) {
+      return res.status(400).json({ success: false, message: "This is already your mobile number" });
+    }
+
+    // Reject numbers already registered to another account.
+    const takenPhone = await User.exists({
+      phone: newPhone,
+      _id: { $ne: user._id },
+    });
+
+    if (takenPhone) {
+      return res.status(409).json({ success: false, message: "An account with this mobile number already exists" });
+    }
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    user.pendingPhone = newPhone;
+    user.pendingEmail = "";
+    user.changeOTP = otp;
+    user.otpExpiry = Date.now() + 10 * 60 * 1000;
+    await user.save();
+
+    await sendOTP(
+      user.email,
+      otp,
+      "Dealroot Mobile Number Change OTP",
+      "Change your mobile number",
+      "Enter this code to confirm updating your DEALROOT mobile number:"
+    );
+
+    res.json({ success: true, message: "OTP sent to your current email" });
+  } catch (err) {
+    console.log(err);
+    res.status(500).json({ success: false, message: "Failed to send OTP" });
+  }
+});
+
+app.post("/api/auth/verify-phone-change", requireUser, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId);
+    if (!user) return res.status(404).json({ success: false, message: "Account not found" });
+
+    const otp = String(req.body?.otp || "").trim();
+
+    if (!user.pendingPhone) {
+      return res.status(400).json({ success: false, message: "No mobile change requested. Please request an OTP first." });
+    }
+
+    if (user.changeOTP !== otp) {
+      return res.status(400).json({ success: false, message: "Invalid OTP" });
+    }
+
+    if (!user.otpExpiry || user.otpExpiry < Date.now()) {
+      return res.status(400).json({ success: false, message: "OTP expired. Please request a new one." });
+    }
+
+    // Re-check the new number is still free (another account may have taken
+    // it between the request and the verification).
+    const takenPhone = await User.exists({
+      phone: user.pendingPhone,
+      _id: { $ne: user._id },
+    });
+
+    if (takenPhone) {
+      user.pendingPhone = "";
+      user.changeOTP = "";
+      user.otpExpiry = null;
+      await user.save();
+      return res.status(409).json({ success: false, message: "An account with this mobile number already exists" });
+    }
+
+    user.phone = user.pendingPhone;
+    user.pendingPhone = "";
+    user.changeOTP = "";
+    user.otpExpiry = null;
+    await user.save();
+
+    res.json({ success: true, message: "Mobile number updated successfully", user: publicUser(user) });
+  } catch (err) {
+    console.log(err);
+    res.status(500).json({ success: false, message: "Server Error" });
+  }
+});
+
+// Change password — always verify the current password first.
+app.post("/api/auth/change-password", requireUser, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId).select("+passwordHash");
+    if (!user) return res.status(404).json({ success: false, message: "Account not found" });
+
+    const currentPassword = String(req.body?.currentPassword || "");
+    const newPassword = String(req.body?.newPassword || "");
+
+    if (!(await bcrypt.compare(currentPassword, user.passwordHash))) {
+      return res.status(400).json({ success: false, message: "Current password is incorrect" });
+    }
+
+    if (newPassword.length < 8) {
+      return res.status(400).json({ success: false, message: "New password must be at least 8 characters" });
+    }
+
+    user.passwordHash = await bcrypt.hash(newPassword, 12);
+    await user.save();
+
+    res.json({ success: true, message: "Password changed successfully" });
+  } catch (err) {
+    console.log(err);
+    res.status(500).json({ success: false, message: "Server Error" });
+  }
+});
+
 app.get("/api/auth/me", requireUser, async (req, res) => {
   const user = await User.findById(req.user.userId);
   if (!user) return res.status(404).json({ success: false, message: "Account not found" });
@@ -1503,20 +1870,93 @@ app.get("/api/auth/me", requireUser, async (req, res) => {
 
 app.put("/api/auth/me", requireUser, async (req, res) => {
   try {
-    const phone = String(req.body?.phone || "").replace(/\D/g, "");
-    const pincode = String(req.body?.pincode || "").replace(/\D/g, "");
-   const update = {
-  name: String(req.body?.name || "").trim(),
-  phone,
-  address: String(req.body?.address || "").trim(),
-  state: String(req.body?.state || "").trim(),
-  city: String(req.body?.city || "").trim(),
-  pincode,
-};
+    const body = req.body || {};
+    let update;
 
-    if (update.name.length < 2) throw new Error("Please enter your full name");
-    if (phone && phone.length !== 10) throw new Error("Please enter a valid 10-digit mobile number");
-    if (pincode && pincode.length !== 6) throw new Error("Please enter a valid 6-digit pincode");
+    if (Array.isArray(body.addresses)) {
+      // Address-book mode: validate every address and keep the flat fields in
+      // sync with the default address (orders still read the flat fields).
+      const cleanAddress = (a) => ({
+        name: String(a?.name || "").trim(),
+        phone: String(a?.phone || "").replace(/\D/g, ""),
+        address: String(a?.address || "").trim(),
+        state: String(a?.state || "").trim(),
+        city: String(a?.city || "").trim(),
+        pincode: String(a?.pincode || "").replace(/\D/g, ""),
+        isDefault: Boolean(a?.isDefault),
+      });
+
+      const addresses = body.addresses
+        .filter(
+          (a) =>
+            a &&
+            (String(a.name || "").trim() ||
+              String(a.phone || "").trim() ||
+              String(a.address || "").trim() ||
+              String(a.state || "").trim() ||
+              String(a.city || "").trim() ||
+              String(a.pincode || "").trim())
+        )
+        .map(cleanAddress);
+
+      if (addresses.length > 10)
+        throw new Error("You can save up to 10 addresses");
+
+      for (const a of addresses) {
+        if (!a.name) throw new Error("Please enter the recipient name for every address");
+        if (a.phone.length !== 10)
+          throw new Error(`Please enter a valid 10-digit mobile number for ${a.name}`);
+        if (!a.address) throw new Error(`Please enter the complete address for ${a.name}`);
+        if (!a.city) throw new Error(`Please enter the city for ${a.name}`);
+        if (!a.state) throw new Error(`Please enter the state for ${a.name}`);
+        if (a.pincode.length !== 6)
+          throw new Error(`Please enter a valid 6-digit pincode for ${a.name}`);
+      }
+
+      // Exactly one address may be the default: the first one flagged wins
+      // and every other is forced off, even if the client sent duplicates.
+      const firstDefault = addresses.findIndex((a) => a.isDefault);
+      const normalized = addresses.map((a, i) => ({
+        ...a,
+        isDefault: i === (firstDefault >= 0 ? firstDefault : 0),
+      }));
+      const defaultAddr = normalized.find((a) => a.isDefault) || normalized[0] || {};
+
+      update = {
+        name: String(body.name || "").trim() || defaultAddr.name || "",
+        phone:
+          String(body.phone || "").replace(/\D/g, "") ||
+          defaultAddr.phone ||
+          "",
+        address: defaultAddr.address || "",
+        state: defaultAddr.state || "Uttar Pradesh",
+        city: defaultAddr.city || "Kanpur",
+        pincode: defaultAddr.pincode || "",
+        addresses: normalized,
+      };
+
+      if (update.name.length < 2) throw new Error("Please enter your full name");
+      if (update.phone && update.phone.length !== 10)
+        throw new Error("Please enter a valid 10-digit mobile number");
+    } else {
+      // Legacy single-address update
+      const phone = String(body.phone || "").replace(/\D/g, "");
+      const pincode = String(body.pincode || "").replace(/\D/g, "");
+      update = {
+        name: String(body.name || "").trim(),
+        phone,
+        address: String(body.address || "").trim(),
+        state: String(body.state || "").trim(),
+        city: String(body.city || "").trim(),
+        pincode,
+      };
+
+      if (update.name.length < 2) throw new Error("Please enter your full name");
+      if (phone && phone.length !== 10)
+        throw new Error("Please enter a valid 10-digit mobile number");
+      if (pincode && pincode.length !== 6)
+        throw new Error("Please enter a valid 6-digit pincode");
+    }
 
     const user = await User.findByIdAndUpdate(req.user.userId, update, {
       new: true,
@@ -3200,6 +3640,13 @@ app.post("/api/orders", requireUser, async (req, res) => {
         );
       }
     });
+
+    if (order) {
+      // Notify customer + owner without blocking the order response.
+      sendOrderEmails(order).catch((error) =>
+        console.error("Order email failed:", error.message)
+      );
+    }
 
     res.status(201).json({
       success: true,
