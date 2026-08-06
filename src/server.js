@@ -3545,8 +3545,24 @@ app.post("/api/orders", requireUser, async (req, res) => {
       );
     }
 
-    if (normalizedCoupon && normalizedCoupon !== "WELCOME10") {
-      throw new Error("Invalid coupon code");
+    let couponRecord = null;
+
+    if (normalizedCoupon) {
+      couponRecord = await Coupon.findOne({
+        code: normalizedCoupon,
+        active: true,
+      });
+
+      if (!couponRecord) {
+        throw new Error("Invalid coupon code");
+      }
+
+      if (
+        couponRecord.expiryDate &&
+        new Date(couponRecord.expiryDate) < new Date()
+      ) {
+        throw new Error("Coupon expired");
+      }
     }
 
     let order;
@@ -3604,14 +3620,30 @@ app.post("/api/orders", requireUser, async (req, res) => {
         subtotal >= 499 ? 0 : isKanpurAddress ? 29 : 49;
       let discountAmount = 0;
 
-      if (normalizedCoupon === "WELCOME10") {
-        if (subtotal <= 499) {
+      if (couponRecord) {
+        if (subtotal < couponRecord.minimumOrder) {
           throw new Error(
-            "WELCOME10 applies only when the cart subtotal is above â‚¹499"
+            "Minimum order ₹" + couponRecord.minimumOrder + " for this coupon"
           );
         }
 
-        discountAmount = Math.round(subtotal * 0.1);
+        if (couponRecord.discountType === "percentage") {
+          discountAmount = Math.round(
+            (subtotal * couponRecord.discountValue) / 100
+          );
+
+          if (
+            couponRecord.maximumDiscount &&
+            discountAmount > couponRecord.maximumDiscount
+          ) {
+            discountAmount = couponRecord.maximumDiscount;
+          }
+        } else {
+          discountAmount = Math.min(
+            couponRecord.discountValue,
+            subtotal
+          );
+        }
       }
 
       [order] = await Order.create(
