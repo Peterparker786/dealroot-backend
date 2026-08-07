@@ -5371,6 +5371,45 @@ app.post("/api/tryouts/:id/cashback", requireAdmin, async (req, res) => {
     application.cashbackAvailable = (application.cashbackAvailable || 0) + amount;
     await application.save();
 
+    // Notify the member that cashback was added to their account.
+    if (application.email && process.env.EMAIL_USER) {
+      if (process.env.ORDER_STATUS_EMAIL_DRY_RUN === "true") {
+        console.log("[dry-run] Tryout cashback email → " + application.email);
+      } else {
+        transporter
+          .sendMail({
+            from: '"DEALROOT Beauty" <' + process.env.EMAIL_USER + ">",
+            to: application.email,
+            subject: "🎉 Cashback added to your account — Dealroot Tryouts",
+            html:
+              '<div style="font-family:Arial;padding:30px;max-width:620px;margin:auto">' +
+              '<h2 style="color:#1f2a4d;margin:0 0 6px">Cashback added to your account! 🎉</h2>' +
+              '<p style="color:#6b7280;margin:0 0 18px">Hi ' +
+              xmlEscape(application.name || "there") +
+              ", we have added cashback to your Dealroot Tryout account.</p>" +
+              '<table style="width:100%;border-collapse:collapse;font-size:14px;line-height:1.6">' +
+              '<tr><td style="padding:8px 10px;background:#f0fdf4;font-weight:bold;width:160px">Cashback added</td><td style="padding:8px 10px">₹' +
+              amount +
+              "</td></tr>" +
+              (note
+                ? '<tr><td style="padding:8px 10px;background:#f0fdf4;font-weight:bold">Note</td><td style="padding:8px 10px">' +
+                  xmlEscape(note) +
+                  "</td></tr>"
+                : "") +
+              '<tr><td style="padding:8px 10px;background:#f0fdf4;font-weight:bold">Status</td><td style="padding:8px 10px">Available</td></tr>' +
+              '<tr><td style="padding:8px 10px;background:#f0fdf4;font-weight:bold">Total available</td><td style="padding:8px 10px">₹' +
+              (application.cashbackAvailable || 0) +
+              "</td></tr>" +
+              "</table>" +
+              '<p style="margin-top:18px;color:#6b7280;font-size:13px">You can view your full cashback summary and history in your Tryout dashboard on dealroot.store.</p>' +
+              "</div>",
+          })
+          .catch((err) =>
+            console.error("Tryout cashback member email failed:", err.message)
+          );
+      }
+    }
+
     res.json({
       success: true,
       message: "Cashback added — member can now see it in their dashboard",
