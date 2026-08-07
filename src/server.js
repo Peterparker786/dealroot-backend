@@ -422,6 +422,7 @@ reviews: {
     badge: { type: String, default: "" },
     stock: { type: Number, default: 20, min: 0 },
     isFeatured: { type: Boolean, default: false },
+    tryoutOnly: { type: Boolean, default: false },
     dealType: {
       type: String,
       enum: allowedDealTypes,
@@ -1016,6 +1017,7 @@ const productPayload = (body) => {
       : [],
 
     isFeatured: Boolean(body.isFeatured),
+    tryoutOnly: Boolean(body.tryoutOnly),
     marketplaceLinks: sanitizeMarketplaceLinks(body.marketplaceLinks),
 
     specifications: Array.isArray(body.specifications)
@@ -3485,6 +3487,31 @@ app.patch("/api/products/:id/stock", requireAdmin, async (req, res) => {
   }
 });
 
+// Admin: toggle a product in the Dealroot Tryouts program.
+app.patch("/api/products/:id/tryout", requireAdmin, async (req, res) => {
+  try {
+    const product = await Product.findByIdAndUpdate(
+      req.params.id,
+      { tryoutOnly: Boolean(req.body?.tryoutOnly) },
+      { new: true, runValidators: true }
+    );
+
+    if (!product) {
+      return res.status(404).json({ success: false, message: "Product not found" });
+    }
+
+    res.json({
+      success: true,
+      message: product.tryoutOnly
+        ? "Product added to Dealroot Tryouts" 
+        : "Product removed from Dealroot Tryouts",
+      product,
+    });
+  } catch {
+    res.status(400).json({ success: false, message: "Could not update tryout status" });
+  }
+});
+
 app.delete("/api/products/:id", requireAdmin, async (req, res) => {
   try {
     const product = await Product.findByIdAndDelete(req.params.id);
@@ -3841,6 +3868,18 @@ app.post("/api/orders", requireUser, async (req, res) => {
           throw new Error(
             "A product is unavailable or does not have enough stock"
           );
+        }
+
+        if (product.tryoutOnly) {
+          const tryoutMember = await TryoutApplication.findOne({
+            user: req.user.userId,
+            status: "approved",
+          });
+          if (!tryoutMember) {
+            throw new Error(
+              "This product is exclusive to approved Tryout members. Kindly apply for the Tryout program first."
+            );
+          }
         }
 
         const lineTotal = product.price * quantity;
@@ -5042,6 +5081,353 @@ app.post("/api/returns/:id/reject", requireAdmin, async (req, res) => {
   } catch (error) {
     console.error("Reject return failed:", error.message);
     res.status(500).json({ success: false, message: "Could not reject return" });
+  }
+});
+
+// ===================== DEALROOT TRYOUTS =====================
+const tryoutApplicationSchema = new mongoose.Schema(
+  {
+    user: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+      index: true,
+    },
+    name: { type: String, required: true, trim: true },
+    email: { type: String, trim: true },
+    phone: { type: String, trim: true },
+    city: { type: String, trim: true },
+    state: { type: String, trim: true },
+    pincode: { type: String, trim: true },
+    previousProgram: { type: String, trim: true },
+    otherProgram: { type: String, trim: true },
+    reason: { type: String, default: "" },
+    status: {
+      type: String,
+      enum: ["pending", "approved", "rejected", "disqualified"],
+      default: "pending",
+      index: true,
+    },
+    requestedAt: { type: Date, default: Date.now },
+    processedAt: { type: Date, default: null },
+    cashbackAvailable: { type: Number, default: 0, min: 0 },
+    cashbackPending: { type: Number, default: 0, min: 0 },
+    cashbackReceived: { type: Number, default: 0, min: 0 },
+    cashbackHistory: [
+      {
+        amount: { type: Number, required: true, min: 0 },
+        note: { type: String, default: "" },
+        status: {
+          type: String,
+          enum: ["available", "pending", "received"],
+          default: "available",
+        },
+        createdAt: { type: Date, default: Date.now },
+      },
+    ],
+  },
+  { timestamps: true }
+);
+
+const TryoutApplication = mongoose.model(
+  "TryoutApplication",
+  tryoutApplicationSchema
+);
+
+// Customer: apply for the Tryout program (one active application at a time).
+app.post("/api/tryouts/apply", requireUser, async (req, res) => {
+  try {
+    const name = String(req.body?.name || "").trim();
+    const phone = String(req.body?.phone || "").replace(/\D/g, "").slice(0, 10);
+    const city = String(req.body?.city || "").trim();
+    const state = String(req.body?.state || "").trim();
+    const pincode = String(req.body?.pincode || "").replace(/\D/g, "").slice(0, 6);
+    const previousProgram = String(req.body?.previousProgram || "").trim();
+    const otherProgram = String(req.body?.otherProgram || "").trim();
+    const reason = String(req.body?.reason || "").trim();
+
+    if (name.length < 2) {
+      return res.status(400).json({ success: false, message: "Please enter your full name" });
+    }
+    if (phone.length !== 10) {
+      return res.status(400).json({ success: false, message: "Please enter a valid 10-digit mobile number" });
+    }
+    if (pincode.length !== 6) {
+      return res.status(400).json({ success: false, message: "Please enter a valid 6-digit pincode" });
+    }
+    if (previousProgram === "Other" && !otherProgram) {
+      return res.status(400).json({ success: false, message: "Please tell us the name of the other program" });
+    }
+    const TRYOUT_PROGRAMS = ["Freekamaal", "Trybox", "OPA", "Other"];
+    if (previousProgram && !TRYOUT_PROGRAMS.includes(previousProgram)) {
+      return res.status(400).json({ success: false, message: "Please select a valid option for the previous program" });
+    }
+
+    const existing = await TryoutApplication.findOne({
+      user: req.user.userId,
+      status: { $in: ["pending", "approved"] },
+    });
+
+    if (existing) {
+      return res.status(400).json({
+        success: false,
+        message:
+          existing.status === "approved"
+            ? "You are already an approved Tryout member"
+            : "Your Tryout application is already under review",
+      });
+    }
+
+    // Allow re-applying after a rejection.
+    if (req.body?.replaceRejected) {
+      await TryoutApplication.deleteMany({
+        user: req.user.userId,
+        status: "rejected",
+      });
+    }
+
+    const user = await User.findById(req.user.userId).select("email");
+
+    const application = await TryoutApplication.create({
+      user: req.user.userId,
+      name,
+      email: user?.email || "",
+      phone,
+      city,
+      state,
+      pincode,
+      previousProgram,
+      otherProgram,
+      reason,
+    });
+
+    // Notify the owner about the new application with the full form details.
+    if (process.env.ADMIN_EMAIL) {
+      if (process.env.ORDER_STATUS_EMAIL_DRY_RUN === "true") {
+        console.log("[dry-run] Tryout owner email → " + name);
+      } else {
+      const prevLabel =
+        previousProgram === "Other"
+          ? "Other (" + (otherProgram || "-") + ")"
+          : previousProgram || "-";
+      transporter
+        .sendMail({
+          from: '"DEALROOT Beauty" <' + process.env.EMAIL_USER + ">",
+          to: process.env.ADMIN_EMAIL,
+          subject: "📝 New Tryout application — " + name,
+          html:
+            '<div style="font-family:Arial;padding:30px;max-width:620px;margin:auto">' +
+            '<h2 style="color:#1f2a4d;margin:0 0 6px">New Dealroot Tryouts Application</h2>' +
+            '<p style="color:#6b7280;margin:0 0 18px">A customer just applied for the Tryout program. Details below:</p>' +
+            '<table style="width:100%;border-collapse:collapse;font-size:14px;line-height:1.6">' +
+            '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold;width:160px">Name</td><td style="padding:8px 10px">' + xmlEscape(name) + "</td></tr>" +
+            '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Email</td><td style="padding:8px 10px">' + xmlEscape(user?.email || "-") + "</td></tr>" +
+            '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Phone</td><td style="padding:8px 10px">' + xmlEscape(phone || "-") + "</td></tr>" +
+            '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">City</td><td style="padding:8px 10px">' + xmlEscape(city || "-") + "</td></tr>" +
+            '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">State</td><td style="padding:8px 10px">' + xmlEscape(state || "-") + "</td></tr>" +
+            '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Pincode</td><td style="padding:8px 10px">' + xmlEscape(pincode || "-") + "</td></tr>" +
+            '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Tried before</td><td style="padding:8px 10px">' + xmlEscape(prevLabel) + "</td></tr>" +
+            '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Reason</td><td style="padding:8px 10px">' + xmlEscape(reason || "-") + "</td></tr>" +
+            "</table>" +
+            '<p style="margin-top:18px;color:#6b7280;font-size:13px">Review this application from the DealRoot admin panel → Tryouts tab (approve / reject / disqualify).</p>' +
+            "</div>",
+        })
+        .catch((err) => console.error("Tryout owner email failed:", err.message));
+      }
+    }
+
+    res.json({
+      success: true,
+      message: "Application submitted — we will review it soon",
+      application,
+    });
+  } catch (error) {
+    console.error("Tryout apply failed:", error.message);
+    res.status(500).json({ success: false, message: "Could not submit your application" });
+  }
+});
+
+// Customer: my Tryout application / status.
+app.get("/api/tryouts/my", requireUser, async (req, res) => {
+  try {
+    const application = await TryoutApplication.findOne({
+      user: req.user.userId,
+    }).sort({ requestedAt: -1 });
+
+    const totalOrders = await Order.countDocuments({
+      user: req.user.userId,
+    });
+
+    res.json({
+      success: true,
+      application,
+      approved: application?.status === "approved",
+      dashboard: application
+        ? {
+            totalOrders,
+            cashbackAvailable: application.cashbackAvailable || 0,
+            cashbackPending: application.cashbackPending || 0,
+            cashbackReceived: application.cashbackReceived || 0,
+            history: (application.cashbackHistory || []).slice().reverse(),
+          }
+        : null,
+    });
+  } catch {
+    res.status(500).json({ success: false, message: "Could not load your application" });
+  }
+});
+
+// Admin: all Tryout applications.
+app.get("/api/tryouts/applications", requireAdmin, async (req, res) => {
+  try {
+    const applications = await TryoutApplication.find()
+      .sort({ requestedAt: -1 })
+      .limit(200);
+    res.json({ success: true, applications });
+  } catch {
+    res.status(500).json({ success: false, message: "Could not load applications" });
+  }
+});
+
+// Admin: approve a Tryout application.
+app.post("/api/tryouts/:id/approve", requireAdmin, async (req, res) => {
+  try {
+    const application = await TryoutApplication.findById(req.params.id);
+    if (!application) {
+      return res.status(404).json({ success: false, message: "Application not found" });
+    }
+    if (application.status === "approved") {
+      return res.status(400).json({ success: false, message: "Already approved" });
+    }
+
+    application.status = "approved";
+    application.processedAt = new Date();
+    await application.save();
+
+    res.json({ success: true, message: "Application approved — member can now shop Tryout deals", application });
+  } catch {
+    res.status(500).json({ success: false, message: "Could not approve application" });
+  }
+});
+
+// Admin: reject a Tryout application.
+app.post("/api/tryouts/:id/reject", requireAdmin, async (req, res) => {
+  try {
+    const application = await TryoutApplication.findById(req.params.id);
+    if (!application) {
+      return res.status(404).json({ success: false, message: "Application not found" });
+    }
+
+    application.status = "rejected";
+    application.processedAt = new Date();
+    await application.save();
+
+    res.json({ success: true, message: "Application rejected", application });
+  } catch {
+    res.status(500).json({ success: false, message: "Could not reject application" });
+  }
+});
+
+// Admin: disqualify an approved Tryout member (revoke membership).
+app.post("/api/tryouts/:id/disqualify", requireAdmin, async (req, res) => {
+  try {
+    const application = await TryoutApplication.findById(req.params.id);
+    if (!application) {
+      return res.status(404).json({ success: false, message: "Application not found" });
+    }
+    if (application.status !== "approved") {
+      return res.status(400).json({ success: false, message: "Only approved members can be disqualified" });
+    }
+
+    application.status = "disqualified";
+    application.processedAt = new Date();
+    await application.save();
+
+    res.json({ success: true, message: "Member disqualified — Tryout deals are locked again", application });
+  } catch {
+    res.status(500).json({ success: false, message: "Could not disqualify member" });
+  }
+});
+
+// Admin: add cashback for an approved Tryout member (available balance).
+app.post("/api/tryouts/:id/cashback", requireAdmin, async (req, res) => {
+  try {
+    const application = await TryoutApplication.findById(req.params.id);
+    if (!application) {
+      return res.status(404).json({ success: false, message: "Application not found" });
+    }
+    if (application.status !== "approved") {
+      return res.status(400).json({ success: false, message: "Only approved members can receive cashback" });
+    }
+
+    const amount = Math.max(0, Number(req.body?.amount) || 0);
+    const note = String(req.body?.note || "").trim();
+
+    if (amount <= 0) {
+      return res.status(400).json({ success: false, message: "Please enter a valid cashback amount" });
+    }
+
+    application.cashbackHistory.push({ amount, note, status: "available" });
+    application.cashbackAvailable = (application.cashbackAvailable || 0) + amount;
+    await application.save();
+
+    res.json({
+      success: true,
+      message: "Cashback added — member can now see it in their dashboard",
+      application,
+    });
+  } catch (error) {
+    console.error("Tryout cashback add failed:", error.message);
+    res.status(500).json({ success: false, message: "Could not add cashback" });
+  }
+});
+
+// Admin: move a cashback entry between available / pending / received.
+app.patch("/api/tryouts/cashback/:entryId", requireAdmin, async (req, res) => {
+  try {
+    const nextStatus = String(req.body?.status || "");
+    if (!["available", "pending", "received"].includes(nextStatus)) {
+      return res.status(400).json({ success: false, message: "Invalid cashback status" });
+    }
+
+    const application = await TryoutApplication.findOne({
+      "cashbackHistory._id": req.params.entryId,
+    });
+    if (!application) {
+      return res.status(404).json({ success: false, message: "Cashback entry not found" });
+    }
+
+    const entry = application.cashbackHistory.id(req.params.entryId);
+    if (!entry) {
+      return res.status(404).json({ success: false, message: "Cashback entry not found" });
+    }
+
+    // Rebalance the totals from the current entry status to the new one.
+    const from = entry.status;
+    if (from !== nextStatus) {
+      const delta = entry.amount || 0;
+      const subtract = (key) => {
+        application[key] = Math.max(0, (application[key] || 0) - delta);
+      };
+      const add = (key) => {
+        application[key] = (application[key] || 0) + delta;
+      };
+
+      subtract("cashback" + from.charAt(0).toUpperCase() + from.slice(1));
+      add("cashback" + nextStatus.charAt(0).toUpperCase() + nextStatus.slice(1));
+
+      entry.status = nextStatus;
+      await application.save();
+    }
+
+    res.json({
+      success: true,
+      message: "Cashback status updated",
+      application,
+    });
+  } catch (error) {
+    console.error("Tryout cashback update failed:", error.message);
+    res.status(500).json({ success: false, message: "Could not update cashback" });
   }
 });
 
