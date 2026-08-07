@@ -435,6 +435,9 @@ reviews: {
         url: { type: String, trim: true },
       },
     ],
+    buyLink: { type: String, trim: true, default: "" },
+    buyLinkLabel: { type: String, trim: true, default: "Buy Now" },
+    buyLinkTerms: { type: String, trim: true, default: "" },
     specifications: [
       {
         label: { type: String, trim: true },
@@ -612,6 +615,8 @@ codAmount: {
     ],
     stockRestored: { type: Boolean, default: false },
     cancelledAt: { type: Date, default: null },
+    // True when the order contains at least one Tryout-exclusive product.
+    tryoutOrder: { type: Boolean, default: false },
   },
   { timestamps: true }
 );
@@ -728,6 +733,7 @@ amountInPaise: { type: Number, required: true, min: 1 },
       default: "",
       trim: true,
     },
+    tryoutOrder: { type: Boolean, default: false },
     expiresAt: {
       type: Date,
       required: true,
@@ -1019,6 +1025,9 @@ const productPayload = (body) => {
     isFeatured: Boolean(body.isFeatured),
     tryoutOnly: Boolean(body.tryoutOnly),
     marketplaceLinks: sanitizeMarketplaceLinks(body.marketplaceLinks),
+    buyLink: String(body.buyLink || "").trim(),
+    buyLinkLabel: String(body.buyLinkLabel || "").trim(),
+    buyLinkTerms: String(body.buyLinkTerms || "").trim(),
 
     specifications: Array.isArray(body.specifications)
       ? body.specifications
@@ -1089,6 +1098,7 @@ const buildOnlinePaymentQuote = async ({
   items,
   couponCode,
   paymentMethod = "razorpay",
+  userId = null,
 }) => {
   const cleanCustomer = cleanDeliveryCustomer(customer);
   validateDeliveryCustomer(cleanCustomer);
@@ -1119,6 +1129,7 @@ const buildOnlinePaymentQuote = async ({
 
   const orderItems = [];
   let subtotal = 0;
+  let hasTryoutItem = false;
 
   for (const [productId, quantity] of requestedProducts.entries()) {
     const product = await Product.findById(productId);
@@ -1127,6 +1138,23 @@ const buildOnlinePaymentQuote = async ({
       throw new Error(
         "A product is unavailable or does not have enough stock"
       );
+    }
+
+    if (product.tryoutOnly) {
+      hasTryoutItem = true;
+
+      const tryoutMember = userId
+        ? await TryoutApplication.findOne({
+            user: userId,
+            status: "approved",
+          })
+        : null;
+
+      if (!tryoutMember) {
+        throw new Error(
+          "This product is exclusive to approved Tryout members. Kindly apply for the Tryout program first."
+        );
+      }
     }
 
     const lineTotal = roundMoney(product.price * quantity);
@@ -1198,6 +1226,7 @@ const amountInPaise = Math.round(payableNow * 100);
     payableNow,
     codAmount,
     deliveryType: isKanpurAddress ? "local" : "courier",
+    tryoutOrder: hasTryoutItem,
   };
 };
 
@@ -1328,6 +1357,7 @@ const finaliseRazorpayPayment = async ({
             totalAmount: currentPaymentSession.totalAmount,
             deliveryType: currentPaymentSession.deliveryType,
             paymentMethod: currentPaymentSession.paymentMethod,
+            tryoutOrder: currentPaymentSession.tryoutOrder || false,
 
 paymentStatus:
   currentPaymentSession.paymentMethod === "cod"
@@ -3545,6 +3575,7 @@ app.post(
       const quote = await buildOnlinePaymentQuote({
   ...req.body,
   paymentMethod: req.body.paymentMethod,
+  userId: req.user?.userId || null,
 });
       const orderNumber = createOrderNumber();
 
@@ -3571,6 +3602,7 @@ codAmount: quote.codAmount,
 paymentMethod: req.body.paymentMethod || "razorpay",
         amountInPaise: quote.amountInPaise,
         deliveryType: quote.deliveryType,
+        tryoutOrder: quote.tryoutOrder || false,
         razorpayOrderId: razorpayOrder.id,
         expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
       });
@@ -3842,6 +3874,7 @@ app.post("/api/orders", requireUser, async (req, res) => {
     await session.withTransaction(async () => {
       const orderItems = [];
       let subtotal = 0;
+      let hasTryoutItem = false;
 
       for (const item of items) {
         const productId = item?.productId;
@@ -3871,6 +3904,8 @@ app.post("/api/orders", requireUser, async (req, res) => {
         }
 
         if (product.tryoutOnly) {
+          hasTryoutItem = true;
+
           const tryoutMember = await TryoutApplication.findOne({
             user: req.user.userId,
             status: "approved",
@@ -3943,6 +3978,7 @@ app.post("/api/orders", requireUser, async (req, res) => {
             totalAmount: subtotal - discountAmount + deliveryFee,
             deliveryType: isKanpurAddress ? "local" : "courier",
             paymentMethod: "cod",
+            tryoutOrder: hasTryoutItem,
           },
         ],
         { session }
@@ -5254,8 +5290,11 @@ app.get("/api/tryouts/my", requireUser, async (req, res) => {
       user: req.user.userId,
     }).sort({ requestedAt: -1 });
 
+    // Only count orders that contain Tryout-exclusive products — normal
+    // store orders should not show up in the Tryout dashboard.
     const totalOrders = await Order.countDocuments({
       user: req.user.userId,
+      tryoutOrder: true,
     });
 
     res.json({
