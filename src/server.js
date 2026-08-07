@@ -199,6 +199,15 @@ const upload = multer({
 });
 const PORT = process.env.PORT || 5000;
 
+// Tryout refund-form uploads: 1 delivery screenshot + up to 5 review files.
+const refundUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB per file
+    files: 6,
+  },
+});
+
 // Tryout purchase-form screenshots can be large phone captures.
 const purchaseUpload = multer({
   storage: multer.memoryStorage(),
@@ -5185,6 +5194,24 @@ const tryoutApplicationSchema = new mongoose.Schema(
         submittedAt: { type: Date, default: Date.now },
       },
     ],
+    // Refund-form submissions (delivery + review proof after receiving the
+    // Tryout product — order id, order amount, delivery screenshot, review
+    // files, notes).
+    refundForms: [
+      {
+        orderId: { type: String, trim: true, default: "" },
+        orderAmount: { type: Number, default: 0, min: 0 },
+        deliveryScreenshotUrl: { type: String, trim: true, default: "" },
+        reviewFiles: [{ type: String, trim: true }],
+        otherInfo: { type: String, trim: true, default: "" },
+        status: {
+          type: String,
+          enum: ["submitted", "verified", "rejected"],
+          default: "submitted",
+        },
+        submittedAt: { type: Date, default: Date.now },
+      },
+    ],
   },
   { timestamps: true }
 );
@@ -5483,6 +5510,230 @@ app.post(
   }
 );
 
+// Customer: submit the refund form (delivery + review proof) after
+// receiving the Tryout product. Stores proofs and emails the member a
+// confirmation + notifies the owner for verification.
+app.post(
+  "/api/tryouts/refund-form",
+  requireUser,
+  (req, res, next) => {
+    refundUpload.fields([
+      { name: "deliveryScreenshot", maxCount: 1 },
+      { name: "reviewFiles", maxCount: 5 },
+    ])(req, res, (err) => {
+      if (err) {
+        return res.status(400).json({
+          success: false,
+          message:
+            err.code === "LIMIT_FILE_SIZE"
+              ? "One of the files is too large (max 10MB each). Please compress and try again."
+              : err.code === "LIMIT_UNEXPECTED_FILE"
+              ? "Too many files — you can attach 1 delivery screenshot and up to 5 review files."
+              : "Could not read the uploaded files. Please try again.",
+        });
+      }
+      next();
+    });
+  },
+  async (req, res) => {
+    try {
+      const application = await TryoutApplication.findOne({
+        user: req.user.userId,
+        status: "approved",
+      });
+
+      if (!application) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Only approved Tryout members can submit the refund form",
+        });
+      }
+
+      const orderId = String(req.body?.orderId || "").trim();
+      const orderAmount = Math.max(0, Number(req.body?.orderAmount) || 0);
+      const otherInfo = String(req.body?.otherInfo || "").trim();
+      const deliveryFile = req.files?.deliveryScreenshot?.[0];
+      const reviewFiles = req.files?.reviewFiles || [];
+
+      if (!orderId) {
+        return res.status(400).json({
+          success: false,
+          message: "Please enter your order id",
+        });
+      }
+      if (orderAmount <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Please enter the order amount",
+        });
+      }
+      if (!deliveryFile) {
+        return res.status(400).json({
+          success: false,
+          message: "Please attach the delivery screenshot",
+        });
+      }
+      if (reviewFiles.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Please attach at least one review file (product, 5 star rating, written content)",
+        });
+      }
+
+      let deliveryScreenshotUrl = "";
+
+      try {
+        deliveryScreenshotUrl = await uploadBufferToCloudinary(
+          deliveryFile.buffer
+        );
+      } catch {
+        return res.status(500).json({
+          success: false,
+          message:
+            "Your delivery screenshot could not be saved. Please try again in a moment.",
+        });
+      }
+
+      const reviewUrls = [];
+
+      for (const file of reviewFiles) {
+        try {
+          reviewUrls.push(await uploadBufferToCloudinary(file.buffer));
+        } catch {
+          // Best effort — one failed review file should not block the rest.
+        }
+      }
+
+      // The review proof is required — never accept a submission where none
+      // of the review files could be stored.
+      if (reviewUrls.length === 0) {
+        return res.status(500).json({
+          success: false,
+          message:
+            "Your review files could not be saved. Please try again in a moment.",
+        });
+      }
+
+      const entry = {
+        orderId,
+        orderAmount,
+        deliveryScreenshotUrl,
+        reviewFiles: reviewUrls,
+        otherInfo,
+        status: "submitted",
+        submittedAt: new Date(),
+      };
+
+      application.refundForms.push(entry);
+      await application.save();
+
+      const memberEmail = String(application.email || "").trim();
+
+      // Confirmation email to the member.
+      if (memberEmail && process.env.EMAIL_USER) {
+        if (process.env.ORDER_STATUS_EMAIL_DRY_RUN === "true") {
+          console.log("[dry-run] Refund form confirmation email → " + memberEmail);
+        } else {
+          transporter
+            .sendMail({
+              from: '"DEALROOT Beauty" <' + process.env.EMAIL_USER + ">",
+              to: memberEmail,
+              subject: "✅ Refund form submitted — Dealroot Tryouts",
+              html:
+                '<div style="font-family:Arial;padding:30px;max-width:620px;margin:auto">' +
+                '<h2 style="color:#1f2a4d;margin:0 0 6px">Your refund form has been filled ✅</h2>' +
+                '<p style="color:#374151;line-height:1.7;margin:0 0 16px">Hi ' +
+                xmlEscape(application.name || "there") +
+                ',<br/>Thank you for submitting your delivery and review proof for order <b>' +
+                xmlEscape(orderId) +
+                '</b>. <b>Please do not cancel your order</b> — keep it active while our team verifies it.' +
+                "</p>" +
+                '<div style="background:#f4f1ff;border:1px solid #e4defc;border-radius:12px;padding:16px 18px;font-size:14px;line-height:1.8">' +
+                '<b>What happens next:</b><br/>Our team will verify your delivery and review, then process your refund / cashback shortly. Wait for the verification email.' +
+                "</div>" +
+                '<p style="margin-top:18px;color:#6b7280;font-size:13px">You can track your submissions in your Tryout dashboard.</p>' +
+                "</div>",
+            })
+            .catch((err) =>
+              console.error("Refund form member email failed:", err.message)
+            );
+        }
+      }
+
+      // Notify the owner with full details + proof links.
+      if (process.env.ADMIN_EMAIL && process.env.EMAIL_USER) {
+        if (process.env.ORDER_STATUS_EMAIL_DRY_RUN === "true") {
+          console.log("[dry-run] Refund form owner email → " + process.env.ADMIN_EMAIL);
+        } else {
+          const reviewLinks = reviewUrls
+            .map(
+              (url, i) =>
+                '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Review file ' +
+                (i + 1) +
+                '</td><td style="padding:8px 10px"><a href="' +
+                xmlEscape(url) +
+                '" style="color:#246bfd">View file</a></td></tr>'
+            )
+            .join("");
+
+          transporter
+            .sendMail({
+              from: '"DEALROOT Beauty" <' + process.env.EMAIL_USER + ">",
+              to: process.env.ADMIN_EMAIL,
+              subject:
+                "📦 Tryout Refund Form — " +
+                String(application.name || "Member"),
+              html:
+                '<div style="font-family:Arial;padding:30px;max-width:620px;margin:auto">' +
+                '<h2 style="color:#1f2a4d;margin:0 0 6px">New Tryout refund form 📦</h2>' +
+                '<p style="color:#6b7280;margin:0 0 18px">A Tryout member submitted their delivery + review proof.</p>' +
+                '<table style="width:100%;border-collapse:collapse;font-size:14px;line-height:1.6">' +
+                '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold;width:180px">Member</td><td style="padding:8px 10px">' +
+                xmlEscape(application.name || "-") +
+                "</td></tr>" +
+                '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Email</td><td style="padding:8px 10px">' +
+                xmlEscape(memberEmail || "-") +
+                "</td></tr>" +
+                '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Order id</td><td style="padding:8px 10px">' +
+                xmlEscape(orderId || "-") +
+                "</td></tr>" +
+                '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Order amount</td><td style="padding:8px 10px">₹' +
+                (orderAmount || 0) +
+                "</td></tr>" +
+                (deliveryScreenshotUrl
+                  ? '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Delivery screenshot</td><td style="padding:8px 10px"><a href="' +
+                    xmlEscape(deliveryScreenshotUrl) +
+                    '" style="color:#246bfd">View screenshot</a></td></tr>'
+                  : "") +
+                reviewLinks +
+                '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Other info</td><td style="padding:8px 10px">' +
+                xmlEscape(otherInfo || "-") +
+                "</td></tr>" +
+                "</table>" +
+                '<p style="margin-top:18px;color:#6b7280;font-size:13px">Verify this delivery and review, then process the refund / cashback from the admin panel → Tryouts tab.</p>' +
+                "</div>",
+            })
+            .catch((err) =>
+              console.error("Refund form owner email failed:", err.message)
+            );
+        }
+      }
+
+      res.status(201).json({
+        success: true,
+        message:
+          "Refund form submitted — we have emailed you the confirmation. Please do not cancel your order.",
+        entry,
+      });
+    } catch (error) {
+      console.error("Refund form submit failed:", error.message);
+      res.status(500).json({ success: false, message: "Could not submit the refund form" });
+    }
+  }
+);
+
 // Customer: my Tryout application / status.
 app.get("/api/tryouts/my", requireUser, async (req, res) => {
   try {
@@ -5509,6 +5760,9 @@ app.get("/api/tryouts/my", requireUser, async (req, res) => {
             cashbackReceived: application.cashbackReceived || 0,
             history: (application.cashbackHistory || []).slice().reverse(),
             purchaseForms: (application.purchaseForms || [])
+              .slice()
+              .reverse(),
+            refundForms: (application.refundForms || [])
               .slice()
               .reverse(),
           }
@@ -5755,6 +6009,52 @@ app.patch(
       res
         .status(500)
         .json({ success: false, message: "Could not update the purchase form" });
+    }
+  }
+);
+
+// Admin: verify or reject a member's refund-form submission.
+app.patch(
+  "/api/tryouts/:id/refund-form/:formId",
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const nextStatus = String(req.body?.status || "").trim();
+      if (!["verified", "rejected"].includes(nextStatus)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid refund form status" });
+      }
+
+      const application = await TryoutApplication.findById(req.params.id);
+      if (!application) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Application not found" });
+      }
+
+      const form = (application.refundForms || []).id(req.params.formId);
+      if (!form) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Refund form not found" });
+      }
+
+      form.status = nextStatus;
+      await application.save();
+
+      res.json({
+        success: true,
+        message:
+          "Refund form " +
+          (nextStatus === "verified" ? "verified" : "rejected"),
+        application,
+      });
+    } catch (error) {
+      console.error("Refund form status update failed:", error.message);
+      res
+        .status(500)
+        .json({ success: false, message: "Could not update the refund form" });
     }
   }
 );
