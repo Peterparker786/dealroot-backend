@@ -5212,6 +5212,22 @@ const tryoutApplicationSchema = new mongoose.Schema(
         submittedAt: { type: Date, default: Date.now },
       },
     ],
+    // Cashback withdrawal requests (member asks to be paid out to their UPI).
+    withdrawals: [
+      {
+        // Human-friendly reference shown in the member dashboard history.
+        referenceId: { type: String, trim: true, default: "" },
+        amount: { type: Number, required: true, min: 1 },
+        upiId: { type: String, trim: true, default: "" },
+        status: {
+          type: String,
+          enum: ["requested", "paid", "rejected"],
+          default: "requested",
+        },
+        requestedAt: { type: Date, default: Date.now },
+        processedAt: { type: Date, default: null },
+      },
+    ],
   },
   { timestamps: true }
 );
@@ -5765,6 +5781,9 @@ app.get("/api/tryouts/my", requireUser, async (req, res) => {
             refundForms: (application.refundForms || [])
               .slice()
               .reverse(),
+            withdrawals: (application.withdrawals || [])
+              .slice()
+              .reverse(),
           }
         : null,
     });
@@ -6055,6 +6074,263 @@ app.patch(
       res
         .status(500)
         .json({ success: false, message: "Could not update the refund form" });
+    }
+  }
+);
+
+// Customer: request a cashback withdrawal to their UPI. Moves the amount
+// from available → pending so it cannot be withdrawn twice, notifies the
+// owner with the member's UPI details, and confirms to the member.
+app.post("/api/tryouts/withdraw", requireUser, async (req, res) => {
+  try {
+    const application = await TryoutApplication.findOne({
+      user: req.user.userId,
+      status: "approved",
+    });
+
+    if (!application) {
+      return res.status(400).json({
+        success: false,
+        message: "Only approved Tryout members can request a withdrawal",
+      });
+    }
+
+    const amount = Math.floor(Number(req.body?.amount) || 0);
+    const upiId = String(req.body?.upiId || "").trim();
+
+    if (amount <= 0) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Please enter a valid amount" });
+    }
+    if (amount > (application.cashbackAvailable || 0)) {
+      return res.status(400).json({
+        success: false,
+        message: "Amount exceeds your available cashback",
+      });
+    }
+    if (!upiId || !upiId.includes("@")) {
+      return res.status(400).json({
+        success: false,
+        message: "Please enter a valid UPI ID (e.g. yourname@upi)",
+      });
+    }
+
+    application.cashbackAvailable =
+      (application.cashbackAvailable || 0) - amount;
+    application.cashbackPending =
+      (application.cashbackPending || 0) + amount;
+    application.withdrawals.push({
+      referenceId:
+        "REQ_" +
+        Array.from(crypto.randomBytes(6))
+          .map((byte) =>
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[byte % 36]
+          )
+          .join(""),
+      amount,
+      upiId,
+      status: "requested",
+      requestedAt: new Date(),
+    });
+
+    await application.save();
+
+    const memberEmail = String(application.email || "").trim();
+
+    // Confirm to the member.
+    if (memberEmail && process.env.EMAIL_USER) {
+      if (process.env.ORDER_STATUS_EMAIL_DRY_RUN === "true") {
+        console.log("[dry-run] Withdrawal member email → " + memberEmail);
+      } else {
+        transporter
+          .sendMail({
+            from: '"DEALROOT Beauty" <' + process.env.EMAIL_USER + ">",
+            to: memberEmail,
+            subject: "💳 Withdrawal request received — Dealroot Tryouts",
+            html:
+              '<div style="font-family:Arial;padding:30px;max-width:620px;margin:auto">' +
+              '<h2 style="color:#1f2a4d;margin:0 0 6px">Withdrawal request received 💳</h2>' +
+              '<p style="color:#374151;line-height:1.7;margin:0 0 16px">Hi ' +
+              xmlEscape(application.name || "there") +
+              ", we have received your cashback withdrawal request.</p>" +
+              '<table style="width:100%;border-collapse:collapse;font-size:14px;line-height:1.6">' +
+              '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold;width:160px">Reference</td><td style="padding:8px 10px">' +
+              xmlEscape(
+                (application.withdrawals[application.withdrawals.length - 1] || {})
+                  .referenceId || "-"
+              ) +
+              "</td></tr>" +
+              '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Amount</td><td style="padding:8px 10px">₹' +
+              amount +
+              "</td></tr>" +
+              '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">UPI ID</td><td style="padding:8px 10px">' +
+              xmlEscape(upiId) +
+              "</td></tr>" +
+              '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Status</td><td style="padding:8px 10px">Requested</td></tr>' +
+              "</table>" +
+              '<p style="margin-top:18px;color:#6b7280;font-size:13px">Our team will process your payout to the above UPI ID shortly. You can track it in your Tryout dashboard.</p>' +
+              "</div>",
+          })
+          .catch((err) =>
+            console.error("Withdrawal member email failed:", err.message)
+          );
+      }
+    }
+
+    // Notify the owner so they can pay out to the UPI.
+    if (process.env.ADMIN_EMAIL && process.env.EMAIL_USER) {
+      if (process.env.ORDER_STATUS_EMAIL_DRY_RUN === "true") {
+        console.log("[dry-run] Withdrawal owner email → " + process.env.ADMIN_EMAIL);
+      } else {
+        transporter
+          .sendMail({
+            from: '"DEALROOT Beauty" <' + process.env.EMAIL_USER + ">",
+            to: process.env.ADMIN_EMAIL,
+            subject:
+              "💳 Tryout Withdrawal Request — " +
+              String(application.name || "Member"),
+            html:
+              '<div style="font-family:Arial;padding:30px;max-width:620px;margin:auto">' +
+              '<h2 style="color:#1f2a4d;margin:0 0 6px">New Tryout withdrawal request 💳</h2>' +
+              '<p style="color:#6b7280;margin:0 0 18px">A Tryout member wants to withdraw their cashback.</p>' +
+              '<table style="width:100%;border-collapse:collapse;font-size:14px;line-height:1.6">' +
+              '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold;width:180px">Member</td><td style="padding:8px 10px">' +
+              xmlEscape(application.name || "-") +
+              "</td></tr>" +
+              '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Email</td><td style="padding:8px 10px">' +
+              xmlEscape(memberEmail || "-") +
+              "</td></tr>" +
+              '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Amount</td><td style="padding:8px 10px">₹' +
+              amount +
+              "</td></tr>" +
+              '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">UPI ID</td><td style="padding:8px 10px">' +
+              xmlEscape(upiId) +
+              "</td></tr>" +
+              "</table>" +
+              '<p style="margin-top:18px;color:#6b7280;font-size:13px">Pay this amount to the UPI above, then mark it paid from the admin panel → Tryouts tab.</p>' +
+              "</div>",
+          })
+          .catch((err) =>
+            console.error("Withdrawal owner email failed:", err.message)
+          );
+      }
+    }
+
+    res.status(201).json({
+      success: true,
+      message:
+        "Withdrawal request submitted — our team will pay to your UPI shortly",
+      application,
+    });
+  } catch (error) {
+    console.error("Withdrawal request failed:", error.message);
+    res
+      .status(500)
+      .json({ success: false, message: "Could not submit the withdrawal request" });
+  }
+});
+
+// Admin: mark a withdrawal request as paid or rejected (rebalances totals).
+app.patch(
+  "/api/tryouts/withdraw/:entryId",
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const nextStatus = String(req.body?.status || "").trim();
+      if (!["paid", "rejected"].includes(nextStatus)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid withdrawal status" });
+      }
+
+      const application = await TryoutApplication.findOne({
+        "withdrawals._id": req.params.entryId,
+      });
+      if (!application) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Withdrawal not found" });
+      }
+
+      const entry = application.withdrawals.id(req.params.entryId);
+      if (!entry || entry.status !== "requested") {
+        return res
+          .status(400)
+          .json({ success: false, message: "Withdrawal is already processed" });
+      }
+
+      const delta = entry.amount || 0;
+
+      // pending is released when paid; returned to available when rejected.
+      application.cashbackPending = Math.max(
+        0,
+        (application.cashbackPending || 0) - delta
+      );
+
+      if (nextStatus === "paid") {
+        // The payout completed — count it as cashback the member received.
+        application.cashbackReceived =
+          (application.cashbackReceived || 0) + delta;
+      } else {
+        application.cashbackAvailable =
+          (application.cashbackAvailable || 0) + delta;
+      }
+
+      entry.status = nextStatus;
+      entry.processedAt = new Date();
+      await application.save();
+
+      // Notify the member that their withdrawal was processed.
+      const memberEmail = String(application.email || "").trim();
+
+      if (memberEmail && process.env.EMAIL_USER) {
+        if (process.env.ORDER_STATUS_EMAIL_DRY_RUN === "true") {
+          console.log("[dry-run] Withdrawal processed email → " + memberEmail);
+        } else {
+          transporter
+            .sendMail({
+              from: '"DEALROOT Beauty" <' + process.env.EMAIL_USER + ">",
+              to: memberEmail,
+              subject:
+                nextStatus === "paid"
+                  ? "✅ Withdrawal paid — Dealroot Tryouts"
+                  : "ℹ️ Withdrawal rejected — Dealroot Tryouts",
+              html:
+                '<div style="font-family:Arial;padding:30px;max-width:620px;margin:auto">' +
+                (nextStatus === "paid"
+                  ? '<h2 style="color:#1f2a4d;margin:0 0 6px">Your withdrawal has been paid ✅</h2>'
+                  : '<h2 style="color:#1f2a4d;margin:0 0 6px">Your withdrawal was rejected</h2>') +
+                '<p style="color:#374151;line-height:1.7;margin:0 0 16px">Hi ' +
+                xmlEscape(application.name || "there") +
+                ", your withdrawal request of <b>₹" +
+                delta +
+                "</b> has been " +
+                (nextStatus === "paid"
+                  ? "paid to " + xmlEscape(entry.upiId || "your UPI") + "."
+                  : "rejected. The amount has been returned to your available cashback.") +
+                "</p>" +
+                (nextStatus === "rejected"
+                  ? '<p style="color:#6b7280;font-size:13px">If you think this is a mistake, contact our team or submit a new withdrawal request.</p>'
+                  : '<p style="color:#6b7280;font-size:13px">Thank you for being a Dealroot Tryout member! You can view your updated balance in your dashboard.</p>') +
+                "</div>",
+            })
+            .catch((err) =>
+              console.error("Withdrawal processed email failed:", err.message)
+            );
+        }
+      }
+
+      res.json({
+        success: true,
+        message: "Withdrawal " + nextStatus,
+        application,
+      });
+    } catch (error) {
+      console.error("Withdrawal status update failed:", error.message);
+      res
+        .status(500)
+        .json({ success: false, message: "Could not update the withdrawal" });
     }
   }
 );
