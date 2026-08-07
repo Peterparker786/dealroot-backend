@@ -2850,10 +2850,36 @@ app.post(
       );
 
       // Upload the extracted product photos to Cloudinary so the storefront
-      // can use them directly.
+      // can use them directly. The main image is guaranteed to be a real
+      // photo (the vision model just used it), so it is always uploaded even
+      // when the stricter size/content-type checks would reject it.
       const uploadedImages = [];
 
+      const pushUploaded = (url) => {
+        if (url && !uploadedImages.includes(url)) {
+          uploadedImages.push(url);
+        }
+      };
+
+      const looksLikeImageUrl = (type, url) =>
+        /^image\//i.test(type) ||
+        (/\/(jpe?g|png|webp|gif)$/i.test(url) &&
+          (type === "" || /^(image\/|application\/octet-stream)/i.test(type)));
+
+      if (imageBuffer.length > 5000 && looksLikeImageUrl(mimeType, mainImage)) {
+        try {
+          pushUploaded(await uploadBufferToCloudinary(imageBuffer));
+        } catch (error) {
+          console.error(
+            "Main image Cloudinary upload failed:",
+            error.message
+          );
+        }
+      }
+
       for (const imgUrl of pageImages.slice(0, 5)) {
+        if (imgUrl === mainImage) continue;
+
         const controller2 = new AbortController();
         const timeout2 = setTimeout(() => controller2.abort(), 20000);
 
@@ -2868,27 +2894,37 @@ app.post(
 
           const buffer2 = Buffer.from(await response2.arrayBuffer());
           const type2 = response2.headers.get("content-type") || "";
-          const looksLikeImage =
-            /^image\//i.test(type2) ||
-            (!type2 && /\.(jpe?g|png|webp|gif)$/i.test(imgUrl));
 
-          if (buffer2.length > 20000 && looksLikeImage) {
-            const secureUrl = await uploadBufferToCloudinary(buffer2);
-            if (secureUrl && !uploadedImages.includes(secureUrl)) {
-              uploadedImages.push(secureUrl);
+          if (buffer2.length > 10000 && looksLikeImageUrl(type2, imgUrl)) {
+            try {
+              const secureUrl = await uploadBufferToCloudinary(buffer2);
+              if (secureUrl) pushUploaded(secureUrl);
+            } catch (error) {
+              console.error(
+                "Product image Cloudinary upload failed:",
+                error.message
+              );
             }
           }
-        } catch {
-          // skip broken images
+        } catch (error) {
+          console.error("Product image download failed:", error.message);
         } finally {
           clearTimeout(timeout2);
         }
       }
 
+      // Fallback: if nothing could be uploaded to Cloudinary (e.g. quota or
+      // datacenter IP blocked by the CDN), still hand back the original CDN
+      // image URLs so the admin can review and save them.
+      const images =
+        uploadedImages.length > 0
+          ? uploadedImages
+          : pageImages.slice(0, 5);
+
       res.json({
         success: true,
         info,
-        images: uploadedImages,
+        images,
       });
     } catch (error) {
       console.error("Link extraction failed:", error.message);
@@ -2906,6 +2942,18 @@ app.post(
   upload.array("images", 10),
   async (req, res) => {
     try {
+      if (
+        !process.env.CLOUDINARY_CLOUD_NAME ||
+        !process.env.CLOUDINARY_API_KEY ||
+        !process.env.CLOUDINARY_API_SECRET
+      ) {
+        return res.status(500).json({
+          success: false,
+          message:
+            "Cloudinary is not configured on this server. Add CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET to the server environment (Render dashboard > Environment), then restart.",
+        });
+      }
+
       if (!req.files || req.files.length === 0) {
         return res.status(400).json({
           success: false,
