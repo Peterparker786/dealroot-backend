@@ -199,6 +199,14 @@ const upload = multer({
 });
 const PORT = process.env.PORT || 5000;
 
+// Tryout purchase-form screenshots can be large phone captures.
+const purchaseUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 15 * 1024 * 1024, // 15MB
+  },
+});
+
 // Returns uploads allow larger videos (photos + one video).
 const returnUpload = multer({
   storage: multer.memoryStorage(),
@@ -5161,6 +5169,22 @@ const tryoutApplicationSchema = new mongoose.Schema(
         createdAt: { type: Date, default: Date.now },
       },
     ],
+    // Purchase-form submissions (member buys a Tryout product, then submits
+    // proof so the team can verify and add the order to their dashboard).
+    purchaseForms: [
+      {
+        phoneAtStore: { type: String, trim: true, default: "" },
+        profileName: { type: String, trim: true, default: "" },
+        screenshotUrl: { type: String, trim: true, default: "" },
+        otherInfo: { type: String, trim: true, default: "" },
+        status: {
+          type: String,
+          enum: ["submitted", "verified", "rejected"],
+          default: "submitted",
+        },
+        submittedAt: { type: Date, default: Date.now },
+      },
+    ],
   },
   { timestamps: true }
 );
@@ -5283,6 +5307,182 @@ app.post("/api/tryouts/apply", requireUser, async (req, res) => {
   }
 });
 
+// Customer: submit the purchase form after buying a Tryout product.
+// Stores the proof (incl. screenshot) and emails the member a confirmation
+// + notifies the owner so they can verify and credit the order.
+app.post(
+  "/api/tryouts/purchase-form",
+  requireUser,
+  (req, res, next) => {
+    purchaseUpload.single("screenshot")(req, res, (err) => {
+      if (err) {
+        return res.status(400).json({
+          success: false,
+          message:
+            err.code === "LIMIT_FILE_SIZE"
+              ? "The screenshot is too large (max 15MB). Please compress it and try again."
+              : "Could not read the uploaded screenshot. Please try again.",
+        });
+      }
+      next();
+    });
+  },
+  async (req, res) => {
+    try {
+      const application = await TryoutApplication.findOne({
+        user: req.user.userId,
+        status: "approved",
+      });
+
+      if (!application) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Only approved Tryout members can submit the purchase form",
+        });
+      }
+
+      const phoneAtStore = String(req.body?.phoneAtStore || "")
+        .replace(/\D/g, "")
+        .slice(0, 10);
+      const profileName = String(req.body?.profileName || "").trim();
+      const otherInfo = String(req.body?.otherInfo || "").trim();
+
+      if (phoneAtStore.length !== 10) {
+        return res.status(400).json({
+          success: false,
+          message: "Please enter a valid 10-digit mobile number used at the store",
+        });
+      }
+      if (!profileName) {
+        return res.status(400).json({
+          success: false,
+          message: "Please enter your profile name on the marketplace",
+        });
+      }
+      if (!req.file) {
+        return res.status(400).json({
+          success: false,
+          message: "Please attach the order screenshot",
+        });
+      }
+
+      let screenshotUrl = "";
+
+      try {
+        screenshotUrl = await uploadBufferToCloudinary(req.file.buffer);
+      } catch {
+        // Proof could not be stored — do not accept the submission silently.
+        return res.status(500).json({
+          success: false,
+          message:
+            "Your screenshot could not be saved. Please try again in a moment.",
+        });
+      }
+
+      const entry = {
+        phoneAtStore,
+        profileName,
+        screenshotUrl,
+        otherInfo,
+        status: "submitted",
+        submittedAt: new Date(),
+      };
+
+      application.purchaseForms.push(entry);
+      await application.save();
+
+      const memberEmail = String(application.email || "").trim();
+
+      // Confirmation email to the member.
+      if (memberEmail && process.env.EMAIL_USER) {
+        if (process.env.ORDER_STATUS_EMAIL_DRY_RUN === "true") {
+          console.log("[dry-run] Purchase form confirmation email → " + memberEmail);
+        } else {
+          transporter
+            .sendMail({
+              from: '"DEALROOT Beauty" <' + process.env.EMAIL_USER + ">",
+              to: memberEmail,
+              subject: "✅ Cashback form submitted — Dealroot Tryouts",
+              html:
+                '<div style="font-family:Arial;padding:30px;max-width:620px;margin:auto">' +
+                '<h2 style="color:#1f2a4d;margin:0 0 6px">Your cashback form has been filled ✅</h2>' +
+                '<p style="color:#374151;line-height:1.7;margin:0 0 16px">Hi ' +
+                xmlEscape(application.name || "there") +
+                ',<br/>Thank you for submitting your purchase details. <b>Please do not cancel the order</b> — keep it active so we can verify it.' +
+                "</p>" +
+                '<div style="background:#f4f1ff;border:1px solid #e4defc;border-radius:12px;padding:16px 18px;font-size:14px;line-height:1.8">' +
+                '<b>What happens next:</b><br/>Our team will verify your order and <b>add it to your Tryout dashboard</b> shortly. Wait for the verification email before placing any more purchase-form submissions for the same order.' +
+                "</div>" +
+                '<p style="margin-top:18px;color:#6b7280;font-size:13px">You can track your submissions in your Tryout dashboard → Form Response History.</p>' +
+                "</div>",
+            })
+            .catch((err) =>
+              console.error("Purchase form member email failed:", err.message)
+            );
+        }
+      }
+
+      // Notify the owner with full details + screenshot.
+      if (process.env.ADMIN_EMAIL && process.env.EMAIL_USER) {
+        if (process.env.ORDER_STATUS_EMAIL_DRY_RUN === "true") {
+          console.log("[dry-run] Purchase form owner email → " + process.env.ADMIN_EMAIL);
+        } else {
+          transporter
+            .sendMail({
+              from: '"DEALROOT Beauty" <' + process.env.EMAIL_USER + ">",
+              to: process.env.ADMIN_EMAIL,
+              subject:
+                "🛍️ Tryout Purchase Form — " +
+                String(application.name || "Member"),
+              html:
+                '<div style="font-family:Arial;padding:30px;max-width:620px;margin:auto">' +
+                '<h2 style="color:#1f2a4d;margin:0 0 6px">New Tryout purchase form 🛍️</h2>' +
+                '<p style="color:#6b7280;margin:0 0 18px">A Tryout member submitted their purchase proof.</p>' +
+                '<table style="width:100%;border-collapse:collapse;font-size:14px;line-height:1.6">' +
+                '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold;width:180px">Member</td><td style="padding:8px 10px">' +
+                xmlEscape(application.name || "-") +
+                "</td></tr>" +
+                '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Email</td><td style="padding:8px 10px">' +
+                xmlEscape(memberEmail || "-") +
+                "</td></tr>" +
+                '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Phone at store</td><td style="padding:8px 10px">' +
+                xmlEscape(phoneAtStore || "-") +
+                "</td></tr>" +
+                '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Profile name</td><td style="padding:8px 10px">' +
+                xmlEscape(profileName || "-") +
+                "</td></tr>" +
+                '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Other info</td><td style="padding:8px 10px">' +
+                xmlEscape(otherInfo || "-") +
+                "</td></tr>" +
+                (screenshotUrl
+                  ? '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Screenshot</td><td style="padding:8px 10px"><a href="' +
+                    xmlEscape(screenshotUrl) +
+                    '" style="color:#246bfd">View order screenshot</a></td></tr>'
+                  : "") +
+                "</table>" +
+                '<p style="margin-top:18px;color:#6b7280;font-size:13px">Verify this order and add the cashback from the admin panel → Tryouts tab.</p>' +
+                "</div>",
+            })
+            .catch((err) =>
+              console.error("Purchase form owner email failed:", err.message)
+            );
+        }
+      }
+
+      res.status(201).json({
+        success: true,
+        message:
+          "Purchase form submitted — we have emailed you the confirmation. Please do not cancel your order.",
+        entry,
+      });
+    } catch (error) {
+      console.error("Purchase form submit failed:", error.message);
+      res.status(500).json({ success: false, message: "Could not submit the purchase form" });
+    }
+  }
+);
+
 // Customer: my Tryout application / status.
 app.get("/api/tryouts/my", requireUser, async (req, res) => {
   try {
@@ -5308,6 +5508,9 @@ app.get("/api/tryouts/my", requireUser, async (req, res) => {
             cashbackPending: application.cashbackPending || 0,
             cashbackReceived: application.cashbackReceived || 0,
             history: (application.cashbackHistory || []).slice().reverse(),
+            purchaseForms: (application.purchaseForms || [])
+              .slice()
+              .reverse(),
           }
         : null,
     });
@@ -5508,6 +5711,53 @@ app.patch("/api/tryouts/cashback/:entryId", requireAdmin, async (req, res) => {
     res.status(500).json({ success: false, message: "Could not update cashback" });
   }
 });
+
+// Admin: verify or reject a member's purchase-form submission (screenshot
+// proof). After verifying, the admin adds cashback from the same screen.
+app.patch(
+  "/api/tryouts/:id/purchase-form/:formId",
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const nextStatus = String(req.body?.status || "").trim();
+      if (!["verified", "rejected"].includes(nextStatus)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid purchase form status" });
+      }
+
+      const application = await TryoutApplication.findById(req.params.id);
+      if (!application) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Application not found" });
+      }
+
+      const form = (application.purchaseForms || []).id(req.params.formId);
+      if (!form) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Purchase form not found" });
+      }
+
+      form.status = nextStatus;
+      await application.save();
+
+      res.json({
+        success: true,
+        message:
+          "Purchase form " +
+          (nextStatus === "verified" ? "verified" : "rejected"),
+        application,
+      });
+    } catch (error) {
+      console.error("Purchase form status update failed:", error.message);
+      res
+        .status(500)
+        .json({ success: false, message: "Could not update the purchase form" });
+    }
+  }
+);
 
 const startServer = async () => {
   try {
