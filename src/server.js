@@ -50,7 +50,10 @@ async function brevoSendMail({ from, to, subject, html }) {
   const https = require("https");
   const body = JSON.stringify({
     sender: {
-      email: process.env.EMAIL_USER || "dealroot.store@gmail.com",
+      email:
+        process.env.BREVO_SENDER_EMAIL ||
+        process.env.EMAIL_USER ||
+        "dealroot.store@gmail.com",
       name: "DEALROOT Beauty",
     },
     to: [{ email: to }],
