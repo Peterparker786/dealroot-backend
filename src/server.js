@@ -1645,14 +1645,22 @@ app.get("/api/admin/email-status", requireAdmin, async (req, res) => {
       from: process.env.EMAIL_USER ? String(process.env.EMAIL_USER).replace(/./g, (c, i) => (i < 3 ? c : "*")) : null,
     };
 
-    let smtp = "untested";
-    try {
-      await transporter.verify();
-      smtp = "ok";
-    } catch (e) {
-      smtp = "fail: " + (e.message || "SMTP error");
+    if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+      status.smtp = "not-configured: EMAIL_USER / EMAIL_PASS missing";
+    } else {
+      // verify() can hang forever when SMTP is unreachable — enforce a cap.
+      try {
+        await Promise.race([
+          transporter.verify(),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("SMTP verify timed out")), 8000)
+          ),
+        ]);
+        status.smtp = "ok";
+      } catch (e) {
+        status.smtp = "fail: " + (e.message || "SMTP error");
+      }
     }
-    status.smtp = smtp;
 
     res.json({ success: true, status });
   } catch (e) {
