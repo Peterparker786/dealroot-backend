@@ -12,6 +12,7 @@ const mongoose = require("mongoose");
 const Razorpay = require("razorpay");
 const multer = require("multer");
 const { v2: cloudinary } = require("cloudinary");
+const { syncPurchaseFormToGoogle } = require("./google-sync");
 
 // Escapes user-provided text before it is placed inside HTML emails.
 const xmlEscape = (value) =>
@@ -1630,6 +1631,73 @@ app.post("/api/admin/login", adminLoginLimiter, async (req, res) => {
     token,
     admin: { email },
   });
+});
+
+
+// Admin-only email diagnostics — report SMTP config health WITHOUT exposing secrets.
+app.get("/api/admin/email-status", requireAdmin, async (req, res) => {
+  try {
+    const status = {
+      emailUserSet: Boolean(process.env.EMAIL_USER),
+      emailPassSet: Boolean(process.env.EMAIL_PASS),
+      adminEmailSet: Boolean(process.env.ADMIN_EMAIL),
+      dryRun: process.env.ORDER_STATUS_EMAIL_DRY_RUN === "true",
+      from: process.env.EMAIL_USER ? String(process.env.EMAIL_USER).replace(/./g, (c, i) => (i < 3 ? c : "*")) : null,
+    };
+
+    let smtp = "untested";
+    try {
+      await transporter.verify();
+      smtp = "ok";
+    } catch (e) {
+      smtp = "fail: " + (e.message || "SMTP error");
+    }
+    status.smtp = smtp;
+
+    res.json({ success: true, status });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Could not check email status" });
+  }
+});
+
+// Admin-only: send a test email to the configured ADMIN_EMAIL so the owner can
+// verify the SMTP credentials work from the deployed server.
+app.post("/api/admin/email-test", requireAdmin, async (req, res) => {
+  try {
+    const to = String(process.env.ADMIN_EMAIL || process.env.EMAIL_USER || "").trim();
+    if (!to) {
+      return res.status(400).json({ success: false, message: "No ADMIN_EMAIL configured on this server" });
+    }
+    if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+      return res.status(400).json({
+        success: false,
+        message: "EMAIL_USER / EMAIL_PASS are not set on this server — add them to the deployment env and redeploy.",
+      });
+    }
+
+    const info = await transporter.sendMail({
+      from: '"DEALROOT Beauty" <' + process.env.EMAIL_USER + ">",
+      to,
+      subject: "DEALROOT test email ✅",
+      html:
+        '<div style="font-family:Arial;padding:30px;text-align:center">' +
+        '<h1 style="color:#e21c48">DEALROOT BEAUTY</h1>' +
+        "<p>If you can read this, order confirmation emails are working correctly.</p>" +
+        '<p style="color:#999;font-size:12px">Sent from the deployed server at ' +
+        new Date().toLocaleString("en-IN") +
+        "</p></div>",
+    });
+
+    res.json({
+      success: true,
+      message: "Test email sent to " + to + " (message id: " + info.messageId + ")",
+    });
+  } catch (e) {
+    res.status(500).json({
+      success: false,
+      message: "Email failed: " + (e.message || "unknown error"),
+    });
+  }
 });
 
 app.post("/api/auth/signup", customerAuthLimiter, async (req, res) => {
@@ -5184,7 +5252,14 @@ const tryoutApplicationSchema = new mongoose.Schema(
       {
         phoneAtStore: { type: String, trim: true, default: "" },
         profileName: { type: String, trim: true, default: "" },
+        orderId: { type: String, trim: true, default: "" },
+        orderAmount: { type: Number, default: 0, min: 0 },
+        productName: { type: String, trim: true, default: "" },
+        orderDate: { type: String, trim: true, default: "" },
         screenshotUrl: { type: String, trim: true, default: "" },
+        driveUrl: { type: String, trim: true, default: "" },
+        driveFileId: { type: String, trim: true, default: "" },
+        driveImageUrl: { type: String, trim: true, default: "" },
         otherInfo: { type: String, trim: true, default: "" },
         status: {
           type: String,
@@ -5389,6 +5464,10 @@ app.post(
         .replace(/\D/g, "")
         .slice(0, 10);
       const profileName = String(req.body?.profileName || "").trim();
+      const orderId = String(req.body?.orderId || "").trim();
+      const orderAmount = Math.floor(Number(req.body?.orderAmount) || 0);
+      const productName = String(req.body?.productName || "").trim();
+      const orderDate = String(req.body?.orderDate || "").trim();
       const otherInfo = String(req.body?.otherInfo || "").trim();
 
       if (phoneAtStore.length !== 10) {
@@ -5401,6 +5480,18 @@ app.post(
         return res.status(400).json({
           success: false,
           message: "Please enter your profile name on the marketplace",
+        });
+      }
+      if (!orderId) {
+        return res.status(400).json({
+          success: false,
+          message: "Please enter the order id",
+        });
+      }
+      if (orderAmount <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Please enter the order amount",
         });
       }
       if (!req.file) {
@@ -5426,11 +5517,74 @@ app.post(
       const entry = {
         phoneAtStore,
         profileName,
+        orderId,
+        orderAmount,
+        productName,
+        orderDate,
         screenshotUrl,
+        driveUrl: "",
+        driveFileId: "",
+        driveImageUrl: "",
         otherInfo,
         status: "submitted",
         submittedAt: new Date(),
       };
+
+      // Push to Google Sheet + upload screenshot to Google Drive.
+      // Best-effort — never blocks the submission if sync fails.
+      const entryId = entry._id;
+      const fileMimetype = String(req.file.mimetype || "image/png");
+      const fileExt =
+        fileMimetype === "image/jpeg" || fileMimetype === "image/jpg"
+          ? "jpg"
+          : fileMimetype === "image/webp"
+          ? "webp"
+          : fileMimetype === "image/heic" || fileMimetype === "image/heif"
+          ? "heic"
+          : "png";
+
+      syncPurchaseFormToGoogle({
+        profileName,
+        orderId,
+        orderAmount,
+        productName,
+        phoneAtStore,
+        orderDate,
+        buffer: req.file.buffer,
+        mimetype: fileMimetype,
+        filename:
+          "purchase-" +
+          (profileName || "member").replace(/[^a-z0-9]+/gi, "-") +
+          "-" +
+          Date.now() +
+          "." +
+          fileExt,
+      })
+        .then((syncResult) => {
+          if (syncResult && (syncResult.driveUrl || syncResult.driveFileId)) {
+            // Persist only the drive fields on this entry — never re-save
+            // the whole document (avoids clobbering concurrent edits).
+            return TryoutApplication.updateOne(
+              {
+                _id: application._id,
+                "purchaseForms._id": entryId,
+              },
+              {
+                $set: {
+                  "purchaseForms.$.driveUrl": syncResult.driveUrl || "",
+                  "purchaseForms.$.driveFileId":
+                    syncResult.driveFileId || "",
+                  "purchaseForms.$.driveImageUrl":
+                    syncResult.driveImageUrl || "",
+                },
+              }
+            ).catch(() => {});
+          }
+          return undefined;
+        })
+        .catch((error) =>
+          console.error("Google sync failed:", error && error.message)
+        );
 
       application.purchaseForms.push(entry);
       await application.save();
