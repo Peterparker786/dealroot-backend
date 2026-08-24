@@ -956,7 +956,9 @@ const Category = mongoose.model("Category", categorySchema);
 // Categories API — stored server-side so every browser/device sees the same list.
 app.get("/api/categories", async (req, res) => {
   try {
-    const list = await Category.find().sort({ createdAt: 1 });
+    const list = await Category.find().sort({ createdAt: 1 }).lean();
+    // Categories change very rarely — cache for 10 minutes.
+    res.set("Cache-Control", "public, max-age=600, stale-while-revalidate=3600");
     res.json({ success: true, categories: list });
   } catch (error) {
     res.status(500).json({ success: false, message: "Could not load categories" });
@@ -2483,7 +2485,15 @@ app.get("/api/products", async (req, res) => {
       }));
     }
 
-    const products = await Product.find(filter).sort({ createdAt: -1 });
+    const products = await Product.find(filter)
+      .select("brand title price mrp rating reviews images badge stock dealType tryoutOnly category createdAt marketplaceLinks buyLink buyLinkLabel buyLinkTerms")
+      .sort({ createdAt: -1 })
+      .lean();
+
+    // Cache products for 2 minutes on client, 10 seconds on CDN/proxy.
+    // This avoids a full round-trip on every category switch or scroll.
+    res.set("Cache-Control", "public, max-age=120, stale-while-revalidate=600");
+    res.set("Vary", "Accept-Encoding");
 
     res.json({
       success: true,
@@ -3441,9 +3451,13 @@ app.get("/api/banners/active", async (req, res) => {
   try {
     const banners = await Banner.find({
       active: true,
-    }).sort({
-      createdAt: -1,
-    });
+    })
+      .select("title subtitle couponCode buttonText buttonLink image active")
+      .sort({ createdAt: -1 })
+      .lean();
+
+    // Cache active banners for 5 minutes — they change rarely.
+    res.set("Cache-Control", "public, max-age=300, stale-while-revalidate=900");
 
     res.json({
       success: true,
