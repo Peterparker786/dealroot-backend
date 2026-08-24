@@ -4859,6 +4859,215 @@ function startCartRecoveryScheduler() {
   console.log("Abandoned cart recovery scheduler started (every 15 min)");
 }
 
+// ===================== NEW PRODUCTS DAILY EMAIL =====================
+// Every 24 hours, find products added in the last 24 hours and email
+// all registered customers with a "New Arrivals" newsletter.
+let lastNewProductEmailSent = null;
+let lastNewProductEmailCount = 0;
+
+async function sendNewProductEmails() {
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+  // Find products created in the last 24 hours.
+  const newProducts = await Product.find({ createdAt: { $gte: since } })
+    .sort({ createdAt: -1 })
+    .lean();
+
+  if (!newProducts || newProducts.length === 0) {
+    console.log("New product email: no new products in last 24h — skipped");
+    return 0;
+  }
+
+  // Find all registered customers with a valid email.
+  const customers = await User.find({
+    email: { $exists: true, $ne: "", $ne: null },
+  })
+    .select("email name")
+    .lean();
+
+  if (!customers || customers.length === 0) {
+    console.log("New product email: no customers found — skipped");
+    return 0;
+  }
+
+  const siteUrl = seoSiteUrl;
+  const money = (n) => `₹${Number(n || 0).toLocaleString("en-IN")}`;
+
+  // Build product cards HTML.
+  const productCards = newProducts
+    .slice(0, 12) // max 12 products in email
+    .map((p) => {
+      const discount =
+        p.mrp && p.price && p.mrp > p.price
+          ? Math.round(((p.mrp - p.price) / p.mrp) * 100)
+          : 0;
+      const productUrl = `${siteUrl}/product/${p._id}`;
+      const imageUrl =
+        p.images && p.images.length > 0
+          ? p.images[0]
+          : "https://images.unsplash.com/photo-1598440947619-2c35fc9aa908?auto=format&fit=crop&w=400&q=80";
+
+      return `
+        <tr>
+          <td style="padding:12px;vertical-align:top;width:250px;">
+            <a href="${productUrl}" target="_blank" style="text-decoration:none;color:inherit;">
+              <div style="border-radius:12px;overflow:hidden;background:#f9fafb;border:1px solid #e5e7eb;">
+                <img src="${xmlEscape(imageUrl)}" alt="${xmlEscape(p.title)}" style="width:100%;height:200px;object-fit:cover;display:block;" />
+                <div style="padding:14px;">
+                  <div style="font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">${xmlEscape(p.brand || "")}</div>
+                  <div style="font-size:14px;font-weight:600;color:#111;margin-bottom:8px;line-height:1.3;">${xmlEscape(p.title)}</div>
+                  <div style="display:flex;align-items:center;gap:8px;">
+                    <span style="font-size:16px;font-weight:700;color:#111;">${money(p.price)}</span>
+                    ${discount > 0 ? `<span style="font-size:12px;color:#9ca3af;text-decoration:line-through;">${money(p.mrp)}</span><span style="font-size:11px;color:#059669;font-weight:600;background:#ecfdf5;padding:2px 6px;border-radius:4px;">${discount}% OFF</span>` : ""}
+                  </div>
+                </div>
+              </div>
+            </a>
+          </td>
+        </tr>`;
+    })
+    .join("");
+
+  const subject = `🆕 ${newProducts.length} New Arrivals Just Dropped — Up to ${Math.max(...newProducts.map((p) => (p.mrp && p.price && p.mrp > p.price ? Math.round(((p.mrp - p.price) / p.mrp) * 100) : 0)))}% OFF!`;
+
+  const html = `
+    <div style="font-family:'Segoe UI',Arial,sans-serif;background:#f3f4f6;padding:0;margin:0;">
+      <table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:20px 0;">
+        <tr>
+          <td align="center">
+            <table width="600" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.06);">
+              <!-- Header -->
+              <tr>
+                <td style="background:linear-gradient(135deg,#7c3aed,#ec4899);padding:32px 40px;text-align:center;">
+                  <div style="font-size:28px;margin-bottom:8px;">🛍️</div>
+                  <h1 style="margin:0;color:#fff;font-size:24px;font-weight:700;letter-spacing:-0.5px;">New Arrivals Just Dropped!</h1>
+                  <p style="margin:8px 0 0;color:rgba(255,255,255,0.85);font-size:14px;">${newProducts.length} fresh products added in the last 24 hours</p>
+                </td>
+              </tr>
+
+              <!-- Products Grid -->
+              <tr>
+                <td style="padding:24px 20px 8px;">
+                  <table width="100%" cellpadding="0" cellspacing="0">
+                    ${Array.from({ length: Math.ceil(newProducts.slice(0, 12).length / 2) }, (_, row) => {
+                      const pair = newProducts.slice(0, 12).slice(row * 2, row * 2 + 2);
+                      return `<tr>${pair.map((p) => {
+                        const discount = p.mrp && p.price && p.mrp > p.price ? Math.round(((p.mrp - p.price) / p.mrp) * 100) : 0;
+                        const productUrl = `${siteUrl}/product/${p._id}`;
+                        const imageUrl = p.images && p.images.length > 0 ? p.images[0] : "https://images.unsplash.com/photo-1598440947619-2c35fc9aa908?auto=format&fit=crop&w=400&q=80";
+                        return `
+                          <td style="padding:8px;width:50%;vertical-align:top;">
+                            <a href="${productUrl}" target="_blank" style="text-decoration:none;color:inherit;display:block;">
+                              <div style="border-radius:12px;overflow:hidden;background:#f9fafb;border:1px solid #e5e7eb;transition:box-shadow 0.2s;">
+                                <img src="${xmlEscape(imageUrl)}" alt="${xmlEscape(p.title)}" style="width:100%;height:180px;object-fit:cover;display:block;" />
+                                <div style="padding:12px;">
+                                  <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px;">${xmlEscape(p.brand || "")}</div>
+                                  <div style="font-size:13px;font-weight:600;color:#111;margin-bottom:6px;line-height:1.3;">${xmlEscape(p.title)}</div>
+                                  <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                                    <span style="font-size:15px;font-weight:700;color:#111;">${money(p.price)}</span>
+                                    ${discount > 0 ? `<span style="font-size:11px;color:#9ca3af;text-decoration:line-through;">${money(p.mrp)}</span><span style="font-size:10px;color:#059669;font-weight:600;background:#ecfdf5;padding:2px 6px;border-radius:4px;">${discount}% OFF</span>` : ""}
+                                  </div>
+                                </div>
+                              </div>
+                            </a>
+                          </td>`;
+                        }).join("")}</tr>`;
+                    }).join("")}
+                  </table>
+                </td>
+              </tr>
+
+              <!-- CTA Button -->
+              <tr>
+                <td style="padding:20px 40px 32px;text-align:center;">
+                  <a href="${siteUrl}" target="_blank" style="display:inline-block;padding:14px 40px;background:linear-gradient(135deg,#7c3aed,#ec4899);color:#fff;font-size:15px;font-weight:600;text-decoration:none;border-radius:10px;letter-spacing:0.3px;">Shop All New Arrivals →</a>
+                </td>
+              </tr>
+
+              <!-- Footer -->
+              <tr>
+                <td style="background:#f9fafb;padding:20px 40px;text-align:center;border-top:1px solid #e5e7eb;">
+                  <p style="margin:0 0 8px;font-size:12px;color:#6b7280;">You're receiving this because you're a valued DEALROOT customer.</p>
+                  <p style="margin:0;font-size:11px;color:#9ca3af;">DEALROOT Beauty • Kanpur, India • <a href="${siteUrl}" style="color:#7c3aed;">dealroot.store</a></p>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </div>`;
+
+  // Send emails in batches to avoid rate limits.
+  let sent = 0;
+  const BATCH_SIZE = 10;
+  const BATCH_DELAY_MS = 2000;
+
+  for (let i = 0; i < customers.length; i += BATCH_SIZE) {
+    const batch = customers.slice(i, i + BATCH_SIZE);
+    const results = await Promise.allSettled(
+      batch.map((customer) =>
+        transporter.sendMail({
+          from: `"DEALROOT Beauty" <${process.env.EMAIL_USER}>`,
+          to: customer.email,
+          subject,
+          html,
+        })
+      )
+    );
+    sent += results.filter((r) => r.status === "fulfilled").length;
+
+    // Small delay between batches.
+    if (i + BATCH_SIZE < customers.length) {
+      await new Promise((resolve) => setTimeout(resolve, BATCH_DELAY_MS));
+    }
+  }
+
+  lastNewProductEmailSent = new Date();
+  lastNewProductEmailCount = sent;
+  console.log(`New product email: ${sent}/${customers.length} sent (${newProducts.length} products)`);
+  return sent;
+}
+
+// Admin endpoint: manually trigger new product email.
+app.post("/api/admin/new-product-email/run", requireAdmin, async (req, res) => {
+  try {
+    const sent = await sendNewProductEmails();
+    res.json({
+      success: true,
+      message: `Newsletter sent — ${sent} customer(s) notified`,
+      sent,
+    });
+  } catch (error) {
+    console.error("New product email error:", error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Admin endpoint: check last send status.
+app.get("/api/admin/new-product-email/status", requireAdmin, async (req, res) => {
+  res.json({
+    success: true,
+    lastSent: lastNewProductEmailSent,
+    lastCount: lastNewProductEmailCount,
+    nextRun: lastNewProductEmailSent
+      ? new Date(lastNewProductEmailSent.getTime() + 24 * 60 * 60 * 1000)
+      : null,
+  });
+});
+
+// Auto-send every 24 hours.
+function startNewProductEmailScheduler() {
+  // Run once after 5 minutes of server start (don't spam on cold start).
+  setTimeout(() => {
+    sendNewProductEmails().catch(() => {});
+  }, 5 * 60 * 1000);
+  // Then every 24 hours.
+  setInterval(() => {
+    sendNewProductEmails().catch(() => {});
+  }, 24 * 60 * 60 * 1000);
+  console.log("New product email scheduler started (every 24 hours)");
+}
+
 // ===================== RETURNS & REFUNDS =====================
 const RETURN_REASONS = [
   "Product is defective / not working",
@@ -6672,6 +6881,7 @@ const startServer = async () => {
     console.log("MongoDB connected");
 
     startCartRecoveryScheduler();
+    startNewProductEmailScheduler();
 
     try {
       const count = await Category.countDocuments();
