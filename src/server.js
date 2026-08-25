@@ -2651,7 +2651,7 @@ const extractProductFromScreenshot = async (
   mimeType,
   contextText = ""
 ) => {
-  const model = "gemini-flash-latest";
+  const model = "gemini-2.5-flash";
   const prompt = `
 You are a product data extraction assistant for an e-commerce store.
 Look at this product image (from Amazon, Flipkart, Myntra or any store)
@@ -2946,7 +2946,22 @@ const extractProductImagesFromHtml = (html, baseUrl) => {
   }
   [...bases].slice(0, 10).forEach((b) => push(b, 3));
 
-  // 5) Generic src patterns (large/product/image keywords) as last resort.
+  // 5) Flipkart product images — rukminim1/rukminim2 CDN
+  const flipkartRe =
+    /https:\/\/rukminim[12]\.flikart\.com\/[^"']+\.(?:jpg|jpeg|webp|png)/gi;
+  for (const m of html.match(flipkartRe) || []) {
+    push(m, 3);
+  }
+
+  // 6) Flipkart JSON data — look for image URLs inside "imageUrl" or "productImages"
+  const fkImgMatches =
+    html.match(/"(?:image_?Url|productImage|imgUrl)":\s*"(https?:\/\/[^"']+)"/gi) || [];
+  for (const m of fkImgMatches) {
+    const url = m.match(/"(https?:\/\/[^"']+)"/)?.[1];
+    if (url) push(url, 3);
+  }
+
+  // 7) Generic src patterns (large/product/image keywords) as last resort.
   // NOTE: srcset is deliberately excluded — it contains comma-separated URLs
   // with size descriptors that would produce malformed URLs.
   const srcMatches =
@@ -3104,45 +3119,75 @@ app.post(
         });
       }
 
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 30000);
+      // Try multiple User-Agent strings — Amazon/Flipkart aggressively
+      // block the same UA after a few requests, so we rotate.
+      const USER_AGENTS = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
+      ];
 
-      let pageResponse;
+      let pageResponse = null;
+      let html = "";
 
-      try {
-        pageResponse = await fetch(url, {
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
-            "Accept-Language": "en-IN,en;q=0.9,hi;q=0.8",
-          },
-          redirect: "follow",
-          signal: controller.signal,
-        });
-      } catch (fetchError) {
-        if (fetchError.name === "AbortError") {
-          throw new Error("Link se page load nahi hua — timeout. Dobara try karein.");
+      // Attempt up to 3 times with different UAs.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const ua = USER_AGENTS[attempt % USER_AGENTS.length];
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 45000);
+
+        try {
+          pageResponse = await fetch(url, {
+            headers: {
+              "User-Agent": ua,
+              Accept:
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+              "Accept-Language": "en-IN,en;q=0.9,hi;q=0.8",
+              "Accept-Encoding": "gzip, deflate, br",
+              "Cache-Control": "no-cache",
+              Pragma: "no-cache",
+              "Sec-Fetch-Dest": "document",
+              "Sec-Fetch-Mode": "navigate",
+              "Sec-Fetch-Site": "none",
+              "Sec-Fetch-User": "?1",
+              "Upgrade-Insecure-Requests": "1",
+            },
+            redirect: "follow",
+            signal: controller.signal,
+          });
+          clearTimeout(timeout);
+
+          if (pageResponse.ok) {
+            html = (await pageResponse.text()).slice(0, 3000000);
+            // Accept pages with at least some meaningful content.
+            if (html.trim().length >= 1500) break;
+          }
+        } catch (fetchError) {
+          clearTimeout(timeout);
+          if (fetchError.name === "AbortError" && attempt === 2) {
+            throw new Error(
+              "Page load nahi ho paya (timeout). Link check karein ya screenshot method use karein."
+            );
+          }
         }
-        throw new Error("Product page khul nahi paayi. Link check karein.");
-      } finally {
-        clearTimeout(timeout);
       }
 
-      if (!pageResponse.ok) {
-        const blocked =
-          pageResponse.status === 403 || pageResponse.status === 429;
+      if (!pageResponse || !pageResponse.ok) {
+        const status = pageResponse?.status || 0;
+        const blocked = status === 403 || status === 429 || status === 503;
         throw new Error(
           blocked
-            ? `Is store ne automated access block kar diya hai (status ${pageResponse.status}). Is platform ke liye screenshot method use karein.`
-            : `Product page khul nahi paayi (status ${pageResponse.status}). Link check karein.`
+            ? `Store ne automated access block kar diya (HTTP ${status}). ` +
+              "👉 Screenshot wala option use karein — product ka screenshot upload karein aur AI automatically sab details nikaal lega."
+            : `Page load nahi ho paya (HTTP ${status}). Link check karein ya screenshot method try karein.`
         );
       }
 
-      const html = (await pageResponse.text()).slice(0, 3000000);
-
-      if (html.trim().length < 2000) {
+      if (html.trim().length < 1500) {
         throw new Error(
-          "Ye page bot-protected ya client-side rendered hai (khali response aaya). Is platform ke liye screenshot method use karein."
+          "Page bot-protected hai ya images JS se load hoti hain. " +
+          "👉 Screenshot wala option use karein — product ka screenshot upload karein."
         );
       }
       const pageImages = [
@@ -3193,7 +3238,8 @@ app.post(
         return res.status(400).json({
           success: false,
           message:
-            "Is link se product image nahi mili (ye platform images JS se load karta hai). Is product ke liye screenshot option use karein.",
+            "Link se product images nahi milin. Ye platform images JS se load karta hai. " +
+            "👉 Screenshot wala option use karein — product ka screenshot upload karein aur AI sab nikaal lega.",
         });
       }
 
@@ -3216,7 +3262,7 @@ app.post(
           signal: imageController.signal,
         });
       } catch {
-        throw new Error("Product image download nahi ho payi — screenshot try karein");
+        throw new Error("Product image download nahi ho payi. Screenshot wala option try karein.");
       } finally {
         clearTimeout(imageTimeout);
       }
