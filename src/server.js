@@ -4431,74 +4431,6 @@ async function sendOrderStatusEmail(order) {
   });
 }
 
-// Notify the customer when a Razorpay refund is initiated for a cancelled order.
-async function sendRefundEmail(order, refundId) {
-  if (!order || !refundId) return;
-
-  const customerEmail =
-    String(order.customer?.email || "").trim() ||
-    (order.user
-      ? (await User.findOne({ _id: order.user }).select("email"))?.email
-      : "") ||
-    "";
-
-  if (!customerEmail) return;
-
-  if (process.env.ORDER_STATUS_EMAIL_DRY_RUN === "true") {
-    console.log("[dry-run] Refund email " + order.orderNumber);
-    return;
-  }
-
-  const siteUrl = seoSiteUrl;
-  const trackUrl = siteUrl + "/account";
-
-  const html =
-    '<div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;background:#fff;">\n' +
-    '  <div style="background:#059669;padding:22px 28px;text-align:center;">\n' +
-    '    <h1 style="color:#fff;margin:0;font-size:20px;">DEALROOT BEAUTY</h1>\n' +
-    '    <p style="color:#d1fae5;margin:6px 0 0;font-size:13px;">Your refund has been initiated ✅</p>\n' +
-    "  </div>\n" +
-    '  <div style="padding:28px;">\n' +
-    '    <p style="font-size:14px;color:#333;">Hi ' +
-    xmlEscape(order.customer?.name || "there") +
-    ",</p>\n" +
-    '    <div style="background:#ecfdf5;border:1px solid #a7f3d0;border-radius:10px;padding:16px 20px;margin:18px 0;text-align:center;">\n' +
-    '      <span style="font-size:44px;line-height:1;">💸</span>\n' +
-    '      <h2 style="margin:8px 0 4px;font-size:20px;color:#059669;">Refund Initiated</h2>\n' +
-    '      <span style="font-size:12px;color:#999;">Order ' +
-    order.orderNumber +
-    "</span>\n" +
-    "    </div>\n" +
-    '    <p style="font-size:14px;color:#555;line-height:1.6;">Your order has been cancelled and a <b>full refund of ₹' +
-    xmlEscape(String(order.totalAmount)) +
-    '</b> has been initiated to your original payment method.</p>\n' +
-    '    <p style="font-size:14px;color:#555;line-height:1.6;">The refund will reflect in your account within <b>5-7 business days</b>.</p>\n' +
-    '    <table style="width:100%;border-collapse:collapse;margin:16px 0;font-size:13px;">\n' +
-    '      <tr><td style="padding:8px;color:#666;">Order</td><td style="padding:8px;text-align:right;font-weight:700;">' +
-    order.orderNumber +
-    '</td></tr>\n' +
-    '      <tr><td style="padding:8px;color:#666;">Refund ID</td><td style="padding:8px;text-align:right;font-weight:700;font-size:12px;">' +
-    refundId +
-    '</td></tr>\n' +
-    '      <tr><td style="padding:8px;color:#666;border-top:1px solid #eee;">Amount</td><td style="padding:8px;text-align:right;font-weight:800;font-size:16px;color:#059669;">₹' +
-    xmlEscape(String(order.totalAmount)) +
-    '</td></tr>\n' +
-    "    </table>\n" +
-    '    <a href="' +
-    trackUrl +
-    '" style="display:block;text-align:center;background:#059669;color:#fff;text-decoration:none;padding:14px;border-radius:999px;font-size:14px;font-weight:700;">View order status</a>\n' +
-    '    <p style="font-size:12px;color:#999;margin-top:20px;line-height:1.6;text-align:center;">Questions? Reach us at dealroot.store@gmail.com or @Tom_andrew72 on Telegram.</p>\n' +
-    "  </div>\n" +
-    "</div>";
-
-  await transporter.sendMail({
-    from: '"DEALROOT Beauty" <' + process.env.EMAIL_USER + ">",
-    to: customerEmail,
-    subject: "💸 Refund initiated for " + order.orderNumber,
-    html,
-  });
-}
-
 app.patch("/api/orders/:id/status", requireAdmin, async (req, res) => {
   try {
     const { orderStatus } = req.body;
@@ -4646,70 +4578,14 @@ if (!order.customer.state) {
 });
     });
 
-    // Send cancellation email to customer
     sendOrderStatusEmail(order).catch((error) =>
       console.error("Cancellation email failed:", error.message)
     );
 
-    // --- Automatic Razorpay refund for paid orders ---
-    let refundInfo = null;
-    if (
-      order.paymentMethod === "razorpay" &&
-      order.razorpayPaymentId &&
-      ["paid"].includes(order.paymentStatus)
-    ) {
-      try {
-        const razorpayAmount = order.deliveryChargePaid
-          ? Math.round((order.totalAmount - (order.codAmount || 0)) * 100)
-          : Math.round(order.totalAmount * 100);
-
-        const refund = await getRazorpay().payments.refund(
-          order.razorpayPaymentId,
-          {
-            amount: razorpayAmount,
-            speed: "normal",
-            receipt: `RF-CANCEL-${order.orderNumber}`,
-            notes: {
-              reason: "Order cancelled by admin",
-              orderNumber: order.orderNumber,
-            },
-          }
-        );
-
-        order.paymentStatus = "refunded";
-        order.refundId = refund.id;
-        order.refundedAt = new Date();
-        await order.save({ validateBeforeSave: false });
-
-        refundInfo = { id: refund.id, amount: razorpayAmount / 100 };
-
-        console.log(
-          `Auto-refund initiated for ${order.orderNumber}: ₹${
-            razorpayAmount / 100
-          } (Razorpay refund ID: ${refund.id})`
-        );
-
-        // Notify customer that refund has been initiated
-        sendRefundEmail(order, refund.id).catch((error) =>
-          console.error("Refund email failed:", error.message)
-        );
-      } catch (refundError) {
-        console.error(
-          `Auto-refund FAILED for ${order.orderNumber}:`,
-          refundError.message
-        );
-        // Don't fail the cancel — order is already cancelled.
-        // Admin will need to refund manually from Razorpay dashboard.
-      }
-    }
-
     res.json({
       success: true,
-      message: refundInfo
-        ? `Order cancelled, stock restored, and ₹${refundInfo.amount} refund initiated`
-        : "Order cancelled and stock restored",
+      message: "Order cancelled and stock restored",
       order,
-      refund: refundInfo,
     });
 } catch (error) {
   console.log("=================================");
