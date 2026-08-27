@@ -748,6 +748,8 @@ codAmount: {
     cancelledAt: { type: Date, default: null },
     // True when the order contains at least one Tryout-exclusive product.
     tryoutOrder: { type: Boolean, default: false },
+    // Admin-pasted tracking URL so customers can track their shipment.
+    trackingLink: { type: String, default: "", trim: true },
   },
   { timestamps: true }
 );
@@ -4484,6 +4486,45 @@ app.patch("/api/orders/:id/status", requireAdmin, async (req, res) => {
     res.status(400).json({
       success: false,
       message: "Could not update order status",
+    });
+  }
+});
+
+// Admin: set a tracking link for an order so the customer can track their shipment.
+app.patch("/api/orders/:id/tracking", requireAdmin, async (req, res) => {
+  try {
+    const { trackingLink } = req.body;
+    const url = String(trackingLink || "").trim();
+
+    if (url && !/^https?:\/\//i.test(url)) {
+      return res.status(400).json({
+        success: false,
+        message: "Tracking link must be a valid URL",
+      });
+    }
+
+    const order = await Order.findByIdAndUpdate(
+      req.params.id,
+      { trackingLink: url },
+      { new: true, runValidators: true }
+    );
+
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: url ? "Tracking link updated" : "Tracking link removed",
+      order,
+    });
+  } catch {
+    res.status(400).json({
+      success: false,
+      message: "Could not update tracking link",
     });
   }
 });
