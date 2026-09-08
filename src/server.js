@@ -2492,14 +2492,46 @@ app.get("/api/products", async (req, res) => {
       }));
     }
 
+    // Tryout-exclusive products never appear in the public catalogue.
+    // They are visible only to approved Tryout members and admins.
+    let viewer = null;
+    const bearer = readBearerToken(req);
+    if (bearer) {
+      try {
+        viewer = jwt.verify(bearer, jwtSecret);
+      } catch {
+        viewer = null;
+      }
+    }
+
+    let canSeeTryout = viewer?.role === "admin";
+    if (!canSeeTryout && viewer?.role === "user" && viewer.userId) {
+      const member = await TryoutApplication.findOne({
+        user: viewer.userId,
+        status: "approved",
+      })
+        .select("_id")
+        .lean();
+      canSeeTryout = Boolean(member);
+    }
+
+    if (!canSeeTryout) {
+      filter.tryoutOnly = { $ne: true };
+    }
+
     const products = await Product.find(filter)
       .select("brand title price mrp rating reviews images badge stock dealType tryoutOnly category createdAt marketplaceLinks buyLink buyLinkLabel buyLinkTerms")
       .sort({ createdAt: -1 })
       .lean();
 
-    // Cache products for 2 minutes on client, 10 seconds on CDN/proxy.
-    // This avoids a full round-trip on every category switch or scroll.
-    res.set("Cache-Control", "public, max-age=120, stale-while-revalidate=600");
+    // Member/admin responses must never be cached publicly by the CDN,
+    // otherwise a guest could be served a member's tryout products.
+    res.set(
+      "Cache-Control",
+      canSeeTryout
+        ? "private, max-age=60"
+        : "public, max-age=120, stale-while-revalidate=600"
+    );
     res.set("Vary", "Accept-Encoding");
 
     res.json({
@@ -2524,6 +2556,37 @@ app.get("/api/products/:id", async (req, res) => {
         success: false,
         message: "Product not found",
       });
+    }
+
+    // Tryout-exclusive products are only visible to approved members & admins.
+    if (product.tryoutOnly) {
+      let viewer = null;
+      const bearer = readBearerToken(req);
+      if (bearer) {
+        try {
+          viewer = jwt.verify(bearer, jwtSecret);
+        } catch {
+          viewer = null;
+        }
+      }
+
+      let allowed = viewer?.role === "admin";
+      if (!allowed && viewer?.role === "user" && viewer.userId) {
+        const member = await TryoutApplication.findOne({
+          user: viewer.userId,
+          status: "approved",
+        })
+          .select("_id")
+          .lean();
+        allowed = Boolean(member);
+      }
+
+      if (!allowed) {
+        return res.status(404).json({
+          success: false,
+          message: "Product not found",
+        });
+      }
     }
 
     res.json({ success: true, product });
@@ -4956,8 +5019,12 @@ let lastNewProductEmailCount = 0;
 async function sendNewProductEmails() {
   const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
-  // Find products created in the last 24 hours.
-  const newProducts = await Product.find({ createdAt: { $gte: since } })
+  // Find products created in the last 24 hours. Tryout-exclusive products
+  // stay out of the newsletter — only approved members can see them.
+  const newProducts = await Product.find({
+    createdAt: { $gte: since },
+    tryoutOnly: { $ne: true },
+  })
     .sort({ createdAt: -1 })
     .lean();
 
@@ -5711,6 +5778,8 @@ const tryoutApplicationSchema = new mongoose.Schema(
     cashbackHistory: [
       {
         amount: { type: Number, required: true, min: 0 },
+        productName: { type: String, default: "" },
+        trackId: { type: String, default: "" },
         note: { type: String, default: "" },
         status: {
           type: String,
@@ -6508,12 +6577,20 @@ app.post("/api/tryouts/:id/cashback", requireAdmin, async (req, res) => {
 
     const amount = Math.max(0, Number(req.body?.amount) || 0);
     const note = String(req.body?.note || "").trim();
+    const productName = String(req.body?.productName || "").trim();
+    const trackId = String(req.body?.trackId || "").trim();
 
     if (amount <= 0) {
       return res.status(400).json({ success: false, message: "Please enter a valid cashback amount" });
     }
 
-    application.cashbackHistory.push({ amount, note, status: "pending" });
+    application.cashbackHistory.push({
+      amount,
+      productName,
+      trackId,
+      note,
+      status: "pending",
+    });
     application.cashbackPending = (application.cashbackPending || 0) + amount;
     await application.save();
 
@@ -6540,6 +6617,16 @@ app.post("/api/tryouts/:id/cashback", requireAdmin, async (req, res) => {
               (note
                 ? '<tr><td style="padding:8px 10px;background:#f0fdf4;font-weight:bold">Note</td><td style="padding:8px 10px">' +
                   xmlEscape(note) +
+                  "</td></tr>"
+                : "") +
+              (productName
+                ? '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Product</td><td style="padding:8px 10px">' +
+                  xmlEscape(productName) +
+                  "</td></tr>"
+                : "") +
+              (trackId
+                ? '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Track ID</td><td style="padding:8px 10px">' +
+                  xmlEscape(trackId) +
                   "</td></tr>"
                 : "") +
               '<tr><td style="padding:8px 10px;background:#fff7ed;font-weight:bold">Status</td><td style="padding:8px 10px;color:#d97706">⏳ Pending — waiting for admin confirmation</td></tr>' +
