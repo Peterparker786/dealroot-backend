@@ -5823,11 +5823,11 @@ app.post("/api/tryouts/apply", requireUser, async (req, res) => {
       });
     }
 
-    // Allow re-applying after a rejection.
+    // Allow re-applying after a rejection or disqualification.
     if (req.body?.replaceRejected) {
       await TryoutApplication.deleteMany({
         user: req.user.userId,
-        status: "rejected",
+        status: { $in: ["rejected", "disqualified"] },
       });
     }
 
