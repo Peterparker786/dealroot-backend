@@ -5814,6 +5814,9 @@ app.post("/api/tryouts/apply", requireUser, async (req, res) => {
     if (previousProgram && !TRYOUT_PROGRAMS.includes(previousProgram)) {
       return res.status(400).json({ success: false, message: "Please select a valid option for the previous program" });
     }
+    if (previousProgram === "Freekamaal" || previousProgram === "Trybox") {
+      return res.status(403).json({ success: false, message: "Sorry, you are not eligible. This program is for new users or first-time users only." });
+    }
 
     const existing = await TryoutApplication.findOne({
       user: req.user.userId,
