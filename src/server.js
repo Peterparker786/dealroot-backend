@@ -1004,7 +1004,14 @@ app.delete("/api/categories/:name", async (req, res) => {
   try {
     const name = String(req.params.name || "").trim();
 
-    const result = await Category.deleteOne({ name });
+    // Try exact match first, then case-insensitive fallback.
+    let result = await Category.deleteOne({ name });
+
+    if (!result.deletedCount) {
+      result = await Category.deleteOne({
+        name: { $regex: new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") },
+      });
+    }
 
     if (!result.deletedCount) {
       return res.status(404).json({ success: false, message: "Category not found" });
