@@ -1327,12 +1327,7 @@ const buildOnlinePaymentQuote = async ({
     discountAmount = Math.round(subtotal * 0.1);
   }
 
-  const normalizedCity = cleanCustomer.city
-    .toLowerCase()
-    .replace(/\s+/g, " ");
-  const isKanpurAddress = normalizedCity.includes("kanpur");
-  const deliveryFee =
-    subtotal >= 499 ? 0 : isKanpurAddress ? 29 : 49;
+  const deliveryFee = subtotal >= 499 ? 0 : 59;
  const totalAmount = roundMoney(
   subtotal - discountAmount + deliveryFee
 );
@@ -1363,7 +1358,7 @@ const amountInPaise = Math.round(payableNow * 100);
     amountInPaise,
     payableNow,
     codAmount,
-    deliveryType: isKanpurAddress ? "local" : "courier",
+    deliveryType: "courier",
     tryoutOrder: hasTryoutItem,
   };
 };
@@ -4245,11 +4240,7 @@ app.post("/api/orders", requireUser, async (req, res) => {
       }
 
       const normalizedCity = cleanCustomer.city
-        .toLowerCase()
-        .replace(/\s+/g, " ");
-      const isKanpurAddress = normalizedCity.includes("kanpur");
-      const deliveryFee =
-        subtotal >= 499 ? 0 : isKanpurAddress ? 29 : 49;
+      const deliveryFee = subtotal >= 499 ? 0 : 59;
       let discountAmount = 0;
 
       if (couponRecord) {
@@ -4289,7 +4280,7 @@ app.post("/api/orders", requireUser, async (req, res) => {
             couponCode: normalizedCoupon,
             discountAmount,
             totalAmount: subtotal - discountAmount + deliveryFee,
-            deliveryType: isKanpurAddress ? "local" : "courier",
+            deliveryType: "courier",
             paymentMethod: "cod",
             tryoutOrder: hasTryoutItem,
           },
