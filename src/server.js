@@ -6513,8 +6513,8 @@ app.post("/api/tryouts/:id/cashback", requireAdmin, async (req, res) => {
       return res.status(400).json({ success: false, message: "Please enter a valid cashback amount" });
     }
 
-    application.cashbackHistory.push({ amount, note, status: "available" });
-    application.cashbackAvailable = (application.cashbackAvailable || 0) + amount;
+    application.cashbackHistory.push({ amount, note, status: "pending" });
+    application.cashbackPending = (application.cashbackPending || 0) + amount;
     await application.save();
 
     // Notify the member that cashback was added to their account.
@@ -6542,9 +6542,9 @@ app.post("/api/tryouts/:id/cashback", requireAdmin, async (req, res) => {
                   xmlEscape(note) +
                   "</td></tr>"
                 : "") +
-              '<tr><td style="padding:8px 10px;background:#f0fdf4;font-weight:bold">Status</td><td style="padding:8px 10px">Available</td></tr>' +
-              '<tr><td style="padding:8px 10px;background:#f0fdf4;font-weight:bold">Total available</td><td style="padding:8px 10px">₹' +
-              (application.cashbackAvailable || 0) +
+              '<tr><td style="padding:8px 10px;background:#fff7ed;font-weight:bold">Status</td><td style="padding:8px 10px;color:#d97706">⏳ Pending — waiting for admin confirmation</td></tr>' +
+              '<tr><td style="padding:8px 10px;background:#f0fdf4;font-weight:bold">Total pending</td><td style="padding:8px 10px">₹' +
+              (application.cashbackPending || 0) +
               "</td></tr>" +
               "</table>" +
               '<p style="margin-top:18px;color:#6b7280;font-size:13px">You can view your full cashback summary and history in your Tryout dashboard on dealroot.store.</p>' +
