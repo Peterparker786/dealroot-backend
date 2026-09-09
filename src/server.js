@@ -3936,6 +3936,10 @@ app.delete("/api/products/:id", requireAdmin, async (req, res) => {
       });
     }
 
+    // Reviews belong to a product page that no longer exists — clean them up
+    // so ratings never reference a ghost product.
+    await Review.deleteMany({ product: product._id });
+
     res.json({
       success: true,
       message: "Product deleted successfully",
@@ -5708,6 +5712,18 @@ app.post("/api/returns/:id/approve", requireAdmin, async (req, res) => {
     returnRequest.processedAt = new Date();
     await returnRequest.save();
 
+    // Restock every returned item — the products are physically back in
+    // inventory once the return is approved (same behaviour as cancellation).
+    for (const item of returnRequest.items || []) {
+      if (!item.product || !Number.isInteger(item.quantity) || item.quantity < 1) {
+        continue;
+      }
+      await Product.updateOne(
+        { _id: item.product },
+        { $inc: { stock: item.quantity } }
+      );
+    }
+
     const order = await Order.findById(returnRequest.order);
     const customerEmail =
       String(order?.customer?.email || "").trim() ||
@@ -6687,12 +6703,21 @@ app.post("/api/tryouts/:id/cashback", requireAdmin, async (req, res) => {
   }
 });
 
-// Admin: move a cashback entry between available / pending / received.
+// Admin: confirm a cashback entry from pending to available. "received" is
+// deliberately not allowed here — a member's cashback only becomes received
+// through PATCH /api/tryouts/withdraw/:entryId, i.e. the member requests a
+// withdrawal and the admin approves it. That's the only path with a real
+// request/approval trail and the available-balance check; letting admin
+// jump an entry straight to "received" bypassed both.
 app.patch("/api/tryouts/cashback/:entryId", requireAdmin, async (req, res) => {
   try {
     const nextStatus = String(req.body?.status || "");
-    if (!["available", "pending", "received"].includes(nextStatus)) {
-      return res.status(400).json({ success: false, message: "Invalid cashback status" });
+    if (!["available", "pending"].includes(nextStatus)) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Invalid cashback status — cashback can only be marked received by approving a withdrawal request.",
+      });
     }
 
     const application = await TryoutApplication.findOne({
