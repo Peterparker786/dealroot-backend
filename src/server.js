@@ -2526,12 +2526,17 @@ app.get("/api/products", async (req, res) => {
 
     // Member/admin responses must never be cached publicly by the CDN,
     // otherwise a guest could be served a member's tryout products.
-    res.set(
-      "Cache-Control",
-      canSeeTryout
-        ? "private, max-age=60"
-        : "public, max-age=120, stale-while-revalidate=600"
-    );
+    // Admins additionally get "no-store": the admin panel edits stock/
+    // products and re-fetches this same list right after saving, and a
+    // 60s browser cache was making those edits look like they hadn't
+    // saved (the list kept showing the old number until the cache expired).
+    let cacheControl = "public, max-age=120, stale-while-revalidate=600";
+    if (viewer?.role === "admin") {
+      cacheControl = "no-store";
+    } else if (canSeeTryout) {
+      cacheControl = "private, max-age=60";
+    }
+    res.set("Cache-Control", cacheControl);
     res.set("Vary", "Accept-Encoding");
 
     res.json({
