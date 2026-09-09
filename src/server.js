@@ -5015,6 +5015,8 @@ function startCartRecoveryScheduler() {
 // all registered customers with a "New Arrivals" newsletter.
 let lastNewProductEmailSent = null;
 let lastNewProductEmailCount = 0;
+let newProductEmailRunning = false;
+let newProductEmailError = null;
 
 async function sendNewProductEmails() {
   const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
@@ -5183,19 +5185,43 @@ async function sendNewProductEmails() {
   return sent;
 }
 
-// Admin endpoint: manually trigger new product email.
-app.post("/api/admin/new-product-email/run", requireAdmin, async (req, res) => {
+// Send the newsletter in the background so the admin endpoint can respond
+// instantly — batch-sending to dozens of customers over SMTP easily takes
+// 30-60s, far beyond a normal HTTP request timeout.
+async function runNewProductEmailJob() {
+  if (newProductEmailRunning) return;
+  newProductEmailRunning = true;
+  newProductEmailError = null;
   try {
-    const sent = await sendNewProductEmails();
-    res.json({
-      success: true,
-      message: `Newsletter sent — ${sent} customer(s) notified`,
-      sent,
-    });
+    await sendNewProductEmails();
   } catch (error) {
-    console.error("New product email error:", error.message);
-    res.status(500).json({ success: false, message: error.message });
+    newProductEmailError = error.message;
+    console.error("New product email job failed:", error.message);
+  } finally {
+    newProductEmailRunning = false;
   }
+}
+
+// Admin endpoint: manually trigger new product email.
+// Responds immediately — the actual sending happens in the background.
+app.post("/api/admin/new-product-email/run", requireAdmin, async (req, res) => {
+  if (newProductEmailRunning) {
+    return res.json({
+      success: true,
+      message: "Newsletter is already being sent — check the status below",
+      running: true,
+      sent: 0,
+    });
+  }
+
+  runNewProductEmailJob();
+
+  res.json({
+    success: true,
+    message: "Newsletter sending started — it will finish in the background (check status in a minute)",
+    running: true,
+    sent: 0,
+  });
 });
 
 // Admin endpoint: check last send status.
@@ -5204,6 +5230,8 @@ app.get("/api/admin/new-product-email/status", requireAdmin, async (req, res) =>
     success: true,
     lastSent: lastNewProductEmailSent,
     lastCount: lastNewProductEmailCount,
+    running: newProductEmailRunning,
+    error: newProductEmailError,
     nextRun: lastNewProductEmailSent
       ? new Date(lastNewProductEmailSent.getTime() + 24 * 60 * 60 * 1000)
       : null,
