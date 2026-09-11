@@ -658,6 +658,7 @@ const orderSchema = new mongoose.Schema(
         price: { type: Number, required: true, min: 0 },
         quantity: { type: Number, required: true, min: 1 },
         subtotal: { type: Number, required: true, min: 0 },
+        freeGift: { type: Boolean, default: false },
       },
     ],
     deliveryFee: { type: Number, default: 0, min: 0 },
@@ -806,6 +807,7 @@ const paymentSessionSchema = new mongoose.Schema(
         price: { type: Number, required: true, min: 0 },
         quantity: { type: Number, required: true, min: 1 },
         subtotal: { type: Number, required: true, min: 0 },
+        freeGift: { type: Boolean, default: false },
       },
     ],
     deliveryFee: { type: Number, default: 0, min: 0 },
@@ -1238,10 +1240,44 @@ const normaliseCouponCode = (couponCode) =>
 const roundMoney = (amount) =>
   Math.round((Number(amount) + Number.EPSILON) * 100) / 100;
 
+// Free-gift offer: carts worth ₹499+ can attach one product priced up to
+// ₹99 (and in stock) as a FREE gift. Shared validation for every order path.
+const FREE_GIFT_MIN_SUBTOTAL = 499;
+const FREE_GIFT_MAX_PRICE = 99;
+
+const resolveFreeGift = async (giftProductId, subtotal) => {
+  if (!giftProductId) return null;
+
+  if (subtotal < FREE_GIFT_MIN_SUBTOTAL) {
+    throw new Error(
+      `Free gift unlocks only on orders of ₹${FREE_GIFT_MIN_SUBTOTAL} or more`
+    );
+  }
+
+  if (!mongoose.Types.ObjectId.isValid(String(giftProductId))) {
+    throw new Error("Invalid free gift selection");
+  }
+
+  const gift = await Product.findById(giftProductId);
+
+  if (!gift || gift.stock < 1) {
+    throw new Error("The selected free gift is out of stock");
+  }
+
+  if (gift.price > FREE_GIFT_MAX_PRICE) {
+    throw new Error(
+      `Only products up to ₹${FREE_GIFT_MAX_PRICE} can be taken as the free gift`
+    );
+  }
+
+  return gift;
+};
+
 const buildOnlinePaymentQuote = async ({
   customer,
   items,
   couponCode,
+  giftProductId = "",
   paymentMethod = "razorpay",
   userId = null,
 }) => {
@@ -1334,12 +1370,37 @@ const buildOnlinePaymentQuote = async ({
     discountAmount = Math.round(subtotal * 0.1);
   }
 
+  // Attach the free gift as a ₹0 line item. Stock is validated here and
+  // decremented inside the payment transaction with the session items.
+  const giftProduct = await resolveFreeGift(giftProductId, subtotal);
+
+  if (giftProduct) {
+    orderItems.push({
+      product: giftProduct._id,
+      brand: giftProduct.brand,
+      title: giftProduct.title,
+      images: giftProduct.images || [],
+      price: 0,
+      quantity: 1,
+      subtotal: 0,
+      freeGift: true,
+    });
+  }
+
   const deliveryFee = subtotal >= 499 ? 0 : 59;
  const totalAmount = roundMoney(
   subtotal - discountAmount + deliveryFee
 );
 
 const isCod = paymentMethod === "cod";
+
+// Cash on Delivery is only offered below the free-delivery threshold —
+// enforced server-side too, not just hidden in the checkout UI.
+if (isCod && subtotal >= 499) {
+  throw new Error(
+    "Cash on Delivery isn't available for orders of ₹499 or more. Please pay online."
+  );
+}
 
 const payableNow = roundMoney(
   isCod ? deliveryFee : totalAmount
@@ -4201,7 +4262,7 @@ app.post("/api/orders", requireUser, async (req, res) => {
   const session = await mongoose.startSession();
 
   try {
-    const { customer, items, paymentMethod, couponCode } = req.body;
+    const { customer, items, paymentMethod, couponCode, giftProductId } = req.body;
     const normalizedCoupon = String(couponCode || "")
       .trim()
       .toUpperCase();
@@ -4318,8 +4379,45 @@ app.post("/api/orders", requireUser, async (req, res) => {
         });
       }
 
+      // Free gift: validated against the paid subtotal, added as a ₹0 line
+      // item, and its stock decremented inside this same transaction.
+      const giftProduct = await resolveFreeGift(giftProductId, subtotal);
+
+      if (giftProduct) {
+        const giftStock = await Product.findOneAndUpdate(
+          { _id: giftProduct._id, stock: { $gte: 1 } },
+          { $inc: { stock: -1 } },
+          { new: true, session }
+        );
+
+        if (!giftStock) {
+          throw new Error("The selected free gift is out of stock");
+        }
+
+        orderItems.push({
+          product: giftProduct._id,
+          brand: giftProduct.brand,
+          title: giftProduct.title,
+          images: giftProduct.images || [],
+          price: 0,
+          quantity: 1,
+          subtotal: 0,
+          freeGift: true,
+        });
+      }
+
       const normalizedCity = cleanCustomer.city
       const deliveryFee = subtotal >= 499 ? 0 : 59;
+
+      // This endpoint only ever creates Cash on Delivery orders — block it
+      // outright once the cart hits the free-delivery threshold, same rule
+      // as the online-checkout path above.
+      if (subtotal >= 499) {
+        throw new Error(
+          "Cash on Delivery isn't available for orders of ₹499 or more. Please use online checkout."
+        );
+      }
+
       let discountAmount = 0;
 
       if (couponRecord) {
