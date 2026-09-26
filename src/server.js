@@ -1355,20 +1355,59 @@ const buildOnlinePaymentQuote = async ({
 
   const normalizedCoupon = normaliseCouponCode(couponCode);
 
-  if (normalizedCoupon && normalizedCoupon !== "WELCOME10") {
-    throw new Error("Invalid coupon code");
-  }
-
   let discountAmount = 0;
 
   if (normalizedCoupon === "WELCOME10") {
     if (subtotal <= 499) {
       throw new Error(
-        "WELCOME10 applies only when the cart subtotal is above â‚¹499"
+        "WELCOME10 applies only when the cart subtotal is above ₹499"
       );
     }
 
     discountAmount = Math.round(subtotal * 0.1);
+  } else if (normalizedCoupon) {
+    // Any other coupon must exist in the admin-created Coupon collection —
+    // this used to hard-reject every code except WELCOME10 here, even
+    // though /api/coupons/apply (the "Apply" button preview) validated
+    // against the real Coupon list. That mismatch is why a coupon could
+    // show "applied" at checkout but then fail as "Invalid coupon code"
+    // when the order/payment was actually created.
+    const couponRecord = await Coupon.findOne({
+      code: normalizedCoupon,
+      active: true,
+    });
+
+    if (!couponRecord) {
+      throw new Error("Invalid coupon code");
+    }
+
+    if (
+      couponRecord.expiryDate &&
+      new Date(couponRecord.expiryDate) < new Date()
+    ) {
+      throw new Error("Coupon expired");
+    }
+
+    if (subtotal < couponRecord.minimumOrder) {
+      throw new Error(
+        `Minimum order ₹${couponRecord.minimumOrder} for this coupon`
+      );
+    }
+
+    if (couponRecord.discountType === "percentage") {
+      discountAmount = Math.round(
+        (subtotal * couponRecord.discountValue) / 100
+      );
+
+      if (
+        couponRecord.maximumDiscount &&
+        discountAmount > couponRecord.maximumDiscount
+      ) {
+        discountAmount = couponRecord.maximumDiscount;
+      }
+    } else {
+      discountAmount = couponRecord.discountValue;
+    }
   }
 
   // Attach the free gift as a ₹0 line item. Stock is validated here and
