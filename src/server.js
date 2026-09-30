@@ -340,6 +340,50 @@ async function sendReferralBonusEmail(walletTxn) {
   });
 }
 
+// Sent when the admin manually credits a customer's wallet (cashback,
+// goodwill credit, compensation, etc.) from the Wallet tab — separate from
+// the referral-bonus email above since there's no coupon/buyer involved.
+async function sendAdminWalletCreditEmail({ user, amount, note, newBalance }) {
+  if (!user?.email || !(amount > 0)) return;
+
+  const from = `"DEALROOT Beauty" <${process.env.EMAIL_USER}>`;
+  const money = (n) => `₹${Number(n || 0).toLocaleString("en-IN")}`;
+
+  const html = `
+    <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;background:#fff;">
+      <div style="background:#7c3aed;padding:24px 28px;text-align:center;">
+        <h1 style="color:#fff;margin:0;font-size:22px;">🎉 Cashback added to your wallet!</h1>
+      </div>
+      <div style="padding:28px;">
+        <p style="font-size:14px;color:#333;">Hi ${user.name || "there"},</p>
+        <p style="font-size:14px;color:#555;line-height:1.6;">
+          Our team has added some cashback/credit to your DEALROOT wallet.
+        </p>
+        <div style="background:#f5f3ff;border:1px solid #ddd6fe;border-radius:10px;padding:14px 18px;margin:18px 0;">
+          <span style="font-size:12px;color:#7c3aed;display:block;">ADDED TO YOUR WALLET</span>
+          <strong style="font-size:22px;color:#7c3aed;">${money(amount)}</strong>
+          <span style="font-size:12px;color:#999;display:block;margin-top:8px;">New wallet balance: ${money(newBalance)}</span>
+        </div>
+        ${
+          note
+            ? `<p style="font-size:13px;color:#555;line-height:1.6;"><strong>Note:</strong> ${note}</p>`
+            : ""
+        }
+        <p style="font-size:13px;color:#555;line-height:1.6;">
+          This balance is automatically used towards your "pay at delivery" amount the next time you order with DEALROOT.
+        </p>
+      </div>
+    </div>
+  `;
+
+  await transporter.sendMail({
+    from,
+    to: user.email,
+    subject: `🎉 ${money(amount)} added to your DEALROOT wallet`,
+    html,
+  });
+}
+
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
@@ -4167,6 +4211,18 @@ app.post("/api/admin/users/:id/wallet", requireAdmin, async (req, res) => {
       note,
       approvedAt: new Date(),
     });
+
+    // Only a credit gets an email ("cashback added") — a deduction doesn't.
+    if (amount > 0) {
+      sendAdminWalletCreditEmail({
+        user,
+        amount,
+        note,
+        newBalance: nextBalance,
+      }).catch((error) =>
+        console.error("Admin wallet-credit email failed:", error.message)
+      );
+    }
 
     res.json({
       success: true,
