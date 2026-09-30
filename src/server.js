@@ -293,20 +293,22 @@ async function sendOrderEmails(order) {
   }
 }
 
-// Tell a customer that someone used the referral/wallet coupon code the
-// admin assigned to them, and how much just landed in their wallet.
-async function sendReferralBonusEmail(order) {
-  if (!order?.referralOwnerEmail || !order.referralBonus) return;
+// Tell a customer that someone used the referral coupon code the admin
+// assigned to them, and how much the admin just approved into their wallet.
+// Called from the admin's "Approve" action on a pending referral bonus —
+// not at order time, since nothing is credited (or certain) until approved.
+async function sendReferralBonusEmail(walletTxn) {
+  if (!walletTxn) return;
 
-  const owner = await User.findOne({
-    email: order.referralOwnerEmail,
-  }).select("name email walletBalance");
+  const owner = await User.findById(walletTxn.user).select(
+    "name email walletBalance"
+  );
 
   if (!owner) return;
 
   const from = `"DEALROOT Beauty" <${process.env.EMAIL_USER}>`;
   const money = (n) => `₹${Number(n || 0).toLocaleString("en-IN")}`;
-  const buyerName = order.customer?.name || "A customer";
+  const buyerName = walletTxn.buyerName || "A customer";
 
   const html = `
     <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;background:#fff;">
@@ -316,11 +318,11 @@ async function sendReferralBonusEmail(order) {
       <div style="padding:28px;">
         <p style="font-size:14px;color:#333;">Hi ${owner.name || "there"},</p>
         <p style="font-size:14px;color:#555;line-height:1.6;">
-          <strong>${buyerName}</strong> just used your code <strong>${order.couponCode}</strong> on order ${order.orderNumber}.
+          <strong>${buyerName}</strong> used your code <strong>${walletTxn.couponCode}</strong> on order ${walletTxn.orderNumber}, and it's been approved.
         </p>
         <div style="background:#f5f3ff;border:1px solid #ddd6fe;border-radius:10px;padding:14px 18px;margin:18px 0;">
           <span style="font-size:12px;color:#7c3aed;display:block;">ADDED TO YOUR WALLET</span>
-          <strong style="font-size:22px;color:#7c3aed;">${money(order.referralBonus)}</strong>
+          <strong style="font-size:22px;color:#7c3aed;">${money(walletTxn.amount)}</strong>
           <span style="font-size:12px;color:#999;display:block;margin-top:8px;">New wallet balance: ${money(owner.walletBalance)}</span>
         </div>
         <p style="font-size:13px;color:#555;line-height:1.6;">
@@ -333,7 +335,7 @@ async function sendReferralBonusEmail(order) {
   await transporter.sendMail({
     from,
     to: owner.email,
-    subject: `🎉 ${money(order.referralBonus)} added to your DEALROOT wallet`,
+    subject: `🎉 ${money(walletTxn.amount)} added to your DEALROOT wallet`,
     html,
   });
 }
@@ -1031,9 +1033,53 @@ otpExpiry: {
     ],
     // Store-credit balance the admin can top up from the admin panel, and
     // that this customer can spend against the "pay at delivery" portion of
-    // a COD order. Also credited automatically when someone else uses a
-    // coupon that the admin has assigned to this user (referral bonus).
+    // a COD order. A referral bonus (someone used a coupon assigned to this
+    // user) lands here too, but only once the admin approves it — see
+    // WalletTransaction below.
     walletBalance: { type: Number, default: 0, min: 0 },
+  },
+  { timestamps: true }
+);
+
+// A ledger entry for every change to a customer's wallet: an admin manual
+// top-up/deduction (always "approved" the moment it's created — the admin
+// action IS the approval), or a referral bonus from someone using this
+// user's assigned coupon (created "pending" and only credited to
+// walletBalance once the admin approves it from the Wallet tab). Keeping
+// this as its own collection, instead of just incrementing walletBalance
+// directly, gives the admin a reviewable queue plus a per-customer history
+// that always shows which order (if any) and amount each change came from.
+const walletTransactionSchema = new mongoose.Schema(
+  {
+    user: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+      index: true,
+    },
+    type: {
+      type: String,
+      enum: ["referral", "admin"],
+      required: true,
+    },
+    status: {
+      type: String,
+      enum: ["pending", "approved", "rejected"],
+      default: "approved",
+      index: true,
+    },
+    amount: { type: Number, required: true },
+    order: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Order",
+      default: null,
+    },
+    orderNumber: { type: String, default: "", trim: true },
+    orderAmount: { type: Number, default: 0 },
+    buyerName: { type: String, default: "", trim: true },
+    couponCode: { type: String, default: "", trim: true },
+    note: { type: String, default: "", trim: true },
+    approvedAt: { type: Date, default: null },
   },
   { timestamps: true }
 );
@@ -1048,6 +1094,10 @@ const PaymentSession = mongoose.model(
   paymentSessionSchema
 );
 const User = mongoose.model("User", userSchema);
+const WalletTransaction = mongoose.model(
+  "WalletTransaction",
+  walletTransactionSchema
+);
 
 const categorySchema = new mongoose.Schema(
   {
@@ -1341,6 +1391,77 @@ const normaliseCouponCode = (couponCode) =>
 const roundMoney = (amount) =>
   Math.round((Number(amount) + Number.EPSILON) * 100) / 100;
 
+// Shared coupon validation + discount + referral-bonus resolution, used by
+// every path that turns a cart into an order (online checkout below, and the
+// admin's manual "create order for a customer" endpoint). Keeping this in
+// one place is what stops a coupon from validating one way in one place and
+// differently in another — that exact mismatch is what caused the earlier
+// "Coupon applied!" then "Invalid coupon code at payment" bug.
+const resolveCouponForOrder = async (couponCode, subtotal) => {
+  const normalizedCoupon = normaliseCouponCode(couponCode);
+
+  let discountAmount = 0;
+  // If the coupon used is one the admin assigned to a specific customer,
+  // that customer's wallet gets `referralBonus` credited once this order is
+  // actually placed — the caller decides what to do with these.
+  let referralOwnerEmail = "";
+  let referralBonus = 0;
+
+  if (normalizedCoupon === "WELCOME10") {
+    if (subtotal <= 499) {
+      throw new Error(
+        "WELCOME10 applies only when the cart subtotal is above ₹499"
+      );
+    }
+
+    discountAmount = Math.round(subtotal * 0.1);
+  } else if (normalizedCoupon) {
+    const couponRecord = await Coupon.findOne({
+      code: normalizedCoupon,
+      active: true,
+    });
+
+    if (!couponRecord) {
+      throw new Error("Invalid coupon code");
+    }
+
+    if (
+      couponRecord.expiryDate &&
+      new Date(couponRecord.expiryDate) < new Date()
+    ) {
+      throw new Error("Coupon expired");
+    }
+
+    if (subtotal < couponRecord.minimumOrder) {
+      throw new Error(
+        `Minimum order ₹${couponRecord.minimumOrder} for this coupon`
+      );
+    }
+
+    if (couponRecord.discountType === "percentage") {
+      discountAmount = Math.round(
+        (subtotal * couponRecord.discountValue) / 100
+      );
+
+      if (
+        couponRecord.maximumDiscount &&
+        discountAmount > couponRecord.maximumDiscount
+      ) {
+        discountAmount = couponRecord.maximumDiscount;
+      }
+    } else {
+      discountAmount = couponRecord.discountValue;
+    }
+
+    if (couponRecord.assignedUserEmail && couponRecord.referralBonus > 0) {
+      referralOwnerEmail = couponRecord.assignedUserEmail;
+      referralBonus = couponRecord.referralBonus;
+    }
+  }
+
+  return { normalizedCoupon, discountAmount, referralOwnerEmail, referralBonus };
+};
+
 // Free-gift offer: carts worth ₹499+ can attach one product priced up to
 // ₹99 (and in stock) as a FREE gift. Shared validation for every order path.
 const FREE_GIFT_MIN_SUBTOTAL = 499;
@@ -1454,72 +1575,12 @@ const buildOnlinePaymentQuote = async ({
     });
   }
 
-  const normalizedCoupon = normaliseCouponCode(couponCode);
-
-  let discountAmount = 0;
-  // If the coupon used is one the admin assigned to a specific customer,
-  // that customer's wallet gets `referralBonus` credited once this order is
-  // actually placed — set below when such a coupon is found.
-  let referralOwnerEmail = "";
-  let referralBonus = 0;
-
-  if (normalizedCoupon === "WELCOME10") {
-    if (subtotal <= 499) {
-      throw new Error(
-        "WELCOME10 applies only when the cart subtotal is above ₹499"
-      );
-    }
-
-    discountAmount = Math.round(subtotal * 0.1);
-  } else if (normalizedCoupon) {
-    // Any other coupon must exist in the admin-created Coupon collection —
-    // this used to hard-reject every code except WELCOME10 here, even
-    // though /api/coupons/apply (the "Apply" button preview) validated
-    // against the real Coupon list. That mismatch is why a coupon could
-    // show "applied" at checkout but then fail as "Invalid coupon code"
-    // when the order/payment was actually created.
-    const couponRecord = await Coupon.findOne({
-      code: normalizedCoupon,
-      active: true,
-    });
-
-    if (!couponRecord) {
-      throw new Error("Invalid coupon code");
-    }
-
-    if (
-      couponRecord.expiryDate &&
-      new Date(couponRecord.expiryDate) < new Date()
-    ) {
-      throw new Error("Coupon expired");
-    }
-
-    if (subtotal < couponRecord.minimumOrder) {
-      throw new Error(
-        `Minimum order ₹${couponRecord.minimumOrder} for this coupon`
-      );
-    }
-
-    if (couponRecord.discountType === "percentage") {
-      discountAmount = Math.round(
-        (subtotal * couponRecord.discountValue) / 100
-      );
-
-      if (
-        couponRecord.maximumDiscount &&
-        discountAmount > couponRecord.maximumDiscount
-      ) {
-        discountAmount = couponRecord.maximumDiscount;
-      }
-    } else {
-      discountAmount = couponRecord.discountValue;
-    }
-
-    if (couponRecord.assignedUserEmail && couponRecord.referralBonus > 0) {
-      referralOwnerEmail = couponRecord.assignedUserEmail;
-      referralBonus = couponRecord.referralBonus;
-    }
-  }
+  const {
+    normalizedCoupon,
+    discountAmount,
+    referralOwnerEmail,
+    referralBonus,
+  } = await resolveCouponForOrder(couponCode, subtotal);
 
   // Attach the free gift as a ₹0 line item. Stock is validated here and
   // decremented inside the payment transaction with the session items.
@@ -1734,18 +1795,6 @@ const finaliseRazorpayPayment = async ({
         }
       }
 
-      // Credit the referral bonus to whoever's coupon this order used, if any.
-      if (
-        currentPaymentSession.referralOwnerEmail &&
-        currentPaymentSession.referralBonus > 0
-      ) {
-        await User.updateOne(
-          { email: currentPaymentSession.referralOwnerEmail },
-          { $inc: { walletBalance: currentPaymentSession.referralBonus } },
-          { session: databaseSession }
-        );
-      }
-
       [completedOrder] = await Order.create(
         [
           {
@@ -1799,19 +1848,46 @@ codAmount: currentPaymentSession.codAmount,
           { session: databaseSession, runValidators: true }
         );
       }
+
+      // The referral bonus is NOT credited yet — it's recorded as a pending
+      // wallet transaction for the admin to review and approve from the
+      // Wallet tab. Nothing changes for the owner's walletBalance until then.
+      if (
+        currentPaymentSession.referralOwnerEmail &&
+        currentPaymentSession.referralBonus > 0
+      ) {
+        const referralOwner = await User.findOne({
+          email: currentPaymentSession.referralOwnerEmail,
+        }).session(databaseSession);
+
+        if (referralOwner) {
+          await WalletTransaction.create(
+            [
+              {
+                user: referralOwner._id,
+                type: "referral",
+                status: "pending",
+                amount: currentPaymentSession.referralBonus,
+                order: completedOrder._id,
+                orderNumber: completedOrder.orderNumber,
+                orderAmount: completedOrder.totalAmount,
+                buyerName: completedOrder.customer?.name || "",
+                couponCode: completedOrder.couponCode,
+              },
+            ],
+            { session: databaseSession }
+          );
+        }
+      }
     });
 
-    // Notify customer + owner after a paid order is created.
+    // Notify the customer + store owner after a paid order is created. The
+    // referral-bonus owner is emailed separately, only once the admin
+    // approves the pending bonus above (see /api/admin/wallet-transactions).
     if (completedOrder) {
       sendOrderEmails(completedOrder).catch((error) =>
         console.error("Order email failed:", error.message)
       );
-
-      if (completedOrder.referralOwnerEmail && completedOrder.referralBonus > 0) {
-        sendReferralBonusEmail(completedOrder).catch((error) =>
-          console.error("Referral bonus email failed:", error.message)
-        );
-      }
     }
 
     return completedOrder;
@@ -4023,6 +4099,12 @@ app.get("/api/admin/users", requireAdmin, async (req, res) => {
           name: 1,
           email: 1,
           phone: 1,
+          // Their last-used delivery details, kept here so the admin's
+          // "create an order for a customer" form can autofill them.
+          address: 1,
+          state: 1,
+          city: 1,
+          pincode: 1,
           walletBalance: { $ifNull: ["$walletBalance", 0] },
           createdAt: 1,
           orderCount: { $size: "$orders" },
@@ -4039,11 +4121,14 @@ app.get("/api/admin/users", requireAdmin, async (req, res) => {
 });
 
 // Add (positive amount) or deduct (negative amount) store-credit from a
-// specific customer's wallet. Used to fund a referral bonus manually, or as
-// a goodwill credit — separate from the automatic referral-coupon credit.
+// specific customer's wallet. This is a direct admin action — it takes
+// effect immediately (no approval step, unlike a referral bonus) — but is
+// still logged as a WalletTransaction so it shows up in that customer's
+// wallet history alongside any referral bonuses.
 app.post("/api/admin/users/:id/wallet", requireAdmin, async (req, res) => {
   try {
     const amount = Number(req.body.amount);
+    const note = String(req.body.note || "").trim();
 
     if (!Number.isFinite(amount) || amount === 0) {
       return res.status(400).json({
@@ -4074,6 +4159,15 @@ app.post("/api/admin/users/:id/wallet", requireAdmin, async (req, res) => {
     user.walletBalance = nextBalance;
     await user.save();
 
+    await WalletTransaction.create({
+      user: user._id,
+      type: "admin",
+      status: "approved",
+      amount,
+      note,
+      approvedAt: new Date(),
+    });
+
     res.json({
       success: true,
       message: `Wallet updated — new balance ₹${nextBalance}`,
@@ -4083,6 +4177,385 @@ app.post("/api/admin/users/:id/wallet", requireAdmin, async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 });
+
+// A specific customer's orders — order number, amount, status, date — so
+// the admin can look them up before deciding on a manual wallet credit.
+app.get("/api/admin/users/:id/orders", requireAdmin, async (req, res) => {
+  try {
+    const orders = await Order.find({ user: req.params.id })
+      .select("orderNumber totalAmount orderStatus paymentMethod createdAt")
+      .sort({ createdAt: -1 })
+      .lean();
+
+    res.json({ success: true, orders });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// A specific customer's full wallet ledger — every admin credit/debit and
+// every referral bonus (pending, approved or rejected) tied to them.
+app.get(
+  "/api/admin/users/:id/wallet-transactions",
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const transactions = await WalletTransaction.find({
+        user: req.params.id,
+      })
+        .sort({ createdAt: -1 })
+        .lean();
+
+      res.json({ success: true, transactions });
+    } catch (err) {
+      res.status(500).json({ success: false, message: err.message });
+    }
+  }
+);
+
+// ===================== MANUAL ORDER CREATION (admin) =====================
+// Lets the admin place an order on behalf of a customer who ordered by
+// phone/WhatsApp, so it shows up in that customer's account exactly like a
+// self-placed order. Reuses resolveCouponForOrder so a coupon can never
+// behave differently here than it does at real checkout.
+app.post("/api/admin/orders", requireAdmin, async (req, res) => {
+  const {
+    userEmail,
+    customer,
+    items,
+    couponCode = "",
+    giftProductId = "",
+    paymentMethod = "cod", // "cod" or "paid" (admin already collected payment)
+    useWallet = false,
+    sendEmail = true,
+  } = req.body;
+
+  const normalizedEmail = String(userEmail || "").trim().toLowerCase();
+
+  if (!normalizedEmail) {
+    return res
+      .status(400)
+      .json({ success: false, message: "Customer email is required" });
+  }
+
+  if (!Array.isArray(items) || !items.length) {
+    return res
+      .status(400)
+      .json({ success: false, message: "Add at least one product" });
+  }
+
+  if (!["cod", "paid"].includes(paymentMethod)) {
+    return res
+      .status(400)
+      .json({ success: false, message: "Invalid payment method" });
+  }
+
+  const session = await mongoose.startSession();
+  let order = null;
+
+  try {
+    const foundUser = await User.findOne({ email: normalizedEmail });
+
+    if (!foundUser) {
+      throw new Error(
+        "No registered customer found with that email. Ask them to sign up first."
+      );
+    }
+
+    const cleanCustomer = cleanDeliveryCustomer({
+      email: normalizedEmail,
+      ...customer,
+    });
+    validateDeliveryCustomer(cleanCustomer);
+
+    const requestedProducts = new Map();
+
+    for (const item of items) {
+      const productId = String(item?.productId || "");
+      const quantity = Number(item?.quantity);
+
+      if (
+        !mongoose.Types.ObjectId.isValid(productId) ||
+        !Number.isInteger(quantity) ||
+        quantity < 1
+      ) {
+        throw new Error("Invalid product or quantity");
+      }
+
+      requestedProducts.set(
+        productId,
+        (requestedProducts.get(productId) || 0) + quantity
+      );
+    }
+
+    await session.withTransaction(async () => {
+      const orderItems = [];
+      let subtotal = 0;
+
+      for (const [productId, quantity] of requestedProducts.entries()) {
+        const product = await Product.findOneAndUpdate(
+          { _id: productId, stock: { $gte: quantity } },
+          { $inc: { stock: -quantity } },
+          { new: true, session }
+        );
+
+        if (!product) {
+          throw new Error(
+            "A product is unavailable or does not have enough stock"
+          );
+        }
+
+        const lineTotal = roundMoney(product.price * quantity);
+        subtotal = roundMoney(subtotal + lineTotal);
+
+        orderItems.push({
+          product: product._id,
+          brand: product.brand,
+          title: product.title,
+          images: product.images || [],
+          price: product.price,
+          quantity,
+          subtotal: lineTotal,
+        });
+      }
+
+      const giftProduct = await resolveFreeGift(giftProductId, subtotal);
+
+      if (giftProduct) {
+        const giftStock = await Product.findOneAndUpdate(
+          { _id: giftProduct._id, stock: { $gte: 1 } },
+          { $inc: { stock: -1 } },
+          { new: true, session }
+        );
+
+        if (!giftStock) {
+          throw new Error("The selected free gift is out of stock");
+        }
+
+        orderItems.push({
+          product: giftProduct._id,
+          brand: giftProduct.brand,
+          title: giftProduct.title,
+          images: giftProduct.images || [],
+          price: 0,
+          quantity: 1,
+          subtotal: 0,
+          freeGift: true,
+        });
+      }
+
+      const { normalizedCoupon, discountAmount, referralOwnerEmail, referralBonus } =
+        await resolveCouponForOrder(couponCode, subtotal);
+
+      const deliveryFee = subtotal >= 499 ? 0 : 59;
+      const totalAmount = roundMoney(subtotal - discountAmount + deliveryFee);
+
+      if (totalAmount <= 0) {
+        throw new Error("Order total must be greater than zero");
+      }
+
+      // Manual orders skip the online delivery-fee prepay step entirely
+      // (nothing has been charged through Razorpay), so whichever amount is
+      // still owed — the full total for a COD order, nothing for one the
+      // admin marks already paid — is what wallet balance can reduce.
+      let walletUsed = 0;
+      let codAmount = paymentMethod === "cod" ? totalAmount : 0;
+
+      if (useWallet && paymentMethod === "cod" && codAmount > 0) {
+        const walletUser = await User.findById(foundUser._id)
+          .select("walletBalance")
+          .session(session);
+        const availableWallet = Math.max(0, walletUser?.walletBalance || 0);
+        const attemptWalletUsed = roundMoney(
+          Math.min(availableWallet, codAmount)
+        );
+
+        if (attemptWalletUsed > 0) {
+          // Guarded debit (only succeeds if the balance is still enough) so
+          // this can never race the balance below zero.
+          const walletDebit = await User.updateOne(
+            {
+              _id: foundUser._id,
+              walletBalance: { $gte: attemptWalletUsed },
+            },
+            { $inc: { walletBalance: -attemptWalletUsed } },
+            { session }
+          );
+
+          if (walletDebit.modifiedCount === 1) {
+            walletUsed = attemptWalletUsed;
+            codAmount = roundMoney(codAmount - walletUsed);
+          }
+        }
+      }
+
+      [order] = await Order.create(
+        [
+          {
+            orderNumber: createOrderNumber(),
+            user: foundUser._id,
+            customer: cleanCustomer,
+            items: orderItems,
+            deliveryFee,
+            couponCode: normalizedCoupon,
+            discountAmount,
+            totalAmount,
+            deliveryType: "courier",
+            paymentMethod: paymentMethod === "paid" ? "razorpay" : "cod",
+            paymentStatus: paymentMethod === "paid" ? "paid" : "pending",
+            deliveryChargePaid: paymentMethod === "paid",
+            deliveryChargeAmount: paymentMethod === "paid" ? totalAmount : 0,
+            paymentCapturedAt: paymentMethod === "paid" ? new Date() : null,
+            codAmount,
+            walletUsed,
+            referralOwnerEmail: referralOwnerEmail || "",
+            referralBonus: referralBonus || 0,
+          },
+        ],
+        { session }
+      );
+
+      if (referralOwnerEmail && referralBonus > 0) {
+        const referralOwner = await User.findOne({
+          email: referralOwnerEmail,
+        }).session(session);
+
+        if (referralOwner) {
+          await WalletTransaction.create(
+            [
+              {
+                user: referralOwner._id,
+                type: "referral",
+                status: "pending",
+                amount: referralBonus,
+                order: order._id,
+                orderNumber: order.orderNumber,
+                orderAmount: order.totalAmount,
+                buyerName: order.customer?.name || "",
+                couponCode: order.couponCode,
+              },
+            ],
+            { session }
+          );
+        }
+      }
+    });
+
+    if (order && sendEmail) {
+      sendOrderEmails(order).catch((error) =>
+        console.error("Admin-created order email failed:", error.message)
+      );
+    }
+
+    res.status(201).json({ success: true, order });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      message: error.message || "Could not create the order",
+    });
+  } finally {
+    await session.endSession();
+  }
+});
+
+// ===================== REFERRAL BONUS APPROVALS (admin) =====================
+// List wallet transactions across all customers — pass ?status=pending to
+// get just the referral bonuses waiting on admin approval.
+app.get("/api/admin/wallet-transactions", requireAdmin, async (req, res) => {
+  try {
+    const filter = {};
+    if (req.query.status) filter.status = req.query.status;
+
+    const transactions = await WalletTransaction.find(filter)
+      .populate("user", "name email")
+      .sort({ createdAt: -1 })
+      .lean();
+
+    res.json({ success: true, transactions });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Approve a pending referral bonus: credits the wallet now (guarded inside a
+// transaction so it can never double-credit) and emails the customer.
+app.post(
+  "/api/admin/wallet-transactions/:id/approve",
+  requireAdmin,
+  async (req, res) => {
+    const dbSession = await mongoose.startSession();
+
+    try {
+      let updatedTxn = null;
+
+      await dbSession.withTransaction(async () => {
+        const txn = await WalletTransaction.findOne({
+          _id: req.params.id,
+          status: "pending",
+        }).session(dbSession);
+
+        if (!txn) {
+          throw new Error(
+            "This bonus is not pending anymore (already approved or rejected)"
+          );
+        }
+
+        await User.updateOne(
+          { _id: txn.user },
+          { $inc: { walletBalance: txn.amount } },
+          { session: dbSession }
+        );
+
+        txn.status = "approved";
+        txn.approvedAt = new Date();
+        await txn.save({ session: dbSession });
+        updatedTxn = txn;
+      });
+
+      sendReferralBonusEmail(updatedTxn).catch((error) =>
+        console.error("Referral bonus email failed:", error.message)
+      );
+
+      res.json({
+        success: true,
+        message: `Approved — ₹${updatedTxn.amount} added to their wallet`,
+      });
+    } catch (err) {
+      res.status(400).json({ success: false, message: err.message });
+    } finally {
+      dbSession.endSession();
+    }
+  }
+);
+
+// Reject a pending referral bonus — no wallet change, just marks it settled
+// so it drops off the pending queue.
+app.post(
+  "/api/admin/wallet-transactions/:id/reject",
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const txn = await WalletTransaction.findOne({
+        _id: req.params.id,
+        status: "pending",
+      });
+
+      if (!txn) {
+        return res.status(400).json({
+          success: false,
+          message: "This bonus is not pending anymore",
+        });
+      }
+
+      txn.status = "rejected";
+      await txn.save();
+
+      res.json({ success: true, message: "Bonus rejected" });
+    } catch (err) {
+      res.status(500).json({ success: false, message: err.message });
+    }
+  }
+);
 
 app.post("/api/coupons/apply", async (req, res) => {
   try {
