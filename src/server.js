@@ -293,6 +293,51 @@ async function sendOrderEmails(order) {
   }
 }
 
+// Tell a customer that someone used the referral/wallet coupon code the
+// admin assigned to them, and how much just landed in their wallet.
+async function sendReferralBonusEmail(order) {
+  if (!order?.referralOwnerEmail || !order.referralBonus) return;
+
+  const owner = await User.findOne({
+    email: order.referralOwnerEmail,
+  }).select("name email walletBalance");
+
+  if (!owner) return;
+
+  const from = `"DEALROOT Beauty" <${process.env.EMAIL_USER}>`;
+  const money = (n) => `₹${Number(n || 0).toLocaleString("en-IN")}`;
+  const buyerName = order.customer?.name || "A customer";
+
+  const html = `
+    <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;background:#fff;">
+      <div style="background:#7c3aed;padding:24px 28px;text-align:center;">
+        <h1 style="color:#fff;margin:0;font-size:22px;">🎉 Your code just earned you cashback!</h1>
+      </div>
+      <div style="padding:28px;">
+        <p style="font-size:14px;color:#333;">Hi ${owner.name || "there"},</p>
+        <p style="font-size:14px;color:#555;line-height:1.6;">
+          <strong>${buyerName}</strong> just used your code <strong>${order.couponCode}</strong> on order ${order.orderNumber}.
+        </p>
+        <div style="background:#f5f3ff;border:1px solid #ddd6fe;border-radius:10px;padding:14px 18px;margin:18px 0;">
+          <span style="font-size:12px;color:#7c3aed;display:block;">ADDED TO YOUR WALLET</span>
+          <strong style="font-size:22px;color:#7c3aed;">${money(order.referralBonus)}</strong>
+          <span style="font-size:12px;color:#999;display:block;margin-top:8px;">New wallet balance: ${money(owner.walletBalance)}</span>
+        </div>
+        <p style="font-size:13px;color:#555;line-height:1.6;">
+          This balance is automatically used towards your own "pay at delivery" amount the next time you order with DEALROOT.
+        </p>
+      </div>
+    </div>
+  `;
+
+  await transporter.sendMail({
+    from,
+    to: owner.email,
+    subject: `🎉 ${money(order.referralBonus)} added to your DEALROOT wallet`,
+    html,
+  });
+}
+
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
@@ -472,6 +517,22 @@ const couponSchema = new mongoose.Schema(
     active: {
       type: Boolean,
       default: true,
+    },
+
+    // Referral wallet linkage: when set, every successful order that uses
+    // this coupon adds `referralBonus` to this user's wallet balance and
+    // emails them that their code was used. The buyer still gets the normal
+    // discount above — this is on top of that, not instead of it.
+    assignedUserEmail: {
+      type: String,
+      default: "",
+      trim: true,
+      lowercase: true,
+    },
+    referralBonus: {
+      type: Number,
+      default: 0,
+      min: 0,
     },
   },
   { timestamps: true }
@@ -711,6 +772,24 @@ codAmount: {
   default: 0,
 },
 
+// Store-credit the customer spent on this order (already subtracted out
+// of codAmount above) and the referral bonus this order triggered, if the
+// coupon used was assigned to another customer.
+walletUsed: {
+  type: Number,
+  default: 0,
+},
+referralOwnerEmail: {
+  type: String,
+  default: "",
+  trim: true,
+  lowercase: true,
+},
+referralBonus: {
+  type: Number,
+  default: 0,
+},
+
     razorpayOrderId: {
       type: String,
       default: "",
@@ -832,6 +911,21 @@ codAmount: {
   default: 0,
 },
 
+walletUsed: {
+  type: Number,
+  default: 0,
+},
+referralOwnerEmail: {
+  type: String,
+  default: "",
+  trim: true,
+  lowercase: true,
+},
+referralBonus: {
+  type: Number,
+  default: 0,
+},
+
 paymentMethod: {
   type: String,
   enum: ["cod", "razorpay"],
@@ -935,6 +1029,11 @@ otpExpiry: {
         isDefault: { type: Boolean, default: false },
       },
     ],
+    // Store-credit balance the admin can top up from the admin panel, and
+    // that this customer can spend against the "pay at delivery" portion of
+    // a COD order. Also credited automatically when someone else uses a
+    // coupon that the admin has assigned to this user (referral bonus).
+    walletBalance: { type: Number, default: 0, min: 0 },
   },
   { timestamps: true }
 );
@@ -1043,6 +1142,7 @@ state: user.state,
 city: user.city,
   pincode: user.pincode,
   addresses: user.addresses || [],
+  walletBalance: user.walletBalance || 0,
 });
 
 const requireAdmin = (req, res, next) => {
@@ -1281,6 +1381,7 @@ const buildOnlinePaymentQuote = async ({
   giftProductId = "",
   paymentMethod = "razorpay",
   userId = null,
+  useWallet = false,
 }) => {
   const cleanCustomer = cleanDeliveryCustomer(customer);
   validateDeliveryCustomer(cleanCustomer);
@@ -1356,6 +1457,11 @@ const buildOnlinePaymentQuote = async ({
   const normalizedCoupon = normaliseCouponCode(couponCode);
 
   let discountAmount = 0;
+  // If the coupon used is one the admin assigned to a specific customer,
+  // that customer's wallet gets `referralBonus` credited once this order is
+  // actually placed — set below when such a coupon is found.
+  let referralOwnerEmail = "";
+  let referralBonus = 0;
 
   if (normalizedCoupon === "WELCOME10") {
     if (subtotal <= 499) {
@@ -1408,6 +1514,11 @@ const buildOnlinePaymentQuote = async ({
     } else {
       discountAmount = couponRecord.discountValue;
     }
+
+    if (couponRecord.assignedUserEmail && couponRecord.referralBonus > 0) {
+      referralOwnerEmail = couponRecord.assignedUserEmail;
+      referralBonus = couponRecord.referralBonus;
+    }
   }
 
   // Attach the free gift as a ₹0 line item. Stock is validated here and
@@ -1446,9 +1557,22 @@ const payableNow = roundMoney(
   isCod ? deliveryFee : totalAmount
 );
 
-const codAmount = roundMoney(
+let codAmount = roundMoney(
   isCod ? totalAmount - deliveryFee : 0
 );
+
+// Wallet balance only ever reduces the "pay at the door" portion of a COD
+// order — the online delivery-charge prepay step is untouched, so nothing
+// about the existing Razorpay/COD flow changes when wallet isn't used.
+let walletUsed = 0;
+
+if (useWallet && userId && isCod && codAmount > 0) {
+  const walletUser = await User.findById(userId).select("walletBalance");
+  const availableWallet = Math.max(0, walletUser?.walletBalance || 0);
+
+  walletUsed = roundMoney(Math.min(availableWallet, codAmount));
+  codAmount = roundMoney(codAmount - walletUsed);
+}
 
 const amountInPaise = Math.round(payableNow * 100);
   if (amountInPaise < 1) {
@@ -1466,6 +1590,9 @@ const amountInPaise = Math.round(payableNow * 100);
     amountInPaise,
     payableNow,
     codAmount,
+    walletUsed,
+    referralOwnerEmail,
+    referralBonus,
     deliveryType: "courier",
     tryoutOrder: hasTryoutItem,
   };
@@ -1585,6 +1712,40 @@ const finaliseRazorpayPayment = async ({
         }
       }
 
+      // Spend the customer's wallet balance that this order quoted against.
+      // Guarded update (only debits if the balance is still enough) so two
+      // orders racing on the same wallet can never push it negative.
+      if (currentPaymentSession.walletUsed > 0 && currentPaymentSession.user) {
+        const walletDebit = await User.updateOne(
+          {
+            _id: currentPaymentSession.user,
+            walletBalance: { $gte: currentPaymentSession.walletUsed },
+          },
+          { $inc: { walletBalance: -currentPaymentSession.walletUsed } },
+          { session: databaseSession }
+        );
+
+        if (walletDebit.modifiedCount !== 1) {
+          const error = new Error(
+            "Your wallet balance changed before the order could be completed."
+          );
+          error.code = "OUT_OF_STOCK_AFTER_PAYMENT"; // reuses the same auto-refund path below
+          throw error;
+        }
+      }
+
+      // Credit the referral bonus to whoever's coupon this order used, if any.
+      if (
+        currentPaymentSession.referralOwnerEmail &&
+        currentPaymentSession.referralBonus > 0
+      ) {
+        await User.updateOne(
+          { email: currentPaymentSession.referralOwnerEmail },
+          { $inc: { walletBalance: currentPaymentSession.referralBonus } },
+          { session: databaseSession }
+        );
+      }
+
       [completedOrder] = await Order.create(
         [
           {
@@ -1614,6 +1775,9 @@ deliveryChargeAmount:
     : currentPaymentSession.deliveryFee,
 
 codAmount: currentPaymentSession.codAmount,
+            walletUsed: currentPaymentSession.walletUsed || 0,
+            referralOwnerEmail: currentPaymentSession.referralOwnerEmail || "",
+            referralBonus: currentPaymentSession.referralBonus || 0,
             razorpayOrderId: currentPaymentSession.razorpayOrderId,
             razorpayPaymentId: payment.id,
             razorpaySignature,
@@ -1642,6 +1806,12 @@ codAmount: currentPaymentSession.codAmount,
       sendOrderEmails(completedOrder).catch((error) =>
         console.error("Order email failed:", error.message)
       );
+
+      if (completedOrder.referralOwnerEmail && completedOrder.referralBonus > 0) {
+        sendReferralBonusEmail(completedOrder).catch((error) =>
+          console.error("Referral bonus email failed:", error.message)
+        );
+      }
     }
 
     return completedOrder;
@@ -3761,6 +3931,8 @@ app.post("/api/coupons", requireAdmin, async (req, res) => {
       minimumOrder,
       maximumDiscount,
       expiryDate,
+      assignedUserEmail,
+      referralBonus,
     } = req.body;
 
     if (!code || !discountValue) {
@@ -3781,6 +3953,21 @@ app.post("/api/coupons", requireAdmin, async (req, res) => {
       });
     }
 
+    const cleanAssignedEmail = String(assignedUserEmail || "")
+      .trim()
+      .toLowerCase();
+
+    if (cleanAssignedEmail) {
+      const ownerExists = await User.findOne({ email: cleanAssignedEmail });
+
+      if (!ownerExists) {
+        return res.status(400).json({
+          success: false,
+          message: `No registered customer found with email ${cleanAssignedEmail}`,
+        });
+      }
+    }
+
     const coupon = await Coupon.create({
       code: code.toUpperCase(),
       discountType,
@@ -3788,6 +3975,8 @@ app.post("/api/coupons", requireAdmin, async (req, res) => {
       minimumOrder,
       maximumDiscount,
       expiryDate,
+      assignedUserEmail: cleanAssignedEmail,
+      referralBonus: cleanAssignedEmail ? Number(referralBonus) || 0 : 0,
     });
 
     res.status(201).json({
@@ -3803,7 +3992,8 @@ app.post("/api/coupons", requireAdmin, async (req, res) => {
   }
 });
 
-app.get("/api/coupons", async (req, res) => {
+// Admin-only: carries assignedUserEmail (PII) so this list is no longer public.
+app.get("/api/coupons", requireAdmin, async (req, res) => {
   const coupons = await Coupon.find().sort({
     createdAt: -1,
   });
@@ -3812,6 +4002,86 @@ app.get("/api/coupons", async (req, res) => {
     success: true,
     coupons,
   });
+});
+
+// ===================== WALLET / CUSTOMER LIST (admin) =====================
+// List every registered customer with their wallet balance and order
+// history, so the admin can decide who to top up and by how much.
+app.get("/api/admin/users", requireAdmin, async (req, res) => {
+  try {
+    const users = await User.aggregate([
+      {
+        $lookup: {
+          from: "orders",
+          localField: "_id",
+          foreignField: "user",
+          as: "orders",
+        },
+      },
+      {
+        $project: {
+          name: 1,
+          email: 1,
+          phone: 1,
+          walletBalance: { $ifNull: ["$walletBalance", 0] },
+          createdAt: 1,
+          orderCount: { $size: "$orders" },
+          totalSpent: { $sum: "$orders.totalAmount" },
+        },
+      },
+      { $sort: { createdAt: -1 } },
+    ]);
+
+    res.json({ success: true, users });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Add (positive amount) or deduct (negative amount) store-credit from a
+// specific customer's wallet. Used to fund a referral bonus manually, or as
+// a goodwill credit — separate from the automatic referral-coupon credit.
+app.post("/api/admin/users/:id/wallet", requireAdmin, async (req, res) => {
+  try {
+    const amount = Number(req.body.amount);
+
+    if (!Number.isFinite(amount) || amount === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Enter a non-zero amount",
+      });
+    }
+
+    const user = await User.findById(req.params.id);
+
+    if (!user) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Customer not found" });
+    }
+
+    const nextBalance = roundMoney((user.walletBalance || 0) + amount);
+
+    if (nextBalance < 0) {
+      return res.status(400).json({
+        success: false,
+        message: `That would take the wallet negative (current balance ₹${
+          user.walletBalance || 0
+        })`,
+      });
+    }
+
+    user.walletBalance = nextBalance;
+    await user.save();
+
+    res.json({
+      success: true,
+      message: `Wallet updated — new balance ₹${nextBalance}`,
+      user: { id: user._id, walletBalance: user.walletBalance },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
 
 app.post("/api/coupons/apply", async (req, res) => {
@@ -4087,6 +4357,9 @@ app.post(
         totalAmount: quote.totalAmount,
         payableNow: quote.payableNow,
 codAmount: quote.codAmount,
+walletUsed: quote.walletUsed,
+referralOwnerEmail: quote.referralOwnerEmail,
+referralBonus: quote.referralBonus,
 paymentMethod: req.body.paymentMethod || "razorpay",
         amountInPaise: quote.amountInPaise,
         deliveryType: quote.deliveryType,
@@ -4111,6 +4384,8 @@ paymentMethod: req.body.paymentMethod || "razorpay",
         orderNumber,
         amount: quote.amountInPaise,
         currency: "INR",
+        codAmount: quote.codAmount,
+        walletUsed: quote.walletUsed,
       });
     } catch (error) {
       console.error(
