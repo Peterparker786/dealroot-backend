@@ -2777,6 +2777,42 @@ app.get("/api/auth/orders", requireUser, async (req, res) => {
   res.json({ success: true, count: orders.length, orders });
 });
 
+// Pincode → city/state autofill (proxied server-side so the browser never
+// calls the third-party API directly and we can normalise the response).
+// Uses India Post's public pincode API — no key needed.
+app.get("/api/pincode/:code", async (req, res) => {
+  try {
+    const code = String(req.params.code || "").replace(/\D/g, "");
+
+    if (code.length !== 6) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Enter a valid 6-digit pincode" });
+    }
+
+    const response = await fetch(`https://api.postalpincode.in/pincode/${code}`);
+    const data = await response.json();
+    const result = Array.isArray(data) ? data[0] : null;
+    const postOffice = result?.PostOffice?.[0];
+
+    if (result?.Status !== "Success" || !postOffice) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Pincode not found" });
+    }
+
+    res.json({
+      success: true,
+      city: postOffice.District || postOffice.Block || postOffice.Name || "",
+      state: postOffice.State || "",
+    });
+  } catch (error) {
+    res
+      .status(500)
+      .json({ success: false, message: "Could not look up that pincode" });
+  }
+});
+
 // Public order tracking — no login needed. Look up by order number or email.
 app.post("/api/orders/track", async (req, res) => {
   try {
@@ -4284,6 +4320,7 @@ app.post("/api/admin/orders", requireAdmin, async (req, res) => {
     paymentMethod = "cod", // "cod" or "paid" (admin already collected payment)
     useWallet = false,
     sendEmail = true,
+    orderNumber: customOrderNumber = "",
   } = req.body;
 
   const normalizedEmail = String(userEmail || "").trim().toLowerCase();
@@ -4304,6 +4341,21 @@ app.post("/api/admin/orders", requireAdmin, async (req, res) => {
     return res
       .status(400)
       .json({ success: false, message: "Invalid payment method" });
+  }
+
+  // Optional — the admin can pin this order to a specific order ID (e.g. one
+  // already quoted to the customer over WhatsApp). Left blank, it's
+  // auto-generated exactly like a real checkout order.
+  const trimmedOrderNumber = String(customOrderNumber || "").trim().toUpperCase();
+
+  if (trimmedOrderNumber) {
+    const clash = await Order.findOne({ orderNumber: trimmedOrderNumber });
+    if (clash) {
+      return res.status(400).json({
+        success: false,
+        message: `Order ID "${trimmedOrderNumber}" is already in use.`,
+      });
+    }
   }
 
   const session = await mongoose.startSession();
@@ -4448,7 +4500,7 @@ app.post("/api/admin/orders", requireAdmin, async (req, res) => {
       [order] = await Order.create(
         [
           {
-            orderNumber: createOrderNumber(),
+            orderNumber: trimmedOrderNumber || createOrderNumber(),
             user: foundUser._id,
             customer: cleanCustomer,
             items: orderItems,
@@ -5671,10 +5723,10 @@ const AbandonedCart = mongoose.model("AbandonedCart", abandonedCartSchema);
 
 // Config (override via env on Render/local)
 const cartRecoveryHours = Number(process.env.CART_RECOVERY_HOURS || 1);
-const cartRecoveryDiscount = Number(process.env.CART_RECOVERY_DISCOUNT || 10);
+const cartRecoveryDiscount = Number(process.env.CART_RECOVERY_DISCOUNT || 5);
 const cartRecoveryMinOrder = Number(process.env.CART_RECOVERY_MIN_ORDER || 499);
 const cartRecoveryMaxDiscount = Number(process.env.CART_RECOVERY_MAX_DISCOUNT || 150);
-const cartRecoveryValidHours = Number(process.env.CART_RECOVERY_VALID_HOURS || 72);
+const cartRecoveryValidHours = Number(process.env.CART_RECOVERY_VALID_HOURS || 24);
 
 
 // Save a logged-in user's cart snapshot so we can recover it later. Sending an
@@ -5875,7 +5927,30 @@ async function sendAbandonedCartEmail(cart, coupon) {
   });
 }
 
+// Auto-generated recovery coupons (code like "CART5-A1B2C3") are single-use,
+// throwaway codes — once they expire they're just clutter in the admin
+// Coupons list, so every scan sweeps out the expired ones. Manually-created
+// coupons never match this pattern, so they're never touched here.
+async function cleanupExpiredRecoveryCoupons() {
+  try {
+    const result = await Coupon.deleteMany({
+      code: { $regex: /^CART\d+-[0-9A-F]{6}$/ },
+      expiryDate: { $lt: new Date() },
+    });
+
+    if (result.deletedCount > 0) {
+      console.log(
+        `Cleaned up ${result.deletedCount} expired cart-recovery coupon(s)`
+      );
+    }
+  } catch (error) {
+    console.error("Cart-recovery coupon cleanup failed:", error.message);
+  }
+}
+
 async function runCartRecoveryScan() {
+  await cleanupExpiredRecoveryCoupons();
+
   try {
     const cutoff = new Date(Date.now() - cartRecoveryHours * 3600 * 1000);
 
@@ -6475,12 +6550,29 @@ app.post(
         return res.status(400).json({ success: false, message: "Cancelled orders cannot be returned" });
       }
 
-      const sevenDays = 7 * 24 * 60 * 60 * 1000;
-      const placedAt = new Date(order.createdAt || Date.now()).getTime();
-      if (Date.now() - placedAt > sevenDays) {
+      // A return only makes sense once the product has actually reached the
+      // customer — this used to only check "cancelled" + 7 days since the
+      // order was *placed*, which let a Packed/Shipped (undelivered) order
+      // show a "Return / Refund" button before the customer ever received it.
+      if (order.orderStatus !== "delivered") {
         return res.status(400).json({
           success: false,
-          message: "The 7-day return window has expired. Please contact support.",
+          message: "Returns can only be requested after the order has been delivered.",
+        });
+      }
+
+      const deliveredEntry = [...(order.statusHistory || [])]
+        .reverse()
+        .find((entry) => entry.status === "delivered");
+      const deliveredAt = new Date(
+        deliveredEntry?.at || order.updatedAt || order.createdAt || Date.now()
+      ).getTime();
+
+      const sevenDays = 7 * 24 * 60 * 60 * 1000;
+      if (Date.now() - deliveredAt > sevenDays) {
+        return res.status(400).json({
+          success: false,
+          message: "The 7-day return window (from delivery) has expired. Please contact support.",
         });
       }
 
