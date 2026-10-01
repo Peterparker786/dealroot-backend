@@ -1679,6 +1679,10 @@ const resolveFreeGift = async (giftProductId, subtotal) => {
   return gift;
 };
 
+// Wallet balance can only be used to pay down a cart worth at least this
+// much — stops someone emptying their whole wallet onto a ₹20 order.
+const WALLET_MIN_SUBTOTAL = 100;
+
 const buildOnlinePaymentQuote = async ({
   customer,
   items,
@@ -1813,7 +1817,7 @@ let codAmount = roundMoney(
 // about the existing Razorpay/COD flow changes when wallet isn't used.
 let walletUsed = 0;
 
-if (useWallet && userId && isCod && codAmount > 0) {
+if (useWallet && userId && isCod && codAmount > 0 && subtotal >= WALLET_MIN_SUBTOTAL) {
   const walletUser = await User.findById(userId).select("walletBalance");
   const availableWallet = Math.max(0, walletUser?.walletBalance || 0);
 
@@ -4613,7 +4617,12 @@ app.post("/api/admin/orders", requireAdmin, async (req, res) => {
       let walletUsed = 0;
       let codAmount = paymentMethod === "cod" ? totalAmount : 0;
 
-      if (useWallet && paymentMethod === "cod" && codAmount > 0) {
+      if (
+        useWallet &&
+        paymentMethod === "cod" &&
+        codAmount > 0 &&
+        subtotal >= WALLET_MIN_SUBTOTAL
+      ) {
         const walletUser = await User.findById(foundUser._id)
           .select("walletBalance")
           .session(session);
