@@ -209,12 +209,12 @@ async function sendOrderEmails(order) {
   const trackUrl = seoSiteUrl + "/account";
 
   const summaryHtml = `
-    <tr><td style="padding:6px 12px;font-size:13px;color:#666;">Item total</td><td style="padding:6px 12px;font-size:13px;color:#333;text-align:right;">${money((order.totalAmount || 0) - (order.deliveryFee || 0) + (order.discountAmount || 0))}</td></tr>
-    ${order.discountAmount
-      ? `<tr><td style="padding:6px 12px;font-size:13px;color:#059669;">Coupon (${order.couponCode || ""})</td><td style="padding:6px 12px;font-size:13px;color:#059669;text-align:right;">-${money(order.discountAmount)}</td></tr>`
-      : ""}
+    <tr><td style="padding:6px 12px;font-size:13px;color:#666;">Item total</td><td style="padding:6px 12px;font-size:13px;color:#333;text-align:right;">${money((order.totalAmount || 0) - (order.deliveryFee || 0))}</td></tr>
     <tr><td style="padding:6px 12px;font-size:13px;color:#666;">Delivery fee</td><td style="padding:6px 12px;font-size:13px;color:#333;text-align:right;">${order.deliveryFee ? money(order.deliveryFee) : "FREE"}</td></tr>
     <tr><td style="padding:10px 12px;font-size:15px;font-weight:700;color:#111;">Order total</td><td style="padding:10px 12px;font-size:15px;font-weight:700;color:#111;text-align:right;">${money(order.totalAmount)}</td></tr>
+    ${order.discountAmount
+      ? `<tr><td colspan="2" style="padding:12px 12px 2px;font-size:13px;color:#7c3aed;font-weight:600;">🎉 You'll earn ${money(order.discountAmount)} cashback${order.couponCode ? ` (code ${order.couponCode})` : ""} — credited to your wallet once this order is delivered.</td></tr>`
+      : ""}
   `;
 
   const address = order.customer || {};
@@ -381,6 +381,137 @@ async function sendAdminWalletCreditEmail({ user, amount, note, newBalance }) {
     to: user.email,
     subject: `🎉 ${money(amount)} added to your DEALROOT wallet`,
     html,
+  });
+}
+
+// Sent to the buyer themselves when the coupon they used on an order is
+// credited to their wallet as cashback — fires automatically the moment
+// that order is marked "delivered" (see the order-status endpoint).
+async function sendOrderCashbackEmail({ user, order, amount, newBalance }) {
+  if (!user?.email || !(amount > 0)) return;
+
+  const from = `"DEALROOT Beauty" <${process.env.EMAIL_USER}>`;
+  const money = (n) => `₹${Number(n || 0).toLocaleString("en-IN")}`;
+
+  const html = `
+    <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;background:#fff;">
+      <div style="background:#7c3aed;padding:24px 28px;text-align:center;">
+        <h1 style="color:#fff;margin:0;font-size:22px;">🎉 Your cashback has landed!</h1>
+      </div>
+      <div style="padding:28px;">
+        <p style="font-size:14px;color:#333;">Hi ${user.name || "there"},</p>
+        <p style="font-size:14px;color:#555;line-height:1.6;">
+          Your order <strong>${order.orderNumber}</strong> was delivered, and the cashback from coupon
+          <strong>${order.couponCode}</strong> has been added to your DEALROOT wallet.
+        </p>
+        <div style="background:#f5f3ff;border:1px solid #ddd6fe;border-radius:10px;padding:14px 18px;margin:18px 0;">
+          <span style="font-size:12px;color:#7c3aed;display:block;">CASHBACK CREDITED</span>
+          <strong style="font-size:22px;color:#7c3aed;">${money(amount)}</strong>
+          <span style="font-size:12px;color:#999;display:block;margin-top:8px;">New wallet balance: ${money(newBalance)}</span>
+        </div>
+        <p style="font-size:13px;color:#555;line-height:1.6;">
+          This balance is automatically used towards your "pay at delivery" amount the next time you order with DEALROOT.
+        </p>
+      </div>
+    </div>
+  `;
+
+  await transporter.sendMail({
+    from,
+    to: user.email,
+    subject: `🎉 ${money(amount)} cashback credited — order ${order.orderNumber}`,
+    html,
+  });
+}
+
+// Credits a delivered order's coupon cashback (discountAmount) to the
+// buyer's wallet, exactly once. Guarded by an atomic claim on
+// cashbackCredited so a status toggled back and forth, or two concurrent
+// requests, can never double-credit. Guest orders (no linked account) are
+// skipped — there's no wallet to credit.
+async function creditOrderCashback(order) {
+  if (!order?.discountAmount || order.discountAmount <= 0 || !order.user) {
+    return;
+  }
+
+  const claimed = await Order.updateOne(
+    { _id: order._id, cashbackCredited: false },
+    { $set: { cashbackCredited: true } }
+  );
+
+  if (claimed.modifiedCount !== 1) return; // already credited (or no such order)
+
+  const buyer = await User.findByIdAndUpdate(
+    order.user,
+    { $inc: { walletBalance: order.discountAmount } },
+    { new: true }
+  );
+
+  if (!buyer) return;
+
+  await WalletTransaction.create({
+    user: buyer._id,
+    type: "cashback",
+    status: "approved",
+    amount: order.discountAmount,
+    order: order._id,
+    orderNumber: order.orderNumber,
+    orderAmount: order.totalAmount,
+    couponCode: order.couponCode,
+    note: `Cashback for order ${order.orderNumber}`,
+    approvedAt: new Date(),
+  });
+
+  sendOrderCashbackEmail({
+    user: buyer,
+    order,
+    amount: order.discountAmount,
+    newBalance: buyer.walletBalance,
+  }).catch((error) =>
+    console.error("Order cashback email failed:", error.message)
+  );
+}
+
+// Reverses a delivered order's cashback when its return is approved — takes
+// back whatever is still available in the wallet (never pushes it negative)
+// and logs the reversal so the wallet ledger stays accurate.
+async function reverseOrderCashback(order) {
+  if (!order?.cashbackCredited || !order.discountAmount || !order.user) {
+    return;
+  }
+
+  const claimed = await Order.updateOne(
+    { _id: order._id, cashbackCredited: true },
+    { $set: { cashbackCredited: false } }
+  );
+
+  if (claimed.modifiedCount !== 1) return; // already reversed
+
+  const buyer = await User.findById(order.user).select("walletBalance name email");
+  if (!buyer) return;
+
+  const reversedAmount = roundMoney(
+    Math.min(Math.max(0, buyer.walletBalance || 0), order.discountAmount)
+  );
+
+  if (reversedAmount > 0) {
+    await User.updateOne(
+      { _id: buyer._id },
+      { $inc: { walletBalance: -reversedAmount } }
+    );
+  }
+
+  await WalletTransaction.create({
+    user: buyer._id,
+    type: "cashback",
+    status: "approved",
+    amount: -reversedAmount,
+    order: order._id,
+    orderNumber: order.orderNumber,
+    orderAmount: order.totalAmount,
+    couponCode: order.couponCode,
+    note: `Cashback reversed — order ${order.orderNumber} was returned`,
+    approvedAt: new Date(),
   });
 }
 
@@ -836,6 +967,15 @@ referralBonus: {
   default: 0,
 },
 
+// Whether the coupon cashback (discountAmount) for this order has already
+// been credited to the buyer's wallet — set true once, on delivery, so a
+// status toggle (delivered → shipped → delivered again) can never credit it
+// twice. Cleared back to false if a later-approved return claws it back.
+cashbackCredited: {
+  type: Boolean,
+  default: false,
+},
+
     razorpayOrderId: {
       type: String,
       default: "",
@@ -1103,7 +1243,7 @@ const walletTransactionSchema = new mongoose.Schema(
     },
     type: {
       type: String,
-      enum: ["referral", "admin"],
+      enum: ["referral", "admin", "cashback"],
       required: true,
     },
     status: {
@@ -1644,9 +1784,11 @@ const buildOnlinePaymentQuote = async ({
   }
 
   const deliveryFee = subtotal >= 499 ? 0 : 59;
- const totalAmount = roundMoney(
-  subtotal - discountAmount + deliveryFee
-);
+  // Coupons no longer discount the order upfront — the full price is always
+  // charged, and `discountAmount` (computed above) is instead credited to
+  // the buyer's wallet as cashback once the order is delivered (see the
+  // order-status-update handler below).
+  const totalAmount = roundMoney(subtotal + deliveryFee);
 
 const isCod = paymentMethod === "cod";
 
@@ -4456,7 +4598,9 @@ app.post("/api/admin/orders", requireAdmin, async (req, res) => {
         await resolveCouponForOrder(couponCode, subtotal);
 
       const deliveryFee = subtotal >= 499 ? 0 : 59;
-      const totalAmount = roundMoney(subtotal - discountAmount + deliveryFee);
+      // Full price always charged — discountAmount becomes cashback, credited
+      // to the buyer's wallet once this order is marked delivered.
+      const totalAmount = roundMoney(subtotal + deliveryFee);
 
       if (totalAmount <= 0) {
         throw new Error("Order total must be greater than zero");
@@ -5352,7 +5496,10 @@ app.post("/api/orders", requireUser, async (req, res) => {
             deliveryFee,
             couponCode: normalizedCoupon,
             discountAmount,
-            totalAmount: subtotal - discountAmount + deliveryFee,
+            // Full price always charged — discountAmount is credited as
+            // cashback to the buyer's wallet once delivered, not taken off
+            // the order total upfront.
+            totalAmount: subtotal + deliveryFee,
             deliveryType: "courier",
             paymentMethod: "cod",
             tryoutOrder: hasTryoutItem,
@@ -5537,6 +5684,14 @@ app.patch("/api/orders/:id/status", requireAdmin, async (req, res) => {
       sendOrderStatusEmail(order).catch((error) =>
         console.error("Order status email failed:", error.message)
       );
+
+      // Coupon cashback is only ever earned once the order actually reaches
+      // the customer — credit it automatically the moment it's delivered.
+      if (orderStatus === "delivered") {
+        creditOrderCashback(order).catch((error) =>
+          console.error("Order cashback credit failed:", error.message)
+        );
+      }
     }
 
     res.json({
@@ -5882,7 +6037,7 @@ async function sendAbandonedCartEmail(cart, coupon) {
     .join("\n");
 
   const subject =
-    "Your DEALROOT cart is waiting — " + cartRecoveryDiscount + "% off!";
+    "Your DEALROOT cart is waiting — earn " + cartRecoveryDiscount + "% cashback!";
 
   const html =
     '<div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;background:#fff;">\n' +
@@ -5894,9 +6049,9 @@ async function sendAbandonedCartEmail(cart, coupon) {
     '    <p style="font-size:14px;color:#333;">Hi ' +
     xmlEscape(cart.name || "there") +
     ",</p>\n" +
-    '    <p style="font-size:14px;color:#555;line-height:1.6;">Your cart is still saved and waiting for you. Complete your order in the next few days and enjoy <strong style="color:#e21c48;">' +
+    '    <p style="font-size:14px;color:#555;line-height:1.6;">Your cart is still saved and waiting for you. Complete your order in the next few days and earn <strong style="color:#7c3aed;">' +
     cartRecoveryDiscount +
-    "% off</strong> — it's our little nudge to treat yourself.</p>\n" +
+    "% cashback</strong> in your wallet once it's delivered — it's our little nudge to treat yourself.</p>\n" +
     '    <div style="background:#fff5f7;border:1px solid #ffd6de;border-radius:10px;padding:16px 20px;margin:18px 0;text-align:center;">\n' +
     '      <span style="font-size:12px;color:#999;display:block;margin-bottom:6px;">USE THIS CODE AT CHECKOUT</span>\n' +
     '      <span style="font-size:26px;font-weight:800;color:#e21c48;letter-spacing:3px;">' +
@@ -5904,7 +6059,7 @@ async function sendAbandonedCartEmail(cart, coupon) {
     "</span>\n" +
     '      <span style="font-size:12px;color:#999;display:block;margin-top:8px;">' +
     cartRecoveryDiscount +
-    "% off up to ₹" +
+    "% cashback up to ₹" +
     cartRecoveryMaxDiscount +
     " &bull; Min. order ₹" +
     cartRecoveryMinOrder +
@@ -6759,6 +6914,15 @@ app.post("/api/returns/:id/approve", requireAdmin, async (req, res) => {
     }
 
     const order = await Order.findById(returnRequest.order);
+
+    // The order's coupon cashback (if it was already credited after
+    // delivery) is clawed back now that the return is approved.
+    if (order) {
+      reverseOrderCashback(order).catch((error) =>
+        console.error("Cashback reversal failed:", error.message)
+      );
+    }
+
     const customerEmail =
       String(order?.customer?.email || "").trim() ||
       (returnRequest.user
