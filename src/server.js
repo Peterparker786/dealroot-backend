@@ -6868,7 +6868,10 @@ app.get("/api/returns", requireAdmin, async (req, res) => {
     const returns = await ReturnRequest.find()
       .sort({ requestedAt: -1 })
       .limit(100)
-      .populate("order", "orderNumber totalAmount customer");
+      .populate(
+        "order",
+        "orderNumber totalAmount customer couponCode discountAmount cashbackCredited orderStatus"
+      );
     res.json({ success: true, returns });
   } catch (error) {
     res.status(500).json({ success: false, message: "Could not load returns" });
