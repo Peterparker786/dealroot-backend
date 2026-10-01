@@ -515,6 +515,146 @@ async function reverseOrderCashback(order) {
   });
 }
 
+// ===== Personal referral program emails =====
+
+async function sendReferralOwnerEmail({ owner, amount, maskedBuyerEmail, order, newBalance }) {
+  if (!owner?.email || !(amount > 0)) return;
+
+  const from = `"DEALROOT Beauty" <${process.env.EMAIL_USER}>`;
+  const money = (n) => `₹${Number(n || 0).toLocaleString("en-IN")}`;
+
+  const html = `
+    <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;background:#fff;">
+      <div style="background:#7c3aed;padding:24px 28px;text-align:center;">
+        <h1 style="color:#fff;margin:0;font-size:22px;">🎉 Someone used your referral code!</h1>
+      </div>
+      <div style="padding:28px;">
+        <p style="font-size:14px;color:#333;">Hi ${owner.name || "there"},</p>
+        <p style="font-size:14px;color:#555;line-height:1.6;">
+          <strong>${maskedBuyerEmail}</strong> used your referral code
+          <strong>${owner.referralCode}</strong> on an order that's now been delivered — your reward has
+          been added to your DEALROOT wallet.
+        </p>
+        <div style="background:#f5f3ff;border:1px solid #ddd6fe;border-radius:10px;padding:14px 18px;margin:18px 0;">
+          <span style="font-size:12px;color:#7c3aed;display:block;">REFERRAL REWARD CREDITED</span>
+          <strong style="font-size:22px;color:#7c3aed;">${money(amount)}</strong>
+          <span style="font-size:12px;color:#999;display:block;margin-top:8px;">New wallet balance: ${money(newBalance)}</span>
+        </div>
+        <p style="font-size:13px;color:#555;line-height:1.6;">
+          You'll keep earning every time ${maskedBuyerEmail} places an order with DEALROOT.
+        </p>
+      </div>
+    </div>
+  `;
+
+  await transporter.sendMail({
+    from,
+    to: owner.email,
+    subject: `🎉 ${money(amount)} referral reward credited!`,
+    html,
+  });
+}
+
+// Credits a delivered order's personal-referral reward — only the code
+// owner's 50%, since the buyer earns nothing automatically from an account
+// link (they only earn cashback by applying an actual coupon code at
+// checkout, handled separately). Guarded by its own atomic claim
+// (referralOwnerCredited) so this can never be double-credited by a status
+// toggle or a race.
+async function creditReferralBonus(order) {
+  if (!order?.referralShareAmount || order.referralShareAmount <= 0) return;
+
+  // Code owner's 50%.
+  if (order.referralOwnerUser) {
+    const ownerClaim = await Order.updateOne(
+      { _id: order._id, referralOwnerCredited: false },
+      { $set: { referralOwnerCredited: true } }
+    );
+
+    if (ownerClaim.modifiedCount === 1) {
+      const owner = await User.findByIdAndUpdate(
+        order.referralOwnerUser,
+        { $inc: { walletBalance: order.referralShareAmount } },
+        { new: true }
+      );
+
+      if (owner) {
+        const buyerUser = order.user
+          ? await User.findById(order.user).select("email")
+          : null;
+        const maskedBuyerEmail = maskEmail(
+          buyerUser?.email || order.customer?.email
+        );
+
+        await WalletTransaction.create({
+          user: owner._id,
+          type: "referral",
+          status: "approved",
+          amount: order.referralShareAmount,
+          order: order._id,
+          orderNumber: order.orderNumber,
+          orderAmount: order.totalAmount,
+          couponCode: order.referralCodeUsed,
+          note: `${maskedBuyerEmail} used your code +₹${order.referralShareAmount}`,
+          approvedAt: new Date(),
+        });
+
+        sendReferralOwnerEmail({
+          owner,
+          amount: order.referralShareAmount,
+          maskedBuyerEmail,
+          order,
+          newBalance: owner.walletBalance,
+        }).catch((error) =>
+          console.error("Referral owner email failed:", error.message)
+        );
+      }
+    }
+  }
+}
+
+// Reverses a delivered order's personal-referral reward (owner side only —
+// see creditReferralBonus) when its return is approved — takes back
+// whatever is still available in the owner's wallet (never pushes it
+// negative), mirroring reverseOrderCashback.
+async function reverseReferralBonus(order) {
+  if (!order?.referralShareAmount || order.referralShareAmount <= 0) return;
+
+  if (order.referralOwnerCredited && order.referralOwnerUser) {
+    const claimed = await Order.updateOne(
+      { _id: order._id, referralOwnerCredited: true },
+      { $set: { referralOwnerCredited: false } }
+    );
+
+    if (claimed.modifiedCount === 1) {
+      const owner = await User.findById(order.referralOwnerUser).select("walletBalance");
+      if (owner) {
+        const reversedAmount = roundMoney(
+          Math.min(Math.max(0, owner.walletBalance || 0), order.referralShareAmount)
+        );
+        if (reversedAmount > 0) {
+          await User.updateOne(
+            { _id: owner._id },
+            { $inc: { walletBalance: -reversedAmount } }
+          );
+        }
+        await WalletTransaction.create({
+          user: owner._id,
+          type: "referral",
+          status: "approved",
+          amount: -reversedAmount,
+          order: order._id,
+          orderNumber: order.orderNumber,
+          orderAmount: order.totalAmount,
+          couponCode: order.referralCodeUsed,
+          note: `Referral reward reversed — order ${order.orderNumber} was returned`,
+          approvedAt: new Date(),
+        });
+      }
+    }
+  }
+}
+
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
@@ -976,6 +1116,22 @@ cashbackCredited: {
   default: false,
 },
 
+// ===== Personal referral program snapshot (see User.referredBy above) —
+// taken at the moment this order was placed, so it never changes even if
+// the buyer's account later links to a different code. Only the code owner
+// is ever credited (see creditReferralBonus) — the buyer earns nothing from
+// this link itself.
+referralCodeUsed: { type: String, default: "", trim: true, uppercase: true },
+referralOwnerUser: {
+  type: mongoose.Schema.Types.ObjectId,
+  ref: "User",
+  default: null,
+},
+// 50% of this order's subtotal (excluding delivery/COD fee) — credited to
+// the code owner once the order is delivered.
+referralShareAmount: { type: Number, default: 0, min: 0 },
+referralOwnerCredited: { type: Boolean, default: false },
+
     razorpayOrderId: {
       type: String,
       default: "",
@@ -1112,6 +1268,16 @@ referralBonus: {
   default: 0,
 },
 
+// Personal referral program snapshot — carried through to the Order once
+// payment is verified (see buildOnlinePaymentQuote).
+referralCodeUsed: { type: String, default: "", trim: true, uppercase: true },
+referralOwnerUser: {
+  type: mongoose.Schema.Types.ObjectId,
+  ref: "User",
+  default: null,
+},
+referralShareAmount: { type: Number, default: 0, min: 0 },
+
 paymentMethod: {
   type: String,
   enum: ["cod", "razorpay"],
@@ -1221,6 +1387,43 @@ otpExpiry: {
     // user) lands here too, but only once the admin approves it — see
     // WalletTransaction below.
     walletBalance: { type: Number, default: 0, min: 0 },
+
+    // ===== Personal referral program (separate from the per-coupon referral
+    // bonus above, and from the checkout "coupon code" box, which is a
+    // completely different feature) — every customer gets their own
+    // permanent code (e.g. "MAHI50") they can share. A friend applies that
+    // code ONCE, either at signup or later from their profile — this
+    // permanently links their account (`referredBy`/`referredByCode` below)
+    // to the code owner. Once linked, EVERY order that account places
+    // automatically earns the code OWNER 50% of that order's subtotal
+    // (excluding delivery fee) as wallet cashback once it's delivered — no
+    // checkout action needed, see creditReferralBonus. The linked buyer does
+    // NOT automatically get anything from this link; they only earn cashback
+    // by applying an actual coupon code at checkout (the ordinary, unrelated
+    // coupon-cashback system below). Unrelated to `referralOwnerEmail`/
+    // `referralBonus` on Order, which is the older, admin-approved,
+    // per-coupon referral bonus and keeps working exactly as before.
+    // No `default` here on purpose — with a sparse unique index, leaving
+    // this genuinely unset (undefined) for accounts that don't have one yet
+    // keeps them excluded from the index. A `default: ""` would make every
+    // such account's field resolve to the same "" value and collide on the
+    // unique constraint the moment any of them got saved.
+    referralCode: {
+      type: String,
+      trim: true,
+      uppercase: true,
+      unique: true,
+      sparse: true,
+    },
+    // The friend's referral code this account is permanently linked to, once
+    // applied (profile or signup). Null/unset until then, and can only be
+    // set once by the user (admin can still override from the admin panel).
+    referredBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+    referredByCode: { type: String, default: "", trim: true, uppercase: true },
   },
   { timestamps: true }
 );
@@ -1282,6 +1485,40 @@ const WalletTransaction = mongoose.model(
   "WalletTransaction",
   walletTransactionSchema
 );
+
+// Builds this user's permanent personal referral code from their first
+// name (e.g. "Mahi Sharma" -> "MAHI50"), falling back to the email's local
+// part if the name is unusable. Appends an incrementing number instead of
+// "50" if that exact code is already taken by someone else.
+async function generateReferralCode(user) {
+  const rawBase =
+    String(user?.name || "").trim().split(/\s+/)[0] ||
+    String(user?.email || "").split("@")[0] ||
+    "USER";
+  const base = rawBase.replace(/[^a-zA-Z]/g, "").toUpperCase() || "USER";
+
+  let suffix = 50;
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const candidate = `${base}${suffix}`;
+    const clash = await User.findOne({
+      referralCode: candidate,
+      _id: { $ne: user?._id },
+    });
+    if (!clash) return candidate;
+    suffix += 1;
+  }
+  // Extremely unlikely fallback — guarantees uniqueness either way.
+  return `${base}${Date.now().toString().slice(-6)}`;
+}
+
+// "someone@gmail.com" -> "***@gmail.com" — used so a referral-code owner's
+// wallet transaction shows who used their code without exposing the full
+// email address.
+function maskEmail(email) {
+  const str = String(email || "");
+  const at = str.indexOf("@");
+  return at === -1 ? "***" : "***" + str.slice(at);
+}
 
 const categorySchema = new mongoose.Schema(
   {
@@ -1377,6 +1614,8 @@ city: user.city,
   pincode: user.pincode,
   addresses: user.addresses || [],
   walletBalance: user.walletBalance || 0,
+  referralCode: user.referralCode || "",
+  referredByCode: user.referredByCode || "",
 });
 
 const requireAdmin = (req, res, next) => {
@@ -1581,6 +1820,10 @@ const roundMoney = (amount) =>
 // one place is what stops a coupon from validating one way in one place and
 // differently in another — that exact mismatch is what caused the earlier
 // "Coupon applied!" then "Invalid coupon code at payment" bug.
+// NOTE: this is coupon-codes only. The personal referral program (permanent
+// account link, applied once from the profile/signup) is a completely
+// separate feature — see User.referredBy and creditReferralBonus — and is
+// never resolved through a code typed at checkout.
 const resolveCouponForOrder = async (couponCode, subtotal) => {
   const normalizedCoupon = normaliseCouponCode(couponCode);
 
@@ -1643,7 +1886,12 @@ const resolveCouponForOrder = async (couponCode, subtotal) => {
     }
   }
 
-  return { normalizedCoupon, discountAmount, referralOwnerEmail, referralBonus };
+  return {
+    normalizedCoupon,
+    discountAmount,
+    referralOwnerEmail,
+    referralBonus,
+  };
 };
 
 // Free-gift offer: carts worth ₹499+ can attach one product priced up to
@@ -1763,12 +2011,8 @@ const buildOnlinePaymentQuote = async ({
     });
   }
 
-  const {
-    normalizedCoupon,
-    discountAmount,
-    referralOwnerEmail,
-    referralBonus,
-  } = await resolveCouponForOrder(couponCode, subtotal);
+  const { normalizedCoupon, discountAmount, referralOwnerEmail, referralBonus } =
+    await resolveCouponForOrder(couponCode, subtotal);
 
   // Attach the free gift as a ₹0 line item. Stock is validated here and
   // decremented inside the payment transaction with the session items.
@@ -1793,6 +2037,29 @@ const buildOnlinePaymentQuote = async ({
   // the buyer's wallet as cashback once the order is delivered (see the
   // order-status-update handler below).
   const totalAmount = roundMoney(subtotal + deliveryFee);
+
+  // Personal referral program — fully independent of coupon codes. If this
+  // buyer's account is permanently linked to a referral-code owner
+  // (User.referredBy, set once from the profile or signup), that owner
+  // automatically earns 50% of this order's subtotal (not counting the
+  // delivery/COD fee) as wallet cashback once it's delivered — on EVERY
+  // order this account places, with no checkout action required. The buyer
+  // themselves earns nothing from this link.
+  let referralOwnerUser = null;
+  let referralCodeUsed = "";
+  let referralShareAmount = 0;
+
+  if (userId) {
+    const linkedBuyer = await User.findById(userId).select(
+      "referredBy referredByCode"
+    );
+
+    if (linkedBuyer?.referredBy) {
+      referralOwnerUser = linkedBuyer.referredBy;
+      referralCodeUsed = linkedBuyer.referredByCode;
+      referralShareAmount = roundMoney(subtotal * 0.5);
+    }
+  }
 
 const isCod = paymentMethod === "cod";
 
@@ -1844,6 +2111,9 @@ const amountInPaise = Math.round(payableNow * 100);
     walletUsed,
     referralOwnerEmail,
     referralBonus,
+    referralCodeUsed,
+    referralOwnerUser,
+    referralShareAmount,
     deliveryType: "courier",
     tryoutOrder: hasTryoutItem,
   };
@@ -2017,6 +2287,9 @@ codAmount: currentPaymentSession.codAmount,
             walletUsed: currentPaymentSession.walletUsed || 0,
             referralOwnerEmail: currentPaymentSession.referralOwnerEmail || "",
             referralBonus: currentPaymentSession.referralBonus || 0,
+            referralCodeUsed: currentPaymentSession.referralCodeUsed || "",
+            referralOwnerUser: currentPaymentSession.referralOwnerUser || null,
+            referralShareAmount: currentPaymentSession.referralShareAmount || 0,
             razorpayOrderId: currentPaymentSession.razorpayOrderId,
             razorpayPaymentId: payment.id,
             razorpaySignature,
@@ -2436,6 +2709,10 @@ app.post("/api/auth/signup", customerAuthLimiter, async (req, res) => {
       email,
       passwordHash: await bcrypt.hash(password, 12),
     });
+
+    user.referralCode = await generateReferralCode(user);
+    await user.save();
+
     const token = jwt.sign({ role: "user", userId: user._id }, jwtSecret, { expiresIn: "7d" });
 
     res.status(201).json({ success: true, token, user: publicUser(user) });
@@ -2811,9 +3088,70 @@ app.post("/api/auth/change-password", requireUser, async (req, res) => {
   }
 });
 
+// Personal referral program — apply a friend's referral code to permanently
+// link this account to them. One-time only: once set, it can't be changed
+// or cleared by the customer (only the admin can override it from the admin
+// panel). From then on, every order this account places automatically
+// earns the friend 50% of that order's subtotal as wallet cashback once
+// delivered — see buildOnlinePaymentQuote/creditReferralBonus. This account
+// itself earns nothing from the link; it only earns cashback by applying an
+// actual coupon code at checkout, a separate, unrelated feature.
+app.post("/api/auth/apply-referral", requireUser, async (req, res) => {
+  try {
+    const normalizedCode = String(req.body?.code || "").trim().toUpperCase();
+
+    if (!normalizedCode) {
+      return res.status(400).json({ success: false, message: "Please enter a referral code" });
+    }
+
+    const me = await User.findById(req.user.userId);
+    if (!me) {
+      return res.status(404).json({ success: false, message: "Account not found" });
+    }
+
+    if (me.referredBy) {
+      return res.status(400).json({
+        success: false,
+        message: "You've already applied a referral code — it can't be changed.",
+      });
+    }
+
+    if (me.referralCode === normalizedCode) {
+      return res.status(400).json({ success: false, message: "You can't use your own referral code" });
+    }
+
+    const owner = await User.findOne({ referralCode: normalizedCode });
+    if (!owner || String(owner._id) === String(me._id)) {
+      return res.status(400).json({ success: false, message: "Invalid referral code" });
+    }
+
+    me.referredBy = owner._id;
+    me.referredByCode = owner.referralCode;
+    await me.save();
+
+    res.json({
+      success: true,
+      message: `Referral code ${owner.referralCode} applied! They'll now earn 50% cashback on every order you place, once delivered.`,
+      user: publicUser(me),
+    });
+  } catch (err) {
+    console.error("Apply referral error:", err);
+    res.status(500).json({ success: false, message: "Server Error" });
+  }
+});
+
 app.get("/api/auth/me", requireUser, async (req, res) => {
   const user = await User.findById(req.user.userId);
   if (!user) return res.status(404).json({ success: false, message: "Account not found" });
+
+  // Safety net for accounts created before the referral program existed —
+  // the startup backfill should already have covered everyone, but assign
+  // one here too if it's somehow still missing.
+  if (!user.referralCode) {
+    user.referralCode = await generateReferralCode(user);
+    await user.save();
+  }
+
   res.json({ success: true, user: publicUser(user) });
 });
 
@@ -4332,6 +4670,8 @@ app.get("/api/admin/users", requireAdmin, async (req, res) => {
           city: 1,
           pincode: 1,
           walletBalance: { $ifNull: ["$walletBalance", 0] },
+          referralCode: { $ifNull: ["$referralCode", ""] },
+          referredByCode: { $ifNull: ["$referredByCode", ""] },
           createdAt: 1,
           orderCount: { $size: "$orders" },
           totalSpent: { $sum: "$orders.totalAmount" },
@@ -4341,6 +4681,80 @@ app.get("/api/admin/users", requireAdmin, async (req, res) => {
     ]);
 
     res.json({ success: true, users });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Admin: set/override a customer's own referral code (e.g. to fix a clash
+// or give them a custom one). Must stay unique across all customers.
+app.patch("/api/admin/users/:id/referral-code", requireAdmin, async (req, res) => {
+  try {
+    const code = String(req.body?.code || "").trim().toUpperCase();
+    if (!code) {
+      return res.status(400).json({ success: false, message: "Enter a referral code" });
+    }
+
+    const clash = await User.findOne({ referralCode: code, _id: { $ne: req.params.id } });
+    if (clash) {
+      return res.status(400).json({ success: false, message: "That code is already in use" });
+    }
+
+    const user = await User.findByIdAndUpdate(
+      req.params.id,
+      { referralCode: code },
+      { new: true, runValidators: true }
+    );
+    if (!user) return res.status(404).json({ success: false, message: "Customer not found" });
+
+    res.json({
+      success: true,
+      message: `Referral code set to ${code}`,
+      user: { id: user._id, referralCode: user.referralCode },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Admin: assign (or clear) which referral code a customer's account is
+// permanently linked to (User.referredBy/referredByCode). Normally a
+// customer sets this themselves once, from their profile, but the admin can
+// override or fix it here. Send an empty code to clear the link.
+app.patch("/api/admin/users/:id/referred-by", requireAdmin, async (req, res) => {
+  try {
+    const code = String(req.body?.code || "").trim().toUpperCase();
+
+    const user = await User.findById(req.params.id);
+    if (!user) {
+      return res.status(404).json({ success: false, message: "Customer not found" });
+    }
+
+    if (!code) {
+      user.referredBy = null;
+      user.referredByCode = "";
+      await user.save();
+      return res.json({ success: true, message: "Referral link cleared", user: publicUser(user) });
+    }
+
+    const owner = await User.findOne({ referralCode: code });
+    if (!owner) {
+      return res.status(400).json({ success: false, message: "Invalid referral code" });
+    }
+
+    if (String(owner._id) === String(user._id)) {
+      return res.status(400).json({ success: false, message: "Can't link a customer to their own code" });
+    }
+
+    user.referredBy = owner._id;
+    user.referredByCode = owner.referralCode;
+    await user.save();
+
+    res.json({
+      success: true,
+      message: `Linked to ${owner.referralCode}`,
+      user: publicUser(user),
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -4610,6 +5024,18 @@ app.post("/api/admin/orders", requireAdmin, async (req, res) => {
         throw new Error("Order total must be greater than zero");
       }
 
+      // Personal referral program — fully independent of the Coupon code
+      // field above. If this customer's account is permanently linked to a
+      // referral-code owner, that owner automatically earns 50% of this
+      // order's subtotal (not counting delivery/COD fee) as cashback once
+      // delivered — same as the real checkout path (see
+      // buildOnlinePaymentQuote).
+      const referralOwnerUser = foundUser.referredBy || null;
+      const referralCodeUsed = foundUser.referredByCode || "";
+      const referralShareAmount = referralOwnerUser
+        ? roundMoney(subtotal * 0.5)
+        : 0;
+
       // Manual orders skip the online delivery-fee prepay step entirely
       // (nothing has been charged through Razorpay), so whichever amount is
       // still owed — the full total for a COD order, nothing for one the
@@ -4671,6 +5097,9 @@ app.post("/api/admin/orders", requireAdmin, async (req, res) => {
             walletUsed,
             referralOwnerEmail: referralOwnerEmail || "",
             referralBonus: referralBonus || 0,
+            referralCodeUsed,
+            referralOwnerUser,
+            referralShareAmount,
           },
         ],
         { session }
@@ -4821,9 +5250,10 @@ app.post(
 app.post("/api/coupons/apply", async (req, res) => {
   try {
     const { code, subtotal } = req.body;
+    const normalizedCode = String(code || "").trim().toUpperCase();
 
     const coupon = await Coupon.findOne({
-      code: code.toUpperCase(),
+      code: normalizedCode,
       active: true,
     });
 
@@ -5060,7 +5490,17 @@ app.delete("/api/products/:id", requireAdmin, async (req, res) => {
 app.post(
   "/api/payments/razorpay/create-order",
   paymentLimiter,
-  optionalUser,
+  // Was optionalUser — that let a stale/expired login token silently fall
+  // back to a "guest" order (req.user = null) instead of rejecting the
+  // request. The frontend already requires a logged-in user before it'll
+  // even open checkout, so the only time that ever actually fired was when
+  // someone's 7-day session token had quietly expired while the UI still
+  // showed them as logged in: Razorpay still took the payment, but the
+  // order was saved with no `user`, so it could never show up on their
+  // "My Orders" page (which filters by user id) even though the money was
+  // taken. requireUser stops the Razorpay payment from ever starting in
+  // that case — the customer gets "please log in again" up front instead.
+  requireUser,
   async (req, res) => {
     try {
       const instance = getRazorpay();
@@ -5094,6 +5534,9 @@ codAmount: quote.codAmount,
 walletUsed: quote.walletUsed,
 referralOwnerEmail: quote.referralOwnerEmail,
 referralBonus: quote.referralBonus,
+referralCodeUsed: quote.referralCodeUsed,
+referralOwnerUser: quote.referralOwnerUser,
+referralShareAmount: quote.referralShareAmount,
 paymentMethod: req.body.paymentMethod || "razorpay",
         amountInPaise: quote.amountInPaise,
         deliveryType: quote.deliveryType,
@@ -5699,6 +6142,11 @@ app.patch("/api/orders/:id/status", requireAdmin, async (req, res) => {
       if (orderStatus === "delivered") {
         creditOrderCashback(order).catch((error) =>
           console.error("Order cashback credit failed:", error.message)
+        );
+
+        // Personal referral program — same "only on delivery" rule.
+        creditReferralBonus(order).catch((error) =>
+          console.error("Referral bonus credit failed:", error.message)
         );
       }
     }
@@ -6932,6 +7380,12 @@ app.post("/api/returns/:id/approve", requireAdmin, async (req, res) => {
     if (order) {
       reverseOrderCashback(order).catch((error) =>
         console.error("Cashback reversal failed:", error.message)
+      );
+
+      // Same for the personal referral reward (both the buyer's and the
+      // code owner's 50%), if it had already been credited.
+      reverseReferralBonus(order).catch((error) =>
+        console.error("Referral bonus reversal failed:", error.message)
       );
     }
 
@@ -8321,11 +8775,36 @@ app.patch(
   }
 );
 
+// One-time (per boot) backfill: assigns a personal referral code to every
+// existing account that doesn't have one yet — new signups already get one
+// at registration, so this only ever has work to do right after this
+// feature first ships. Safe to run every boot since it only touches users
+// missing the field.
+async function backfillReferralCodes() {
+  try {
+    const missing = await User.find({
+      $or: [{ referralCode: { $exists: false } }, { referralCode: "" }],
+    }).select("name email");
+
+    for (const user of missing) {
+      user.referralCode = await generateReferralCode(user);
+      await user.save();
+    }
+
+    if (missing.length > 0) {
+      console.log(`Assigned referral codes to ${missing.length} existing customer(s)`);
+    }
+  } catch (error) {
+    console.error("Referral code backfill failed:", error.message);
+  }
+}
+
 const startServer = async () => {
   try {
     await mongoose.connect(process.env.MONGODB_URI);
     console.log("MongoDB connected");
 
+    backfillReferralCodes();
     startCartRecoveryScheduler();
     startNewProductEmailScheduler();
 
