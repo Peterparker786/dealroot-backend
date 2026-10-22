@@ -5372,9 +5372,20 @@ app.put("/api/products/:id", requireAdmin, async (req, res) => {
       });
     }
 
+    // The regular product-edit form does not send the tryoutOnly field (it is
+    // toggled through the Tryouts tab or the dedicated endpoint). Editing must
+    // PRESERVE the existing flag instead of silently resetting it to public.
+    let existingTryoutOnly = Boolean(req.body?.tryoutOnly);
+    if (typeof req.body?.tryoutOnly !== "boolean") {
+      const existing = await Product.findById(req.params.id).select("tryoutOnly").lean();
+      existingTryoutOnly = Boolean(existing?.tryoutOnly);
+    }
+    const payload = productPayload(req.body);
+    payload.tryoutOnly = existingTryoutOnly;
+
     const product = await Product.findByIdAndUpdate(
       req.params.id,
-      productPayload(req.body),
+      payload,
       { new: true, runValidators: true }
     );
 
