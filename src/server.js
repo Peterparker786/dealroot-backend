@@ -3445,10 +3445,15 @@ app.get("/api/products", async (req, res) => {
     if (viewer?.role === "admin") {
       cacheControl = "no-store";
     } else if (canSeeTryout) {
-      cacheControl = "private, max-age=60";
+      // Members must never get a cached response: a browser that had cached
+      // the public (guest) list would otherwise keep serving it after login,
+      // hiding every Tryout-exclusive product.
+      cacheControl = "private, no-store";
     }
     res.set("Cache-Control", cacheControl);
-    res.set("Vary", "Accept-Encoding");
+    // Authorization must be part of the cache key — otherwise a guest's cached
+    // public list is reused for a signed-in member and Tryout products vanish.
+    res.set("Vary", "Accept-Encoding, Authorization");
 
     res.json({
       success: true,
