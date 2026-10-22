@@ -947,6 +947,9 @@ reviews: {
     buyLink: { type: String, trim: true, default: "" },
     buyLinkLabel: { type: String, trim: true, default: "Buy Now" },
     buyLinkTerms: { type: String, trim: true, default: "" },
+    // Offer TNC / T&C shown on the Tryout product card. Without this field
+    // Mongoose strict mode silently dropped it on save.
+    tnc: { type: String, trim: true, default: "" },
     specifications: [
       {
         label: { type: String, trim: true },
