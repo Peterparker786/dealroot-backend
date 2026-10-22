@@ -7538,6 +7538,10 @@ const tryoutApplicationSchema = new mongoose.Schema(
           enum: ["submitted", "verified", "rejected"],
           default: "submitted",
         },
+        // Set when the admin rejects the submission — shown to the member on
+        // their dashboard and included in the rejection email.
+        rejectionReason: { type: String, trim: true, default: "" },
+        reviewedAt: { type: Date, default: null },
         submittedAt: { type: Date, default: Date.now },
       },
     ],
@@ -8469,8 +8473,59 @@ app.patch(
           .json({ success: false, message: "Purchase form not found" });
       }
 
+      const rejectionReason = String(
+        req.body?.rejectionReason || req.body?.reason || ""
+      ).trim();
+
+      if (nextStatus === "rejected" && !rejectionReason) {
+        return res.status(400).json({
+          success: false,
+          message: "Please write a reason for rejecting this purchase form",
+        });
+      }
+
       form.status = nextStatus;
+      form.rejectionReason = nextStatus === "rejected" ? rejectionReason : "";
+      form.reviewedAt = new Date();
       await application.save();
+
+      // Tell the member why their submission was rejected — and what to fix.
+      const memberEmail = String(application.email || "").trim();
+      if (nextStatus === "rejected" && memberEmail && process.env.EMAIL_USER) {
+        if (process.env.ORDER_STATUS_EMAIL_DRY_RUN === "true") {
+          console.log(
+            "[dry-run] Purchase form rejection email → " + memberEmail
+          );
+        } else {
+          transporter
+            .sendMail({
+              from: '"DEALROOT Beauty" <' + process.env.EMAIL_USER + ">",
+              to: memberEmail,
+              subject: "❌ Purchase form rejected — Dealroot Tryouts",
+              html:
+                '<div style="font-family:Arial;padding:30px;max-width:620px;margin:auto">' +
+                '<h2 style="color:#b91c1c;margin:0 0 6px">Your purchase form was rejected</h2>' +
+                '<p style="color:#374151;line-height:1.7;margin:0 0 16px">Hi ' +
+                xmlEscape(application.name || "there") +
+                ',<br/>We could not verify your recent Tryout purchase submission.' +
+                "</p>" +
+                '<div style="background:#fff1f2;border:1px solid #fecdd3;border-radius:12px;padding:16px 18px;font-size:14px;line-height:1.8;color:#7f1d1d">' +
+                '<b>Reason from our team:</b><br/>' +
+                xmlEscape(rejectionReason).replace(/\n/g, "<br/>") +
+                "</div>" +
+                '<div style="background:#f4f1ff;border:1px solid #e4defc;border-radius:12px;padding:16px 18px;font-size:14px;line-height:1.8;margin-top:14px">' +
+                "<b>What you can do:</b><br/>Order id: " +
+                xmlEscape(form.orderId || "-") +
+                "<br/>Fix the issue above and submit the purchase form again from your Tryout dashboard." +
+                "</div>" +
+                '<p style="margin-top:18px;color:#6b7280;font-size:13px">Need help? Reply to this email and our team will assist you.</p>' +
+                "</div>",
+            })
+            .catch((err) =>
+              console.error("Purchase form rejection email failed:", err.message)
+            );
+        }
+      }
 
       res.json({
         success: true,
