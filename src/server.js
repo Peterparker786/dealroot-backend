@@ -5425,6 +5425,94 @@ app.delete("/api/coupons/:id", requireAdmin, async (req, res) => {
   }
 });
 
+// Admin-only: edit an existing coupon. The code stays locked (it's the
+// customer-facing identifier), everything else can be changed. Payment-mode
+// rules mirror create so an edit can never drop to an invalid empty state.
+app.put("/api/coupons/:id", requireAdmin, async (req, res) => {
+  try {
+    const coupon = await Coupon.findById(req.params.id);
+
+    if (!coupon) {
+      return res.status(404).json({
+        success: false,
+        message: "Coupon not found",
+      });
+    }
+
+    const {
+      discountType,
+      discountValue,
+      minimumOrder,
+      maximumDiscount,
+      paymentModes,
+      expiryDate,
+      assignedUserEmail,
+      referralBonus,
+    } = req.body;
+
+    if (!discountValue) {
+      return res.status(400).json({
+        success: false,
+        message: "Discount value is required",
+      });
+    }
+
+    const cleanAssignedEmail = String(assignedUserEmail || "")
+      .trim()
+      .toLowerCase();
+
+    if (cleanAssignedEmail) {
+      const ownerExists = await User.findOne({ email: cleanAssignedEmail });
+
+      if (!ownerExists) {
+        return res.status(400).json({
+          success: false,
+          message: `No registered customer found with email ${cleanAssignedEmail}`,
+        });
+      }
+    }
+
+    const requestedModes = Array.isArray(paymentModes)
+      ? paymentModes
+          .map((mode) => String(mode || "").trim().toLowerCase())
+          .filter((mode) => mode === "cod" || mode === "prepaid")
+      : [];
+    const cleanPaymentModes = [...new Set(requestedModes)];
+
+    if (cleanPaymentModes.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Please choose at least one payment method: COD, prepaid (online) or both",
+      });
+    }
+
+    coupon.discountType = discountType ?? coupon.discountType;
+    coupon.discountValue = discountValue;
+    coupon.minimumOrder = minimumOrder;
+    coupon.maximumDiscount = maximumDiscount;
+    coupon.paymentModes = cleanPaymentModes;
+    coupon.expiryDate = expiryDate;
+    coupon.assignedUserEmail = cleanAssignedEmail;
+    coupon.referralBonus = cleanAssignedEmail
+      ? Number(referralBonus) || 0
+      : 0;
+
+    await coupon.save();
+
+    res.json({
+      success: true,
+      message: "Coupon updated successfully",
+      coupon,
+    });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      message: error.message,
+    });
+  }
+});
+
 app.post("/api/products", requireAdmin, async (req, res) => {
   try {
     const error = validateProduct(req.body);
