@@ -829,6 +829,16 @@ const couponSchema = new mongoose.Schema(
       default: 0,
     },
 
+    // Which payment methods this coupon may be used with: "cod" (cash on
+    // delivery) and/or "prepaid" (razorpay / already-paid). Both = no
+    // restriction. Coupons created before this field existed keep working as
+    // "both" — see couponAllowedPaymentModes() below.
+    paymentModes: {
+      type: [String],
+      enum: ["cod", "prepaid"],
+      default: ["cod", "prepaid"],
+    },
+
     expiryDate: Date,
 
     active: {
@@ -1827,7 +1837,31 @@ const roundMoney = (amount) =>
 // account link, applied once from the profile/signup) is a completely
 // separate feature — see User.referredBy and creditReferralBonus — and is
 // never resolved through a code typed at checkout.
-const resolveCouponForOrder = async (couponCode, subtotal) => {
+// "prepaid" covers every way a customer can pay up-front (razorpay, or an
+// order the admin recorded as already-paid).
+const paymentModeForMethod = (paymentMethod) =>
+  String(paymentMethod || "").toLowerCase() === "cod" ? "cod" : "prepaid";
+
+// A coupon is usable on a payment method only when that method's mode is in
+// the coupon's paymentModes. Coupons without the field (created before this
+// existed) or with both modes behave exactly as before — no restriction.
+const couponAllowedPaymentModes = (coupon) => {
+  const configured = Array.isArray(coupon?.paymentModes)
+    ? coupon.paymentModes.map((mode) => String(mode).toLowerCase())
+    : [];
+
+  const modes = ["cod", "prepaid"].filter((mode) =>
+    configured.includes(mode)
+  );
+
+  return modes.length ? modes : ["cod", "prepaid"];
+};
+
+const resolveCouponForOrder = async (
+  couponCode,
+  subtotal,
+  paymentMethod = "razorpay"
+) => {
   const normalizedCoupon = normaliseCouponCode(couponCode);
 
   let discountAmount = 0;
@@ -1865,6 +1899,15 @@ const resolveCouponForOrder = async (couponCode, subtotal) => {
     if (subtotal < couponRecord.minimumOrder) {
       throw new Error(
         `Minimum order ₹${couponRecord.minimumOrder} for this coupon`
+      );
+    }
+
+    const paymentMode = paymentModeForMethod(paymentMethod);
+    if (!couponAllowedPaymentModes(couponRecord).includes(paymentMode)) {
+      throw new Error(
+        paymentMode === "cod"
+          ? "This coupon cannot be used on Cash on Delivery orders — please choose online payment"
+          : "This coupon can only be used on Cash on Delivery orders"
       );
     }
 
@@ -2015,7 +2058,7 @@ const buildOnlinePaymentQuote = async ({
   }
 
   const { normalizedCoupon, discountAmount, referralOwnerEmail, referralBonus } =
-    await resolveCouponForOrder(couponCode, subtotal);
+    await resolveCouponForOrder(couponCode, subtotal, paymentMethod);
 
   // Attach the free gift as a ₹0 line item. Stock is validated here and
   // decremented inside the payment transaction with the session items.
@@ -4578,6 +4621,7 @@ app.post("/api/coupons", requireAdmin, async (req, res) => {
       discountValue,
       minimumOrder,
       maximumDiscount,
+      paymentModes,
       expiryDate,
       assignedUserEmail,
       referralBonus,
@@ -4616,12 +4660,31 @@ app.post("/api/coupons", requireAdmin, async (req, res) => {
       }
     }
 
+    // Which payment methods this coupon works with: "cod" / "prepaid" /
+    // both. Anything unrecognised (or missing) means "both", so old API
+    // callers and older coupon data keep working unchanged.
+    const requestedModes = Array.isArray(paymentModes)
+      ? paymentModes
+          .map((mode) => String(mode || "").trim().toLowerCase())
+          .filter((mode) => mode === "cod" || mode === "prepaid")
+      : [];
+    const cleanPaymentModes = [...new Set(requestedModes)];
+
+    if (cleanPaymentModes.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Please choose at least one payment method: COD, prepaid (online) or both",
+      });
+    }
+
     const coupon = await Coupon.create({
       code: code.toUpperCase(),
       discountType,
       discountValue,
       minimumOrder,
       maximumDiscount,
+      paymentModes: cleanPaymentModes,
       expiryDate,
       assignedUserEmail: cleanAssignedEmail,
       referralBonus: cleanAssignedEmail ? Number(referralBonus) || 0 : 0,
@@ -5021,7 +5084,7 @@ app.post("/api/admin/orders", requireAdmin, async (req, res) => {
       }
 
       const { normalizedCoupon, discountAmount, referralOwnerEmail, referralBonus } =
-        await resolveCouponForOrder(couponCode, subtotal);
+        await resolveCouponForOrder(couponCode, subtotal, paymentMethod);
 
       const deliveryFee = subtotal >= 499 ? 0 : 59;
       // Full price always charged — discountAmount becomes cashback, credited
@@ -5257,7 +5320,7 @@ app.post(
 
 app.post("/api/coupons/apply", async (req, res) => {
   try {
-    const { code, subtotal } = req.body;
+    const { code, subtotal, paymentMethod } = req.body;
     const normalizedCode = String(code || "").trim().toUpperCase();
 
     const coupon = await Coupon.findOne({
@@ -5289,6 +5352,24 @@ app.post("/api/coupons/apply", async (req, res) => {
       });
     }
 
+    // Payment-mode restriction (COD only / prepaid only / both). The checkout
+    // sends the method it is about to use so the customer finds out here —
+    // not later, at order time.
+    const allowedPaymentModes = couponAllowedPaymentModes(coupon);
+
+    if (
+      paymentMethod &&
+      !allowedPaymentModes.includes(paymentModeForMethod(paymentMethod))
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          paymentModeForMethod(paymentMethod) === "cod"
+            ? "This coupon cannot be used on Cash on Delivery orders — please choose online payment"
+            : "This coupon can only be used on Cash on Delivery orders",
+      });
+    }
+
     let discount = 0;
 
     if (coupon.discountType === "percentage") {
@@ -5309,6 +5390,7 @@ app.post("/api/coupons/apply", async (req, res) => {
       success: true,
       coupon,
       discount,
+      paymentModes: allowedPaymentModes,
     });
 
   } catch (err) {
