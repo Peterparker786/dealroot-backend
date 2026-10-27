@@ -1499,6 +1499,61 @@ const WalletTransaction = mongoose.model(
   walletTransactionSchema
 );
 
+// Store-wide settings the admin can change without a deploy, kept in a single
+// document (key: "store"). The delivery charge lives here so online checkout,
+// the COD prepayment and admin-created orders all read one number instead of
+// each hardcoding it.
+const STORE_SETTINGS_KEY = "store";
+const DEFAULT_DELIVERY_FEE = 59;
+// Orders at or above this subtotal always ship free (this is also the point
+// where Cash on Delivery stops being offered).
+const FREE_DELIVERY_THRESHOLD = 499;
+
+const storeSettingsSchema = new mongoose.Schema(
+  {
+    key: { type: String, required: true, unique: true },
+    deliveryFee: {
+      type: Number,
+      default: DEFAULT_DELIVERY_FEE,
+      min: 0,
+      max: 1000,
+    },
+  },
+  { timestamps: true }
+);
+
+const StoreSettings = mongoose.model("StoreSettings", storeSettingsSchema);
+
+const getStoreSettings = async () => {
+  let record = null;
+
+  try {
+    record = await StoreSettings.findOne({ key: STORE_SETTINGS_KEY }).lean();
+  } catch (error) {
+    // A settings read must never break checkout — fall back to the default.
+    console.error("Store settings could not be read:", error.message);
+  }
+
+  const savedFee = Number(record?.deliveryFee);
+
+  return {
+    deliveryFee:
+      Number.isFinite(savedFee) && savedFee > 0
+        ? savedFee
+        : DEFAULT_DELIVERY_FEE,
+    freeDeliveryThreshold: FREE_DELIVERY_THRESHOLD,
+  };
+};
+
+// Delivery is free from the threshold up; below it the admin-set charge applies.
+const deliveryFeeFor = async (subtotal) => {
+  if (subtotal >= FREE_DELIVERY_THRESHOLD) return 0;
+
+  const { deliveryFee } = await getStoreSettings();
+
+  return roundMoney(deliveryFee);
+};
+
 // Builds this user's permanent personal referral code from their first
 // name (e.g. "Mahi Sharma" -> "MAHI50"), falling back to the email's local
 // part if the name is unusable. Appends an incrementing number instead of
@@ -2077,7 +2132,7 @@ const buildOnlinePaymentQuote = async ({
     });
   }
 
-  const deliveryFee = subtotal >= 499 ? 0 : 59;
+  const deliveryFee = await deliveryFeeFor(subtotal);
   // Coupons no longer discount the order upfront — the full price is always
   // charged, and `discountAmount` (computed above) is instead credited to
   // the buyer's wallet as cashback once the order is delivered (see the
@@ -3408,6 +3463,21 @@ app.post("/api/orders/track", async (req, res) => {
   }
 });
 
+// The storefront reads this to show the live delivery charge (cart, checkout
+// summary) instead of a hardcoded number that drifts from what is charged.
+app.get("/api/store-settings", async (req, res) => {
+  try {
+    const settings = await getStoreSettings();
+
+    res.json({ success: true, ...settings });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Could not load store settings",
+    });
+  }
+});
+
 app.get("/api/products", async (req, res) => {
   try {
     const { category, search, featured, dealType } = req.query;
@@ -4703,6 +4773,44 @@ app.post("/api/coupons", requireAdmin, async (req, res) => {
   }
 });
 
+app.put("/api/admin/store-settings", requireAdmin, async (req, res) => {
+  try {
+    const deliveryFee = Number(req.body?.deliveryFee);
+
+    // ₹0 would leave a COD order with nothing to prepay online, which the
+    // Razorpay flow cannot handle — so the admin range starts at ₹1.
+    if (
+      !Number.isInteger(deliveryFee) ||
+      deliveryFee < 1 ||
+      deliveryFee > 1000
+    ) {
+      throw new Error(
+        "Delivery charge must be a whole number between ₹1 and ₹1000"
+      );
+    }
+
+    const saved = await StoreSettings.findOneAndUpdate(
+      { key: STORE_SETTINGS_KEY },
+      { $set: { deliveryFee } },
+      { new: true, upsert: true, runValidators: true }
+    );
+
+    res.json({
+      success: true,
+      message: `Delivery charge updated to ₹${saved.deliveryFee}`,
+      deliveryFee: saved.deliveryFee,
+      freeDeliveryThreshold: FREE_DELIVERY_THRESHOLD,
+    });
+  } catch (error) {
+    console.error("Store settings update failed:", error.message);
+
+    res.status(error.statusCode || 400).json({
+      success: false,
+      message: error.message || "Could not save the delivery charge",
+    });
+  }
+});
+
 // Admin-only: carries assignedUserEmail (PII) so this list is no longer public.
 app.get("/api/coupons", requireAdmin, async (req, res) => {
   const coupons = await Coupon.find().sort({
@@ -5086,7 +5194,7 @@ app.post("/api/admin/orders", requireAdmin, async (req, res) => {
       const { normalizedCoupon, discountAmount, referralOwnerEmail, referralBonus } =
         await resolveCouponForOrder(couponCode, subtotal, paymentMethod);
 
-      const deliveryFee = subtotal >= 499 ? 0 : 59;
+      const deliveryFee = await deliveryFeeFor(subtotal);
       // Full price always charged — discountAmount becomes cashback, credited
       // to the buyer's wallet once this order is marked delivered.
       const totalAmount = roundMoney(subtotal + deliveryFee);
@@ -6088,7 +6196,7 @@ app.post("/api/orders", requireUser, async (req, res) => {
       }
 
       const normalizedCity = cleanCustomer.city
-      const deliveryFee = subtotal >= 499 ? 0 : 59;
+      const deliveryFee = await deliveryFeeFor(subtotal);
 
       // This endpoint only ever creates Cash on Delivery orders — block it
       // outright once the cart hits the free-delivery threshold, same rule
