@@ -861,6 +861,16 @@ const couponSchema = new mongoose.Schema(
       default: 0,
       min: 0,
     },
+    usageCount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    maxUses: {
+      type: Number,
+      min: 1,
+      default: null,
+    },
   },
   { timestamps: true }
 );
@@ -4710,6 +4720,7 @@ app.post("/api/coupons", requireAdmin, async (req, res) => {
       expiryDate,
       assignedUserEmail,
       referralBonus,
+      maxUses,
     } = req.body;
 
     if (!code || !discountValue) {
@@ -4773,6 +4784,7 @@ app.post("/api/coupons", requireAdmin, async (req, res) => {
       expiryDate,
       assignedUserEmail: cleanAssignedEmail,
       referralBonus: cleanAssignedEmail ? Number(referralBonus) || 0 : 0,
+      maxUses: maxUses !== undefined ? Number(maxUses) : null,
     });
 
     res.status(201).json({
@@ -5571,6 +5583,7 @@ app.put("/api/coupons/:id", requireAdmin, async (req, res) => {
       expiryDate,
       assignedUserEmail,
       referralBonus,
+      maxUses,
     } = req.body;
 
     if (!discountValue) {
@@ -5620,6 +5633,7 @@ app.put("/api/coupons/:id", requireAdmin, async (req, res) => {
     coupon.referralBonus = cleanAssignedEmail
       ? Number(referralBonus) || 0
       : 0;
+    coupon.maxUses = maxUses !== undefined ? Number(maxUses) : null;
 
     await coupon.save();
 
