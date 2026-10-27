@@ -1985,7 +1985,13 @@ const resolveCouponForOrder = async (
       referralOwnerEmail = couponRecord.assignedUserEmail;
       referralBonus = couponRecord.referralBonus;
     }
-  }
+
+    // Check max usage limit
+    if (couponRecord.maxUses && couponRecord.usageCount >= couponRecord.maxUses) {
+      throw new Error(
+        `This coupon can only be used ${couponRecord.maxUses} time${couponRecord.maxUses > 1 ? "s" : ""} — limit reached`
+      );
+    }
 
   return {
     normalizedCoupon,
@@ -1998,6 +2004,15 @@ const resolveCouponForOrder = async (
 // Free-gift offer: carts worth ₹499+ can attach one product priced up to
 // ₹99 (and in stock) as a FREE gift. Shared validation for every order path.
 const FREE_GIFT_MIN_SUBTOTAL = 499;
+
+// Increment coupon usage count after a successful order placement
+const incrementCouponUsage = async (couponCode) => {
+  await Coupon.updateOne({ code: couponCode }, { $inc: { usageCount: 1 } });
+};
+
+// Resolve a coupon code for an order, returning discount info and optionally
+// incrementing the usage count. Callers that want usage tracking should
+// call `await incrementCouponUsage(normalizedCoupon)` after the order is saved.
 const FREE_GIFT_MAX_PRICE = 99;
 
 const resolveFreeGift = async (giftProductId, subtotal) => {
