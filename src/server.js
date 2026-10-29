@@ -4926,6 +4926,8 @@ app.get("/api/admin/sales-stats", requireAdmin, async (req, res) => {
 
     let totalCashbackGiven = 0;
 
+    let totalRazorpayFees = 0;
+
     let orderCount = 0;
 
 
@@ -4941,37 +4943,33 @@ app.get("/api/admin/sales-stats", requireAdmin, async (req, res) => {
 
 
     orders.forEach(order => {
+      const orderRevenue = order.totalAmount || 0;
+      const deliveryFee = order.deliveryFee || 0;
+      const cashback = order.discountAmount || 0;
 
-      // Subtotal = totalAmount - deliveryFee
+      // Razorpay only charges the part actually paid online: the full amount
+      // for prepaid orders, and just the prepaid delivery charge for COD.
+      const onlinePaid =
+        order.paymentMethod === "razorpay"
+          ? Math.max(orderRevenue - (order.walletUsed || 0), 0)
+          : order.deliveryChargePaid
+            ? Math.max(order.deliveryChargeAmount || 0, 0)
+            : 0;
 
-      const subtotal = order.totalAmount - order.deliveryFee;
+      const razorpayFee = Math.round(onlinePaid * 0.02);
 
-      
-      // Cashback given = discountAmount (coupon discount)
+      // Profit = what the customer paid
+      //          - delivery charge (goes to the courier)
+      //          - Razorpay fee (2% of the online-paid amount)
+      //          - cashback credited to the customer's wallet
+      const orderProfit =
+        orderRevenue - deliveryFee - razorpayFee - cashback;
 
-      totalCashbackGiven += (order.discountAmount || 0);
-
-
-
-      // Revenue before deductions: subtotal + deliveryFee - cashback given
-
-      // But we need to account for Razorpay fee (2%) and wallet cashback
-
-      
-      // Profit calculation:
-      // - Revenue: subtotal + deliveryFee (what customer paid)
-      // - Deductions:
-      //   • Razorpay fee: 2% of (subtotal + deliveryFee) 
-      //   • Wallet cashback given: discountAmount
-      // Profit = Revenue - RazorpayFee - WalletCashback
-      
-      const orderRevenue = subtotal + order.deliveryFee;
-      const razorpayFee = Math.round(orderRevenue * 0.02); // 2% Razorpay deduction
-      const orderProfit = orderRevenue - razorpayFee - (order.discountAmount || 0);
-      
       totalSales += orderRevenue;
       totalProfit += orderProfit;
-      totalDeliveryFees += order.deliveryFee;
+      totalDeliveryFees += deliveryFee;
+      totalCashbackGiven += cashback;
+      totalRazorpayFees += razorpayFee;
       orderCount++;
     });
 
@@ -4986,6 +4984,7 @@ app.get("/api/admin/sales-stats", requireAdmin, async (req, res) => {
         totalProfit: totalProfit,
         totalDeliveryFees: totalDeliveryFees,
         totalCashbackGiven: totalCashbackGiven,
+        totalRazorpayFees: totalRazorpayFees,
         avgOrderValue: avgOrderValue,
         razorPayDeductionRate: 2, // 2%
         freeDeliveryThreshold: freeDeliveryThreshold
