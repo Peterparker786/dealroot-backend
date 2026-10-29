@@ -4903,16 +4903,25 @@ app.put("/api/admin/store-settings", requireAdmin, async (req, res) => {
 // Admin-only: Sales statistics endpoint
 
 app.get("/api/admin/sales-stats", requireAdmin, async (req, res) => {
-
   try {
+    // "all" (default) | "7d" | "30d" | "1y"
+    const range = String(req.query.range || "all").toLowerCase();
 
-    // Get all orders with status delivered or completed
+    const RANGE_DAYS = { "7d": 7, "30d": 30, "1y": 365 };
+    const days = RANGE_DAYS[range] || null;
 
-    const orders = await Order.find({
+    const since = days
+      ? new Date(Date.now() - days * 24 * 60 * 60 * 1000)
+      : null;
 
-      orderStatus: { $in: ["delivered", "completed"] }
+    // Get delivered/completed orders inside the selected window
+    const orderQuery = { orderStatus: { $in: ["delivered", "completed"] } };
 
-    }).sort({ createdAt: -1 });
+    if (since) {
+      orderQuery.createdAt = { $gte: since };
+    }
+
+    const orders = await Order.find(orderQuery).sort({ createdAt: -1 });
 
 
 
@@ -4987,7 +4996,9 @@ app.get("/api/admin/sales-stats", requireAdmin, async (req, res) => {
         totalRazorpayFees: totalRazorpayFees,
         avgOrderValue: avgOrderValue,
         razorPayDeductionRate: 2, // 2%
-        freeDeliveryThreshold: freeDeliveryThreshold
+        freeDeliveryThreshold: freeDeliveryThreshold,
+        range,
+        since: since ? since.toISOString() : null
       }
     });
   } catch (error) {
