@@ -1534,6 +1534,20 @@ const storeSettingsSchema = new mongoose.Schema(
 
 const StoreSettings = mongoose.model("StoreSettings", storeSettingsSchema);
 
+// Manual book-keeping entries the admin adds from the Sales tab: offline
+// sales (money in) and extra expenses (money out). Not tied to any order.
+const salesEntrySchema = new mongoose.Schema(
+  {
+    type: { type: String, enum: ["income", "expense"], required: true },
+    amount: { type: Number, required: true, min: 1 },
+    note: { type: String, default: "", trim: true },
+    date: { type: Date, default: Date.now },
+  },
+  { timestamps: true }
+);
+
+const SalesEntry = mongoose.model("SalesEntry", salesEntrySchema);
+
 const getStoreSettings = async () => {
   let record = null;
 
@@ -4900,6 +4914,98 @@ app.put("/api/admin/store-settings", requireAdmin, async (req, res) => {
   }
 });
 
+// Shared by the sales-stats and manual-entry endpoints: "all" (default) |
+// "7d" | "30d" | "1y" → a cutoff date (or null for everything).
+const salesRangeSince = (rangeValue) => {
+  const range = String(rangeValue || "all").toLowerCase();
+  const RANGE_DAYS = { "7d": 7, "30d": 30, "1y": 365 };
+  const days = RANGE_DAYS[range] || null;
+
+  return days ? new Date(Date.now() - days * 24 * 60 * 60 * 1000) : null;
+};
+
+// Admin-only: manual offline sales / extra expense entries for the Sales tab.
+app.get("/api/admin/sales-entries", requireAdmin, async (req, res) => {
+  try {
+    const since = salesRangeSince(req.query.range);
+    const query = since ? { date: { $gte: since } } : {};
+
+    const entries = await SalesEntry.find(query).sort({ date: -1, createdAt: -1 });
+
+    res.json({ success: true, entries });
+  } catch (error) {
+    console.error("Sales entries load failed:", error.message);
+    res.status(500).json({
+      success: false,
+      message: "Could not load entries",
+    });
+  }
+});
+
+app.post("/api/admin/sales-entries", requireAdmin, async (req, res) => {
+  try {
+    const type = String(req.body?.type || "").toLowerCase();
+    const amount = Number(req.body?.amount);
+
+    if (!["income", "expense"].includes(type)) {
+      return res.status(400).json({
+        success: false,
+        message: "Pick whether this is an offline sale or an expense",
+      });
+    }
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Amount must be greater than zero",
+      });
+    }
+
+    const rawDate = req.body?.date ? new Date(req.body.date) : new Date();
+
+    const entry = await SalesEntry.create({
+      type,
+      amount: Math.round(amount * 100) / 100,
+      note: String(req.body?.note || "").trim().slice(0, 300),
+      date: Number.isNaN(rawDate.getTime()) ? new Date() : rawDate,
+    });
+
+    res.status(201).json({
+      success: true,
+      entry,
+      message: type === "income" ? "Offline sale added" : "Expense added",
+    });
+  } catch (error) {
+    console.error("Sales entry create failed:", error.message);
+    res.status(500).json({
+      success: false,
+      message: "Could not save this entry",
+    });
+  }
+});
+
+app.delete("/api/admin/sales-entries/:id", requireAdmin, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Invalid entry" });
+    }
+
+    const deleted = await SalesEntry.findByIdAndDelete(req.params.id);
+
+    if (!deleted) {
+      return res.status(404).json({ success: false, message: "Entry not found" });
+    }
+
+    res.json({ success: true, message: "Entry deleted" });
+  } catch (error) {
+    console.error("Sales entry delete failed:", error.message);
+    res.status(500).json({
+      success: false,
+      message: "Could not delete this entry",
+    });
+  }
+});
+
 // Admin-only: Sales statistics endpoint
 
 app.get("/api/admin/sales-stats", requireAdmin, async (req, res) => {
@@ -4907,12 +5013,7 @@ app.get("/api/admin/sales-stats", requireAdmin, async (req, res) => {
     // "all" (default) | "7d" | "30d" | "1y"
     const range = String(req.query.range || "all").toLowerCase();
 
-    const RANGE_DAYS = { "7d": 7, "30d": 30, "1y": 365 };
-    const days = RANGE_DAYS[range] || null;
-
-    const since = days
-      ? new Date(Date.now() - days * 24 * 60 * 60 * 1000)
-      : null;
+    const since = salesRangeSince(range);
 
     // Get delivered/completed orders inside the selected window
     const orderQuery = { orderStatus: { $in: ["delivered", "completed"] } };
@@ -4982,6 +5083,21 @@ app.get("/api/admin/sales-stats", requireAdmin, async (req, res) => {
       orderCount++;
     });
 
+    // Manual offline sales / extra expenses inside the same window.
+    const entryQuery = since ? { date: { $gte: since } } : {};
+    const manualEntries = await SalesEntry.find(entryQuery);
+
+    let offlineIncome = 0;
+    let extraExpenses = 0;
+
+    manualEntries.forEach((entry) => {
+      if (entry.type === "income") {
+        offlineIncome += entry.amount || 0;
+      } else {
+        extraExpenses += entry.amount || 0;
+      }
+    });
+
     // Calculate average order value
     const avgOrderValue = orderCount > 0 ? Math.round(totalSales / orderCount) : 0;
 
@@ -4994,6 +5110,10 @@ app.get("/api/admin/sales-stats", requireAdmin, async (req, res) => {
         totalDeliveryFees: totalDeliveryFees,
         totalCashbackGiven: totalCashbackGiven,
         totalRazorpayFees: totalRazorpayFees,
+        offlineIncome: offlineIncome,
+        extraExpenses: extraExpenses,
+        // Online profit + offline sales income − manual expenses
+        netProfit: totalProfit + offlineIncome - extraExpenses,
         avgOrderValue: avgOrderValue,
         razorPayDeductionRate: 2, // 2%
         freeDeliveryThreshold: freeDeliveryThreshold,
