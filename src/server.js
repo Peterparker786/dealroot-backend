@@ -2002,6 +2002,7 @@ const resolveCouponForOrder = async (
         `This coupon can only be used ${couponRecord.maxUses} time${couponRecord.maxUses > 1 ? "s" : ""} — limit reached`
       );
     }
+  }
 
   return {
     normalizedCoupon,
@@ -4828,6 +4829,15 @@ app.put("/api/admin/store-settings", requireAdmin, async (req, res) => {
       deliveryFee: saved.deliveryFee,
       freeDeliveryThreshold: FREE_DELIVERY_THRESHOLD,
     });
+  } catch (error) {
+    console.error("Store settings update failed:", error.message);
+
+    res.status(error.statusCode || 400).json({
+      success: false,
+      message: error.message || "Could not save the delivery charge",
+    });
+  }
+});
 
 // Admin-only: Sales statistics endpoint
 
@@ -4925,15 +4935,6 @@ app.get("/api/admin/sales-stats", requireAdmin, async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Could not fetch sales statistics"
-    });
-  }
-});
-  } catch (error) {
-    console.error("Store settings update failed:", error.message);
-
-    res.status(error.statusCode || 400).json({
-      success: false,
-      message: error.message || "Could not save the delivery charge",
     });
   }
 });
