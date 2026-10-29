@@ -5460,6 +5460,7 @@ app.post("/api/admin/orders", requireAdmin, async (req, res) => {
     useWallet = false,
     sendEmail = true,
     orderNumber: customOrderNumber = "",
+    guest = false, // allow an order for someone without a DEALROOT account
   } = req.body;
 
   const normalizedEmail = String(userEmail || "").trim().toLowerCase();
@@ -5502,10 +5503,16 @@ app.post("/api/admin/orders", requireAdmin, async (req, res) => {
 
   try {
     const foundUser = await User.findOne({ email: normalizedEmail });
+    // A guest order is someone who ordered over the phone/WhatsApp and does
+    // not want a DEALROOT account — the admin still enters their email and
+    // address, the confirmation mail goes to them, and the order shows up in
+    // the Orders list. If the email does belong to an account we still link
+    // it, so the order also appears in their profile.
+    const isGuestOrder = Boolean(guest) && !foundUser;
 
-    if (!foundUser) {
+    if (!foundUser && !isGuestOrder) {
       throw new Error(
-        "No registered customer found with that email. Ask them to sign up first."
+        "No registered customer found with that email. Ask them to sign up first, or switch to a guest order."
       );
     }
 
@@ -5614,8 +5621,8 @@ app.post("/api/admin/orders", requireAdmin, async (req, res) => {
       // order's subtotal (not counting delivery/COD fee) as cashback once
       // delivered — same as the real checkout path (see
       // buildOnlinePaymentQuote).
-      const referralOwnerUser = foundUser.referredBy || null;
-      const referralCodeUsed = foundUser.referredByCode || "";
+      const referralOwnerUser = foundUser?.referredBy || null;
+      const referralCodeUsed = foundUser?.referredByCode || "";
       const referralShareAmount = referralOwnerUser
         ? roundMoney(subtotal * 0.5)
         : 0;
@@ -5628,6 +5635,7 @@ app.post("/api/admin/orders", requireAdmin, async (req, res) => {
       let codAmount = paymentMethod === "cod" ? totalAmount : 0;
 
       if (
+        foundUser &&
         useWallet &&
         paymentMethod === "cod" &&
         codAmount > 0 &&
@@ -5664,7 +5672,7 @@ app.post("/api/admin/orders", requireAdmin, async (req, res) => {
         [
           {
             orderNumber: trimmedOrderNumber || createOrderNumber(),
-            user: foundUser._id,
+            user: foundUser?._id || null,
             customer: cleanCustomer,
             items: orderItems,
             deliveryFee,
