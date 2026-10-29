@@ -5083,6 +5083,85 @@ app.get("/api/admin/sales-stats", requireAdmin, async (req, res) => {
       orderCount++;
     });
 
+    // ---- Sales trend + top products for the dashboard charts ----
+    const dayKey = (date) => date.toISOString().slice(0, 10);
+    const monthKey = (date) => date.toISOString().slice(0, 7);
+    const useMonthly = range === "1y" || range === "all";
+
+    const timelineMap = new Map();
+
+    if (useMonthly) {
+      for (let i = 11; i >= 0; i--) {
+        const d = new Date();
+        d.setDate(1);
+        d.setMonth(d.getMonth() - i);
+        timelineMap.set(monthKey(d), {
+          key: monthKey(d),
+          label: d.toLocaleDateString("en-IN", { month: "short", year: "2-digit" }),
+          sales: 0,
+          profit: 0,
+          orders: 0,
+        });
+      }
+    } else {
+      const totalDays = range === "30d" ? 30 : 7;
+
+      for (let i = totalDays - 1; i >= 0; i--) {
+        const d = new Date();
+        d.setHours(0, 0, 0, 0);
+        d.setDate(d.getDate() - i);
+        timelineMap.set(dayKey(d), {
+          key: dayKey(d),
+          label: d.toLocaleDateString("en-IN", { day: "numeric", month: "short" }),
+          sales: 0,
+          profit: 0,
+          orders: 0,
+        });
+      }
+    }
+
+    const productTotals = new Map();
+
+    orders.forEach((order) => {
+      const created = new Date(order.createdAt);
+      const key = useMonthly ? monthKey(created) : dayKey(created);
+      const bucket = timelineMap.get(key);
+
+      if (bucket) {
+        bucket.sales += order.totalAmount || 0;
+        bucket.orders += 1;
+      }
+
+      (order.items || []).forEach((item) => {
+        if (!item || item.freeGift) return;
+
+        const productId = String(item.product || item.title || "");
+        const entry = productTotals.get(productId) || {
+          title: item.title || "Product",
+          brand: item.brand || "",
+          image: (item.images && item.images[0]) || "",
+          qty: 0,
+          revenue: 0,
+        };
+
+        entry.qty += Number(item.quantity) || 0;
+        entry.revenue +=
+          Number(item.subtotal) || Number(item.price) * Number(item.quantity) || 0;
+
+        productTotals.set(productId, entry);
+      });
+    });
+
+    const timeline = [...timelineMap.values()];
+
+    const topProducts = [...productTotals.values()]
+      .sort((a, b) => b.qty - a.qty || b.revenue - a.revenue)
+      .slice(0, 5)
+      .map((product) => ({
+        ...product,
+        revenue: Math.round(product.revenue),
+      }));
+
     // Manual offline sales / extra expenses inside the same window.
     const entryQuery = since ? { date: { $gte: since } } : {};
     const manualEntries = await SalesEntry.find(entryQuery);
@@ -5114,6 +5193,8 @@ app.get("/api/admin/sales-stats", requireAdmin, async (req, res) => {
         extraExpenses: extraExpenses,
         // Online profit + offline sales income − manual expenses
         netProfit: totalProfit + offlineIncome - extraExpenses,
+        timeline: timeline,
+        topProducts: topProducts,
         avgOrderValue: avgOrderValue,
         razorPayDeductionRate: 2, // 2%
         freeDeliveryThreshold: freeDeliveryThreshold,
