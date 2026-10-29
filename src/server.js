@@ -2017,8 +2017,18 @@ const resolveCouponForOrder = async (
 const FREE_GIFT_MIN_SUBTOTAL = 499;
 
 // Increment coupon usage count after a successful order placement
-const incrementCouponUsage = async (couponCode) => {
-  await Coupon.updateOne({ code: couponCode }, { $inc: { usageCount: 1 } });
+const incrementCouponUsage = async (couponCode, session) => {
+  const code = normaliseCouponCode(couponCode);
+
+  // No coupon used (or a built-in code like WELCOME10 that is not stored as a
+  // Coupon document) — nothing to count.
+  if (!code) return;
+
+  await Coupon.updateOne(
+    { code },
+    { $inc: { usageCount: 1 } },
+    session ? { session } : {}
+  );
 };
 
 // Resolve a coupon code for an order, returning discount info and optionally
@@ -2425,6 +2435,17 @@ codAmount: currentPaymentSession.codAmount,
         ],
         { session: databaseSession }
       );
+
+      // Count this order against the coupon's usage limit. A counting failure
+      // must never roll back an order the customer has already paid for.
+      try {
+        await incrementCouponUsage(
+          currentPaymentSession.couponCode,
+          databaseSession
+        );
+      } catch (error) {
+        console.error("Coupon usage increment failed:", error.message);
+      }
 
       currentPaymentSession.status = "paid";
       currentPaymentSession.razorpayPaymentId = payment.id;
@@ -5412,6 +5433,12 @@ app.post("/api/admin/orders", requireAdmin, async (req, res) => {
         { session }
       );
 
+      try {
+        await incrementCouponUsage(normalizedCoupon, session);
+      } catch (error) {
+        console.error("Coupon usage increment failed:", error.message);
+      }
+
       if (referralOwnerEmail && referralBonus > 0) {
         const referralOwner = await User.findOne({
           email: referralOwnerEmail,
@@ -6346,6 +6373,19 @@ app.post("/api/orders", requireUser, async (req, res) => {
           );
         }
 
+        // Same usage-limit rule as resolveCouponForOrder, which this COD path
+        // predates and therefore never applied.
+        if (
+          couponRecord.maxUses &&
+          couponRecord.usageCount >= couponRecord.maxUses
+        ) {
+          throw new Error(
+            `This coupon can only be used ${couponRecord.maxUses} time${
+              couponRecord.maxUses > 1 ? "s" : ""
+            } — limit reached`
+          );
+        }
+
         if (couponRecord.discountType === "percentage") {
           discountAmount = Math.round(
             (subtotal * couponRecord.discountValue) / 100
@@ -6386,6 +6426,12 @@ app.post("/api/orders", requireUser, async (req, res) => {
         ],
         { session }
       );
+
+      try {
+        await incrementCouponUsage(normalizedCoupon, session);
+      } catch (error) {
+        console.error("Coupon usage increment failed:", error.message);
+      }
 
       if (req.user?.userId) {
         await User.findByIdAndUpdate(
