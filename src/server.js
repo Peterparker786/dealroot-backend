@@ -4828,6 +4828,106 @@ app.put("/api/admin/store-settings", requireAdmin, async (req, res) => {
       deliveryFee: saved.deliveryFee,
       freeDeliveryThreshold: FREE_DELIVERY_THRESHOLD,
     });
+
+// Admin-only: Sales statistics endpoint
+
+app.get("/api/admin/sales-stats", requireAdmin, async (req, res) => {
+
+  try {
+
+    // Get all orders with status delivered or completed
+
+    const orders = await Order.find({
+
+      orderStatus: { $in: ["delivered", "completed"] }
+
+    }).sort({ createdAt: -1 });
+
+
+
+    // Calculate total sales
+
+    let totalSales = 0;
+
+    let totalProfit = 0;
+
+    let totalDeliveryFees = 0;
+
+    let totalCashbackGiven = 0;
+
+    let orderCount = 0;
+
+
+
+    // Get store settings for delivery fee and thresholds
+
+    const storeSettings = await getStoreSettings();
+
+    const deliveryFee = storeSettings.deliveryFee;
+
+    const freeDeliveryThreshold = FREE_DELIVERY_THRESHOLD;
+
+
+
+    orders.forEach(order => {
+
+      // Subtotal = totalAmount - deliveryFee
+
+      const subtotal = order.totalAmount - order.deliveryFee;
+
+      
+      // Cashback given = discountAmount (coupon discount)
+
+      totalCashbackGiven += (order.discountAmount || 0);
+
+
+
+      // Revenue before deductions: subtotal + deliveryFee - cashback given
+
+      // But we need to account for Razorpay fee (2%) and wallet cashback
+
+      
+      // Profit calculation:
+      // - Revenue: subtotal + deliveryFee (what customer paid)
+      // - Deductions:
+      //   • Razorpay fee: 2% of (subtotal + deliveryFee) 
+      //   • Wallet cashback given: discountAmount
+      // Profit = Revenue - RazorpayFee - WalletCashback
+      
+      const orderRevenue = subtotal + order.deliveryFee;
+      const razorpayFee = Math.round(orderRevenue * 0.02); // 2% Razorpay deduction
+      const orderProfit = orderRevenue - razorpayFee - (order.discountAmount || 0);
+      
+      totalSales += orderRevenue;
+      totalProfit += orderProfit;
+      totalDeliveryFees += order.deliveryFee;
+      orderCount++;
+    });
+
+    // Calculate average order value
+    const avgOrderValue = orderCount > 0 ? Math.round(totalSales / orderCount) : 0;
+
+    res.json({
+      success: true,
+      stats: {
+        totalOrders: orderCount,
+        totalSales: totalSales,
+        totalProfit: totalProfit,
+        totalDeliveryFees: totalDeliveryFees,
+        totalCashbackGiven: totalCashbackGiven,
+        avgOrderValue: avgOrderValue,
+        razorPayDeductionRate: 2, // 2%
+        freeDeliveryThreshold: freeDeliveryThreshold
+      }
+    });
+  } catch (error) {
+    console.error("Sales stats error:", error.message);
+    res.status(500).json({
+      success: false,
+      message: "Could not fetch sales statistics"
+    });
+  }
+});
   } catch (error) {
     console.error("Store settings update failed:", error.message);
 
