@@ -1922,10 +1922,24 @@ const couponAllowedPaymentModes = (coupon) => {
   return modes.length ? modes : ["cod", "prepaid"];
 };
 
+// How many times this customer (matched by the email on their order) has
+// already used the coupon.
+const couponUsageForEmail = (couponRecord, email) => {
+  const normalized = String(email || "").trim().toLowerCase();
+  if (!normalized) return 0;
+
+  const entry = (couponRecord.perUserUsage || []).find(
+    (usage) => usage.email === normalized
+  );
+
+  return entry ? entry.count : 0;
+};
+
 const resolveCouponForOrder = async (
   couponCode,
   subtotal,
-  paymentMethod = "razorpay"
+  paymentMethod = "razorpay",
+  customerEmail = ""
 ) => {
   const normalizedCoupon = normaliseCouponCode(couponCode);
 
@@ -1996,10 +2010,15 @@ const resolveCouponForOrder = async (
       referralBonus = couponRecord.referralBonus;
     }
 
-    // Check max usage limit
-    if (couponRecord.maxUses && couponRecord.usageCount >= couponRecord.maxUses) {
+    // Per-customer usage limit. usageCount (global) is only a total counter.
+    if (
+      couponRecord.maxUses &&
+      couponUsageForEmail(couponRecord, customerEmail) >= couponRecord.maxUses
+    ) {
       throw new Error(
-        `This coupon can only be used ${couponRecord.maxUses} time${couponRecord.maxUses > 1 ? "s" : ""} — limit reached`
+        `You have already used this coupon the maximum ${couponRecord.maxUses} time${
+          couponRecord.maxUses > 1 ? "s" : ""
+        }`
       );
     }
   }
@@ -2017,18 +2036,33 @@ const resolveCouponForOrder = async (
 const FREE_GIFT_MIN_SUBTOTAL = 499;
 
 // Increment coupon usage count after a successful order placement
-const incrementCouponUsage = async (couponCode, session) => {
+const incrementCouponUsage = async (couponCode, customerEmail, session) => {
   const code = normaliseCouponCode(couponCode);
 
   // No coupon used (or a built-in code like WELCOME10 that is not stored as a
   // Coupon document) — nothing to count.
   if (!code) return;
 
-  await Coupon.updateOne(
-    { code },
-    { $inc: { usageCount: 1 } },
-    session ? { session } : {}
+  const options = session ? { session } : {};
+
+  await Coupon.updateOne({ code }, { $inc: { usageCount: 1 } }, options);
+
+  const email = String(customerEmail || "").trim().toLowerCase();
+  if (!email) return;
+
+  const bumped = await Coupon.updateOne(
+    { code, "perUserUsage.email": email },
+    { $inc: { "perUserUsage.$.count": 1 } },
+    options
   );
+
+  if (!bumped.matchedCount) {
+    await Coupon.updateOne(
+      { code },
+      { $push: { perUserUsage: { email, count: 1 } } },
+      options
+    );
+  }
 };
 
 // Resolve a coupon code for an order, returning discount info and optionally
@@ -2149,7 +2183,12 @@ const buildOnlinePaymentQuote = async ({
   }
 
   const { normalizedCoupon, discountAmount, referralOwnerEmail, referralBonus } =
-    await resolveCouponForOrder(couponCode, subtotal, paymentMethod);
+    await resolveCouponForOrder(
+      couponCode,
+      subtotal,
+      paymentMethod,
+      cleanCustomer.email
+    );
 
   // Attach the free gift as a ₹0 line item. Stock is validated here and
   // decremented inside the payment transaction with the session items.
@@ -2441,6 +2480,7 @@ codAmount: currentPaymentSession.codAmount,
       try {
         await incrementCouponUsage(
           currentPaymentSession.couponCode,
+          currentPaymentSession.customer?.email,
           databaseSession
         );
       } catch (error) {
@@ -5341,7 +5381,12 @@ app.post("/api/admin/orders", requireAdmin, async (req, res) => {
       }
 
       const { normalizedCoupon, discountAmount, referralOwnerEmail, referralBonus } =
-        await resolveCouponForOrder(couponCode, subtotal, paymentMethod);
+        await resolveCouponForOrder(
+          couponCode,
+          subtotal,
+          paymentMethod,
+          cleanCustomer.email
+        );
 
       const deliveryFee = await deliveryFeeFor(subtotal);
       // Full price always charged — discountAmount becomes cashback, credited
@@ -5434,7 +5479,7 @@ app.post("/api/admin/orders", requireAdmin, async (req, res) => {
       );
 
       try {
-        await incrementCouponUsage(normalizedCoupon, session);
+        await incrementCouponUsage(normalizedCoupon, cleanCustomer.email, session);
       } catch (error) {
         console.error("Coupon usage increment failed:", error.message);
       }
@@ -6373,16 +6418,17 @@ app.post("/api/orders", requireUser, async (req, res) => {
           );
         }
 
-        // Same usage-limit rule as resolveCouponForOrder, which this COD path
-        // predates and therefore never applied.
+        // Same per-customer usage-limit rule as resolveCouponForOrder, which
+        // this COD path predates and therefore never applied.
         if (
           couponRecord.maxUses &&
-          couponRecord.usageCount >= couponRecord.maxUses
+          couponUsageForEmail(couponRecord, cleanCustomer.email) >=
+            couponRecord.maxUses
         ) {
           throw new Error(
-            `This coupon can only be used ${couponRecord.maxUses} time${
-              couponRecord.maxUses > 1 ? "s" : ""
-            } — limit reached`
+            `You have already used this coupon the maximum ${
+              couponRecord.maxUses
+            } time${couponRecord.maxUses > 1 ? "s" : ""}`
           );
         }
 
@@ -6428,7 +6474,7 @@ app.post("/api/orders", requireUser, async (req, res) => {
       );
 
       try {
-        await incrementCouponUsage(normalizedCoupon, session);
+        await incrementCouponUsage(normalizedCoupon, cleanCustomer.email, session);
       } catch (error) {
         console.error("Coupon usage increment failed:", error.message);
       }

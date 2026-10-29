@@ -1,5 +1,13 @@
 const mongoose = require("mongoose");
 
+const couponUserUsageSchema = new mongoose.Schema(
+  {
+    email: { type: String, required: true, trim: true, lowercase: true },
+    count: { type: Number, default: 0, min: 0 },
+  },
+  { _id: false }
+);
+
 const couponSchema = new mongoose.Schema(
   {
     code: {
@@ -43,11 +51,16 @@ const couponSchema = new mongoose.Schema(
       min: 0,
     },
 
+    // Per-customer limit: how many times ONE customer (matched by the email
+    // on their order) may use this code. null = unlimited. The global
+    // usageCount below stays as a total-used counter for reporting only.
     maxUses: {
       type: Number,
       min: 1,
       default: null,
     },
+
+    perUserUsage: [couponUserUsageSchema],
 
     // Referral wallet linkage: when set, every successful order that uses
     // this coupon adds `referralBonus` to this user's wallet balance and
