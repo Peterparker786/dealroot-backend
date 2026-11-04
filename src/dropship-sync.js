@@ -9,10 +9,11 @@
 // Fallback rule (important): if a scrape fails, is blocked, or returns 0,
 // the saved price is never overwritten — the entry is only marked as failed.
 
-const DROPSHIP_PLATFORMS = ["Amazon", "Flipkart", "Meesho"];
+const DROPSHIP_PLATFORMS = ["Amazon", "Flipkart", "Meesho", "DigiHaat"];
 
-// Amazon / Flipkart / Meesho block a User-Agent after a few requests, so we
-// rotate through a small set like the existing link-extraction endpoint does.
+// Amazon / Flipkart / Meesho / DigiHaat block a User-Agent after a few
+// requests, so we rotate through a small set like the existing
+// link-extraction endpoint does.
 const USER_AGENTS = [
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
@@ -37,6 +38,9 @@ const platformForUrl = (url) => {
   if (host.includes("amazon")) return "Amazon";
   if (host.includes("flipkart")) return "Flipkart";
   if (host.includes("meesho")) return "Meesho";
+  // DigiHaat is the ONDC marketplace at digihaat.in — accept the common
+  // "digihat" spelling too, since people type it both ways.
+  if (host.includes("digihaat") || host.includes("digihat")) return "DigiHaat";
   return "";
 };
 
@@ -86,9 +90,69 @@ async function fetchHtml(url) {
   );
 }
 
+// DigiHaat (ONDC) serves prices inside its own payload/markup shapes, so it
+// gets a dedicated block that is tried before the shared patterns. Returns
+// null when nothing usable is found, and the caller then falls back to the
+// generic patterns below.
+const DIGIHAAT_PRICE_PATTERNS = [
+  // ONDC / Beckn price object: "price": { "value": 298, "currency": "INR" }
+  /"price"\s*:\s*\{\s*"value"\s*:\s*"?([0-9]+(?:\.[0-9]{1,2})?)"?/i,
+  /"sellingPrice"\s*:\s*"?([0-9]+(?:\.[0-9]{1,2})?)"?/i,
+  /"finalPrice"\s*:\s*"?([0-9]+(?:\.[0-9]{1,2})?)"?/i,
+  /"offerPrice"\s*:\s*"?([0-9]+(?:\.[0-9]{1,2})?)"?/i,
+  /"discountedPrice"\s*:\s*"?([0-9]+(?:\.[0-9]{1,2})?)"?/i,
+  /"value"\s*:\s*"?([0-9]+(?:\.[0-9]{1,2})?)"?\s*,\s*"currency"\s*:\s*"INR"/i,
+  // Rendered price block, e.g. "₹298₹500(15% OFF)" — the first number is the
+  // actual selling price, the second one is the struck-through MRP.
+  /₹\s*([0-9][0-9,]{0,8})\s*(?:₹|<)/,
+];
+
+const parseDigiHaatPrice = (html) => {
+  for (const pattern of DIGIHAAT_PRICE_PATTERNS) {
+    const match = html.match(pattern);
+    const value = Number(String(match?.[1] || "").replace(/,/g, ""));
+
+    if (Number.isFinite(value) && value > 0) return value;
+  }
+
+  return null;
+};
+
+// DigiHaat availability: ONDC payloads carry a status field, and the rendered
+// page falls back to plain "Sold out" / "Out of stock" text.
+const parseDigiHaatStock = (html) => {
+  const status = html.match(
+    /"(?:stockStatus|availability|inventoryStatus)"\s*:\s*"([^"]+)"/i
+  )?.[1];
+
+  if (status) {
+    if (/out[\s_-]*of[\s_-]*stock|sold[\s_-]*out|unavailable|discontinued/i.test(status)) {
+      return false;
+    }
+
+    if (/in[\s_-]*stock|available/i.test(status)) return true;
+  }
+
+  if (/out\s+of\s+stock|sold\s+out|currently\s+unavailable|notify\s+me/i.test(html)) {
+    return false;
+  }
+
+  if (/add\s+to\s+cart|buy\s+now/i.test(html)) return true;
+
+  return null;
+};
+
 // Reads the *selling* price from the source page. Tried in order of
 // reliability: structured data first, then the platform's own markup.
-const parsePrice = (html) => {
+const parsePrice = (html, platform = "") => {
+  // DigiHaat-specific block first — every other platform keeps the exact same
+  // pattern order it had before.
+  if (String(platform).toLowerCase().includes("digihaat")) {
+    const digiHaatPrice = parseDigiHaatPrice(html);
+
+    if (digiHaatPrice) return digiHaatPrice;
+  }
+
   const patterns = [
     // JSON-LD / embedded product JSON
     /"price"\s*:\s*"?([0-9]+(?:\.[0-9]{1,2})?)"?/i,
@@ -116,14 +180,22 @@ const parsePrice = (html) => {
 };
 
 // true = in stock, false = out of stock, null = could not tell.
-const parseStock = (html) => {
+const parseStock = (html, platform = "") => {
+  if (String(platform).toLowerCase().includes("digihaat")) {
+    const digiHaatStock = parseDigiHaatStock(html);
+
+    if (digiHaatStock !== null) return digiHaatStock;
+  }
+
   const availability = html.match(
     /"availability"\s*:\s*"([^"]+)"/i
   )?.[1];
 
   if (availability) {
-    if (/outofstock|soldout|discontinued/i.test(availability)) return false;
-    if (/instock|limitedavailability|onlineonly/i.test(availability)) return true;
+    // \s* keeps the old camelCase values (OutOfStock/InStock) working while
+    // also accepting spaced ones ("out of stock", "in stock").
+    if (/out\s*of\s*stock|sold\s*out|discontinued/i.test(availability)) return false;
+    if (/in\s*stock|limited\s*availability|online\s*only/i.test(availability)) return true;
   }
 
   if (
@@ -147,12 +219,15 @@ async function fetchSourceProduct({ url, platform }) {
     throw new Error("Valid product URL chahiye (https://...)");
   }
 
+  // Resolve the platform before parsing so the DigiHaat block can run even
+  // when the caller only supplied a URL.
+  const resolvedPlatform = platform || platformForUrl(sourceUrl);
   const html = await fetchHtml(sourceUrl);
 
   return {
-    platform: platform || platformForUrl(sourceUrl),
-    price: parsePrice(html),
-    inStock: parseStock(html),
+    platform: resolvedPlatform,
+    price: parsePrice(html, resolvedPlatform),
+    inStock: parseStock(html, resolvedPlatform),
     fetchedAt: new Date(),
   };
 }

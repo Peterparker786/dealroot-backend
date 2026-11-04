@@ -6290,7 +6290,7 @@ app.post("/api/admin/dropship-products", requireAdmin, async (req, res) => {
     if (!DROPSHIP_PLATFORMS.includes(platform)) {
       return res.status(400).json({
         success: false,
-        message: "Platform Amazon, Flipkart ya Meesho hona chahiye",
+        message: "Platform Amazon, Flipkart, Meesho ya DigiHaat hona chahiye",
       });
     }
 
@@ -6452,6 +6452,51 @@ app.post("/api/admin/dropship-products/sync", requireAdmin, async (req, res) => 
     });
   }
 });
+
+// Per-product "Sync": re-reads just this one source link on demand, so the
+// admin can check the live price without waiting for the 4-hour cycle or
+// re-syncing the whole catalog.
+app.post(
+  "/api/admin/dropship-products/:id/sync",
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const entry = await DropshipProduct.findById(req.params.id);
+
+      if (!entry) {
+        return res.status(404).json({
+          success: false,
+          message: "Dropship product not found",
+        });
+      }
+
+      const result = await dropshipSync.syncOne(entry);
+      const catalog = await Product.findById(entry.product)
+        .select("title price mrp stock images")
+        .lean();
+
+      // A failed scrape never changes the price — say so plainly instead of
+      // reporting a fake success.
+      res.json({
+        success: true,
+        updated: Boolean(result.updated),
+        message: result.updated
+          ? `Synced — source ₹${entry.sourcePrice} × ${entry.multiplier} = ₹${entry.sellingPrice}`
+          : `Sync failed — purana price rakha gaya (${
+              entry.lastSyncError || "live price nahi mila"
+            })`,
+        dropship: entry,
+        catalog,
+      });
+    } catch (error) {
+      console.error("Dropship single sync failed:", error.message);
+      res.status(500).json({
+        success: false,
+        message: "Could not sync this dropship product",
+      });
+    }
+  }
+);
 
 app.delete(
   "/api/admin/dropship-products/:id",
