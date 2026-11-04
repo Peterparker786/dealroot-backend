@@ -16,6 +16,7 @@ const { v2: cloudinary } = require("cloudinary");
 const { syncPurchaseFormToGoogle } = require("./google-sync");
 const {
   DROPSHIP_PLATFORMS,
+  fetchImageBuffer,
   fetchSourcePage,
   fetchSourceProduct,
   marginLabelFor,
@@ -6319,8 +6320,14 @@ app.post(
       try {
         page = await fetchSourcePage({ url, platform });
       } catch (error) {
+        // Both the direct request and the free proxy fallback failed. The UI
+        // uses `fallback` to offer AI Screenshot Extract / manual images instead
+        // of leaving the admin stuck.
         return res.status(422).json({
           success: false,
+          code: error.code || "FETCH_FAILED",
+          canFallback: true,
+          fallback: { screenshot: true, manualImages: true },
           message: `Link load nahi hua: ${error.message}`,
         });
       }
@@ -6370,6 +6377,10 @@ app.post(
         .join("\n")
         .slice(0, 1000);
 
+      // Warnings never block the extraction — they tell the admin exactly what
+      // was partial so the UI can offer the screenshot / manual-upload fallback.
+      const warnings = [...(page.warnings || [])];
+
       const uploadedImages = [];
       const pushUploaded = (imageUrl) => {
         if (imageUrl && !uploadedImages.includes(imageUrl)) {
@@ -6377,27 +6388,47 @@ app.post(
         }
       };
 
-      if (pageImages.length > 0) {
-        const mainImage = pageImages[0];
+      let aiInfo = null;
 
-        // Same vision extraction as the regular form: specs + bullet points
-        // come from the product photo, with the page title/price as context.
-        try {
-          const imageResponse = await fetch(mainImage, {
-            headers: {
-              "User-Agent":
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
-            },
-            signal: AbortSignal.timeout(30000),
-          });
+      if (pageImages.length === 0) {
+        warnings.push(
+          "Is page se koi product image nahi mili — AI Screenshot Extract ya local image upload se images add karein."
+        );
+      } else {
+        // Prefer the first image, but a blocked (403) or placeholder image must
+        // not kill the extraction: try the next gallery images until one works.
+        let usableImage = null;
+        let chosenIndex = -1;
 
-          const imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
-          const mimeType =
-            imageResponse.headers.get("content-type") || "image/jpeg";
+        for (let i = 0; i < Math.min(pageImages.length, 3); i += 1) {
+          try {
+            const downloaded = await fetchImageBuffer(pageImages[i], {
+              referer: url,
+              timeoutMs: 25000,
+            });
 
-          if (imageBuffer.length > 5000) {
+            if (downloaded) {
+              usableImage = downloaded;
+              chosenIndex = i;
+              break;
+            }
+          } catch (error) {
+            console.error("Dropship extract image download failed:", error.message);
+          }
+        }
+
+        if (!usableImage) {
+          warnings.push(
+            "Product images block ho gayi hain (HTTP 403) — images AI Screenshot Extract ya local upload se add karein. Title, price aur description phir bhi bhar diye gaye hain."
+          );
+        } else {
+          if (usableImage.via !== "direct") {
+            warnings.push("Main image backup proxy se download hui hai.");
+          }
+
+          if (usableImage.buffer.length > 5000) {
             try {
-              pushUploaded(await uploadBufferToCloudinary(imageBuffer));
+              pushUploaded(await uploadBufferToCloudinary(usableImage.buffer));
             } catch (error) {
               console.error(
                 "Dropship extract image upload failed:",
@@ -6406,58 +6437,63 @@ app.post(
             }
           }
 
-          const aiInfo = await extractProductFromScreenshot(
-            imageBuffer,
-            mimeType,
-            contextText
-          );
-
-          info.brand = aiInfo.brand || info.brand;
-          info.title = aiInfo.title || info.title;
-          info.description = aiInfo.description || info.description;
-          info.specifications = aiInfo.specifications || [];
-          info.highlights = aiInfo.highlights || [];
-
-          if (!info.price && aiInfo.price > 0) info.price = aiInfo.price;
-        } catch (error) {
-          // AI is a bonus here — the page data above is still usable.
-          console.error("Dropship extract AI failed:", error.message);
-        }
-
-        for (const imgUrl of pageImages.slice(0, 5)) {
-          if (imgUrl === mainImage) continue;
-
+          // Same vision extraction as the regular form: specs + bullet points
+          // come from the product photo, with the page title/price as context.
           try {
-            const response2 = await fetch(imgUrl, {
-              headers: {
-                "User-Agent":
-                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
-              },
-              signal: AbortSignal.timeout(20000),
-            });
-
-            const buffer2 = Buffer.from(await response2.arrayBuffer());
-            const type2 = response2.headers.get("content-type") || "";
-
-            if (buffer2.length > 10000 && /^image\//i.test(type2)) {
-              try {
-                pushUploaded(await uploadBufferToCloudinary(buffer2));
-              } catch (error) {
-                console.error(
-                  "Dropship extract image upload failed:",
-                  error.message
-                );
-              }
-            }
+            aiInfo = await extractProductFromScreenshot(
+              usableImage.buffer,
+              usableImage.contentType,
+              contextText
+            );
           } catch (error) {
-            console.error("Dropship extract image download failed:", error.message);
+            console.error("Dropship extract AI failed:", error.message);
+            warnings.push(
+              "AI se specs / bullet points nahi nikle — neeche manually add karein ya AI Screenshot Extract dobara try karein."
+            );
           }
         }
+
+        // Remaining gallery images — each one fails on its own.
+        for (let i = 0; i < Math.min(pageImages.length, 6); i += 1) {
+          if (i === chosenIndex) continue;
+
+          try {
+            const extra = await fetchImageBuffer(pageImages[i], {
+              referer: url,
+              timeoutMs: 20000,
+            });
+
+            if (!extra || extra.buffer.length <= 10000) continue;
+
+            pushUploaded(await uploadBufferToCloudinary(extra.buffer));
+          } catch (error) {
+            console.error(
+              "Dropship extract image upload failed:",
+              error.message
+            );
+          }
+        }
+      }
+
+      if (aiInfo) {
+        info.brand = aiInfo.brand || info.brand;
+        info.title = aiInfo.title || info.title;
+        info.description = aiInfo.description || info.description;
+        info.specifications = aiInfo.specifications || [];
+        info.highlights = aiInfo.highlights || [];
+
+        if (!info.price && aiInfo.price > 0) info.price = aiInfo.price;
       }
 
       // Cloudinary par upload na ho to bhi original CDN URLs wapas do.
       const images =
         uploadedImages.length > 0 ? uploadedImages : pageImages.slice(0, 5);
+
+      if (pageImages.length > 0 && uploadedImages.length === 0) {
+        warnings.push(
+          "Images Cloudinary par upload nahi hui — original CDN links diye gaye hain, save karte waqt local upload kar sakte hain."
+        );
+      }
 
       res.set("Cache-Control", "no-store");
       res.json({
@@ -6467,6 +6503,7 @@ app.post(
         inStock,
         info,
         images,
+        warnings,
       });
     } catch (error) {
       console.error("Dropship link extract failed:", error.message);

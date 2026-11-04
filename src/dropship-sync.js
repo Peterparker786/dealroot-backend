@@ -12,16 +12,284 @@
 const DROPSHIP_PLATFORMS = ["Amazon", "Flipkart", "Meesho", "DigiHaat"];
 
 // Amazon / Flipkart / Meesho / DigiHaat block a User-Agent after a few
-// requests, so we rotate through a small set like the existing
-// link-extraction endpoint does.
-const USER_AGENTS = [
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
+// requests, so we rotate through a small set of FULL browser fingerprints
+// (not just the UA string) like a real desktop/mobile visitor would look.
+const BROWSER_PROFILES = [
+  {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+  },
+  {
+    "User-Agent":
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"macOS"',
+  },
+  {
+    "User-Agent":
+      "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36",
+    "sec-ch-ua": '"Google Chrome";v="130", "Chromium";v="130", "Not_A Brand";v="24"',
+    "sec-ch-ua-mobile": "?1",
+    "sec-ch-ua-platform": '"Android"',
+  },
+  {
+    "User-Agent":
+      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "sec-ch-ua": '"Google Chrome";v="130", "Chromium";v="130", "Not_A Brand";v="24"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Linux"',
+  },
+  {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
+  },
 ];
 
 const FETCH_TIMEOUT_MS = 25000;
+
+const PLATFORM_HOME = {
+  Amazon: "https://www.amazon.in/",
+  Flipkart: "https://www.flipkart.com/",
+  Meesho: "https://www.meesho.com/",
+  DigiHaat: "https://www.digihaat.in/",
+};
+
+// Full navigation headers for a product page request. The Referer is the
+// marketplace home page, which is what a browser sends when a visitor clicks
+// through from the homepage/search instead of hitting the URL cold.
+const browserHeadersFor = (url, attempt = 0, platform = "") => {
+  const profile = BROWSER_PROFILES[attempt % BROWSER_PROFILES.length];
+  const home = PLATFORM_HOME[platformForUrl(url) || platform] || "";
+
+  return {
+    ...profile,
+    Accept:
+      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-IN,en;q=0.9,hi;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "no-cache",
+    Pragma: "no-cache",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": home ? "same-origin" : "none",
+    "Sec-Fetch-User": "?1",
+    ...(home ? { Referer: home } : {}),
+  };
+};
+
+// Text that marketplaces put on their block / CAPTCHA pages. Matched only on
+// the first chunk of the page so a normal product description can never trip it.
+const BLOCK_MARKERS =
+  /ip[\s_-]?blocked|access denied|unusual traffic|are you a robot|verify (?:that )?you are (?:a )?human|request blocked|px-captcha|incapsula|cf-error|just a moment\.\.\.|enable javascript and cookies to continue/i;
+
+const BLOCK_STATUSES = [403, 429, 451, 503];
+
+// A page is unusable when the status says blocked OR the body is a tiny shell /
+// CAPTCHA wall. Both cases move the request to the proxy fallback.
+const looksBlocked = (html = "", status = 200) => {
+  if (BLOCK_STATUSES.includes(Number(status))) return true;
+
+  const head = String(html).slice(0, 20000);
+
+  if (head.trim().length < 800) return true;
+
+  return BLOCK_MARKERS.test(head);
+};
+
+// Free read-through gateways, tried in order when a platform blocks our IP.
+// `SCRAPER_PROXY_TEMPLATE` (e.g. "https://user:pass@proxy.example/fetch?url={url}")
+// can be set in .env to put a dedicated proxy in front of all of them.
+const PROXY_GATEWAYS = [
+  {
+    name: "allorigins",
+    build: (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  },
+  {
+    name: "codetabs",
+    build: (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+  },
+  {
+    name: "corsproxy",
+    build: (url) => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
+  },
+  {
+    name: "reader",
+    build: (url) => `https://r.jina.ai/${url}`,
+  },
+];
+
+const proxyGateways = () => {
+  const template = String(process.env.SCRAPER_PROXY_TEMPLATE || "").trim();
+
+  if (!template.includes("{url}")) return PROXY_GATEWAYS;
+
+  return [
+    {
+      name: "custom-proxy",
+      build: (url) => template.replace("{url}", encodeURIComponent(url)),
+    },
+    ...PROXY_GATEWAYS,
+  ];
+};
+
+// One request through the first gateway that answers with something usable.
+// Binary (images) and text (HTML/markdown) are both handled, because the
+// gateways return whatever content type the origin sent.
+const fetchThroughGateways = async (url, { timeoutMs = 20000 } = {}) => {
+  for (const gateway of proxyGateways()) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await fetch(gateway.build(url), {
+        headers: {
+          "User-Agent": BROWSER_PROFILES[0]["User-Agent"],
+          Accept: "*/*",
+        },
+        redirect: "follow",
+        signal: controller.signal,
+      });
+
+      if (!response.ok) continue;
+
+      const contentType = (response.headers.get("content-type") || "").toLowerCase();
+
+      if (/^(image|application\/octet-stream)/.test(contentType)) {
+        const buffer = Buffer.from(await response.arrayBuffer());
+
+        if (buffer.length > 1000) {
+          return { buffer, contentType, gateway: gateway.name };
+        }
+
+        continue;
+      }
+
+      const text = (await response.text()).slice(0, 3000000);
+
+      if (text.trim().length >= 800) {
+        return { text, contentType, gateway: gateway.name };
+      }
+    } catch {
+      // gateway down / timed out — try the next one
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  return null;
+};
+
+// The reader gateway (r.jina.ai) answers with markdown, not HTML. Price parsing
+// already works on plain text, but the title/description/image extractor needs
+// tags — so the markdown is converted into the small HTML skeleton it expects.
+const markdownToPseudoHtml = (markdown, sourceUrl) => {
+  const escape = (value) =>
+    String(value ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+
+  const title = (markdown.match(/^Title:\s*(.+)$/m)?.[1] || "").trim();
+
+  const images = [
+    ...new Set(
+      [...markdown.matchAll(/!\[[^\]]*\]\(\s*(https?:\/\/[^)\s]+)\s*\)/g)].map(
+        (match) => match[1]
+      )
+    ),
+  ].slice(0, 10);
+
+  const bodyText = markdown.split(/Markdown Content:/i)[1] || markdown;
+  const description = bodyText
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
+    .replace(/\[[^\]]*\]\([^)]*\)/g, " ")
+    .replace(/[#>*_`|]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 400);
+
+  return [
+    "<html><head>",
+    `<title>${escape(title)}</title>`,
+    `<meta property="og:title" content="${escape(title)}" />`,
+    `<meta property="og:description" content="${escape(description)}" />`,
+    images[0]
+      ? `<meta property="og:image" content="${escape(images[0])}" />`
+      : "",
+    `<meta property="og:url" content="${escape(sourceUrl)}" />`,
+    "</head><body>",
+    ...images.map((src) => `<img src="${escape(src)}" />`),
+    `<p>${escape(description)}</p>`,
+    `<pre>${escape(markdown.slice(0, 200000))}</pre>`,
+    "</body></html>",
+  ].join("");
+};
+
+const imageMagicOk = (buffer) => {
+  if (!buffer || buffer.length < 1000) return false;
+
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return true;
+  if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47) {
+    return true;
+  }
+  if (
+    buffer.subarray(0, 4).toString("ascii") === "RIFF" &&
+    buffer.subarray(8, 12).toString("ascii") === "WEBP"
+  ) {
+    return true;
+  }
+
+  return buffer.subarray(0, 3).toString("ascii") === "GIF";
+};
+
+// Downloads one product image. A 403 on the image host (Flipkart blocks the
+// CDN per-IP too) is retried through the free gateways, and the bytes are
+// magic-checked so a "blocked" HTML error page is never treated as an image.
+const fetchImageBuffer = async (imageUrl, { referer = "", timeoutMs = 20000 } = {}) => {
+  try {
+    const response = await fetch(imageUrl, {
+      headers: {
+        "User-Agent": BROWSER_PROFILES[0]["User-Agent"],
+        Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Accept-Language": "en-IN,en;q=0.9",
+        ...(referer ? { Referer: referer } : {}),
+      },
+      redirect: "follow",
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+
+    if (response.ok && imageMagicOk(buffer)) {
+      return {
+        buffer,
+        contentType: response.headers.get("content-type") || "image/jpeg",
+        via: "direct",
+      };
+    }
+  } catch {
+    // fall through to the gateways
+  }
+
+  const proxied = await fetchThroughGateways(imageUrl, {
+    timeoutMs: Math.min(timeoutMs, 20000),
+  });
+
+  if (proxied?.buffer && imageMagicOk(proxied.buffer)) {
+    return {
+      buffer: proxied.buffer,
+      contentType: proxied.contentType || "image/jpeg",
+      via: proxied.gateway,
+    };
+  }
+
+  return null;
+};
 
 const roundMoney = (amount) =>
   Math.round((Number(amount) + Number.EPSILON) * 100) / 100;
@@ -91,50 +359,75 @@ const platformForUrl = (url) => {
   return "";
 };
 
-async function fetchHtml(url) {
+// Loads the raw page HTML with a two stage strategy:
+//   1. direct request using rotating realistic browser fingerprints
+//   2. free proxy gateway (Flipkart/Amazon answer 403 to a datacenter IP)
+// Throws an error with `code = "BLOCKED"` when both stages fail, so the admin
+// UI can offer the screenshot / manual-image fallbacks instead of a dead end.
+async function fetchPageHtml(url, { platform = "" } = {}) {
   let lastStatus = 0;
+  let sawBlock = false;
+  let sawTimeout = false;
 
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  for (let attempt = 0; attempt < BROWSER_PROFILES.length; attempt += 1) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
     try {
       const response = await fetch(url, {
-        headers: {
-          "User-Agent": USER_AGENTS[attempt % USER_AGENTS.length],
-          Accept:
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-          "Accept-Language": "en-IN,en;q=0.9,hi;q=0.8",
-          "Cache-Control": "no-cache",
-          Pragma: "no-cache",
-          "Upgrade-Insecure-Requests": "1",
-        },
+        headers: browserHeadersFor(url, attempt, platform),
         redirect: "follow",
         signal: controller.signal,
       });
 
       lastStatus = response.status;
 
-      if (response.ok) {
-        const html = (await response.text()).slice(0, 3000000);
+      const html = (await response.text()).slice(0, 3000000);
 
-        // A tiny page means a bot/JS wall, not a product page.
-        if (html.trim().length >= 800) return html;
+      if (response.ok && !looksBlocked(html, response.status)) {
+        return { html, via: "direct", status: response.status, warnings: [] };
       }
+
+      if (looksBlocked(html, response.status)) sawBlock = true;
     } catch (error) {
-      if (error.name === "AbortError" && attempt === 2) {
-        throw new Error("Source page timed out — link check karein");
-      }
+      if (error.name === "AbortError") sawTimeout = true;
     } finally {
       clearTimeout(timer);
     }
   }
 
-  throw new Error(
-    lastStatus
-      ? `Source page load nahi hui (HTTP ${lastStatus})`
-      : "Source page load nahi hui"
+  // Stage 2 — the free read-through gateways.
+  const proxied = await fetchThroughGateways(url);
+
+  if (proxied?.text && !looksBlocked(proxied.text, 200)) {
+    const isMarkdown =
+      proxied.gateway === "reader" || /^Title:\s*.+$/m.test(proxied.text.slice(0, 2000));
+
+    return {
+      html: isMarkdown ? markdownToPseudoHtml(proxied.text, url) : proxied.text,
+      via: proxied.gateway,
+      status: 200,
+      warnings: [
+        `${platform || platformForUrl(url) || "Source"} ne direct request block kar di — backup proxy (${proxied.gateway}) se data liya gaya. Images kam aa sakti hain.`,
+      ],
+    };
+  }
+
+  const label = platform || platformForUrl(url) || "Source page";
+  const reason = lastStatus
+    ? `${label} ne request block kar di (HTTP ${lastStatus}${BLOCK_STATUSES.includes(lastStatus) ? " — IP blocked" : ""})`
+    : sawTimeout
+      ? "Source page load nahi hui (timeout)"
+      : "Source page load nahi hui";
+
+  const error = new Error(
+    `${reason} — free proxy fallback bhi fail hua. AI Screenshot Extract ya images ka manual upload use karein.`
   );
+
+  error.code = sawBlock || BLOCK_STATUSES.includes(lastStatus) ? "BLOCKED" : "FETCH_FAILED";
+  error.status = lastStatus || 0;
+
+  throw error;
 }
 
 // DigiHaat (ONDC) serves prices inside its own payload/markup shapes, so it
@@ -271,9 +564,14 @@ async function fetchSourcePage({ url, platform }) {
   // Resolve the platform before parsing so the DigiHaat block can run even
   // when the caller only supplied a URL.
   const resolvedPlatform = platform || platformForUrl(sourceUrl);
-  const html = await fetchHtml(sourceUrl);
+  const page = await fetchPageHtml(sourceUrl, { platform: resolvedPlatform });
 
-  return { platform: resolvedPlatform, html };
+  return {
+    platform: resolvedPlatform,
+    html: page.html,
+    via: page.via,
+    warnings: page.warnings || [],
+  };
 }
 
 // Fetches the live price + stock for one marketplace product URL.
@@ -401,8 +699,10 @@ function createDropshipSyncService({ Product, DropshipProduct }) {
 module.exports = {
   DROPSHIP_PLATFORMS,
   DEFAULT_MARGIN_PERCENT,
+  fetchImageBuffer,
   fetchSourcePage,
   fetchSourceProduct,
+  looksBlocked,
   marginLabelFor,
   parsePrice,
   parseStock,
