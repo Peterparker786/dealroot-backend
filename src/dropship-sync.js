@@ -51,7 +51,7 @@ const BROWSER_PROFILES = [
 // Whole-page budget (direct attempts + every proxy gateway). Without a budget
 // a blocked Flipkart page could burn minutes on retries and time the whole
 // admin request out.
-const PAGE_BUDGET_MS = 45000;
+const PAGE_BUDGET_MS = 30000;
 const FETCH_TIMEOUT_MS = 12000;
 
 const PLATFORM_HOME = {
@@ -145,7 +145,7 @@ const proxyGateways = () => {
 // gateways return whatever content type the origin sent.
 const fetchThroughGateways = async (
   url,
-  { timeoutMs = 12000, budgetMs = 0, maxGateways = 4 } = {}
+  { timeoutMs = 12000, budgetMs = 0, maxGateways = 4, binaryOnly = false } = {}
 ) => {
   const deadline = budgetMs > 0 ? Date.now() + budgetMs : 0;
 
@@ -168,8 +168,14 @@ const fetchThroughGateways = async (
       if (!response.ok) continue;
 
       const contentType = (response.headers.get("content-type") || "").toLowerCase();
+      const isBinary = /^(image|application\/octet-stream)/.test(contentType);
 
-      if (/^(image|application\/octet-stream)/.test(contentType)) {
+      // An image request must never accept an HTML/text answer (the markdown
+      // reader always replies with text), otherwise one gateway would swallow
+      // the whole fallback chain.
+      if (binaryOnly && !isBinary) continue;
+
+      if (isBinary) {
         const buffer = Buffer.from(await response.arrayBuffer());
 
         if (buffer.length > 1000) {
@@ -293,7 +299,8 @@ const fetchImageBuffer = async (
   const proxied = await fetchThroughGateways(imageUrl, {
     timeoutMs: Math.min(timeoutMs, 10000),
     budgetMs,
-    maxGateways: 2,
+    maxGateways: 3,
+    binaryOnly: true,
   });
 
   if (proxied?.buffer && imageMagicOk(proxied.buffer)) {
@@ -390,7 +397,7 @@ async function fetchPageHtml(url, { platform = "" } = {}) {
   for (let attempt = 0; attempt < BROWSER_PROFILES.length; attempt += 1) {
     const remaining = deadline - Date.now();
 
-    if (remaining < 8000) break;
+    if (remaining < 6000) break;
 
     const controller = new AbortController();
     const timer = setTimeout(

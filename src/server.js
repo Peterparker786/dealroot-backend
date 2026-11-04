@@ -6507,6 +6507,8 @@ app.post(
       res.json({
         success: true,
         platform,
+        // "direct" or the backup gateway that rescued the page.
+        source: page.via || "direct",
         sourcePrice,
         inStock,
         info,
