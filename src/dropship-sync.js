@@ -26,6 +26,53 @@ const FETCH_TIMEOUT_MS = 25000;
 const roundMoney = (amount) =>
   Math.round((Number(amount) + Number.EPSILON) * 100) / 100;
 
+// Default markup: 100% on top of the source price, i.e. the old hardcoded 2x.
+const DEFAULT_MARGIN_PERCENT = 100;
+
+// Selling price from the entry's saved margin rule.
+//   percentage -> source + (source * margin/100)   (100% = 2x, 50% = 1.5x)
+//   flat       -> source + fixed rupee amount
+// Older entries that only stored a `multiplier` keep working: the multiplier
+// is translated into the equivalent percentage margin.
+const sellingPriceFor = (sourcePrice, entry = {}) => {
+  const source = Number(sourcePrice);
+
+  if (!Number.isFinite(source) || source <= 0) return 0;
+
+  if (String(entry.marginType || "").toLowerCase() === "flat") {
+    const flat = Number(entry.marginValue);
+    return roundMoney(source + (Number.isFinite(flat) ? Math.max(0, flat) : 0));
+  }
+
+  const savedPercent = Number(entry.marginValue);
+  const legacyMultiplier = Number(entry.multiplier);
+  const percent =
+    Number.isFinite(savedPercent) && savedPercent >= 0
+      ? savedPercent
+      : Number.isFinite(legacyMultiplier) && legacyMultiplier > 0
+        ? Math.max(0, (legacyMultiplier - 1) * 100)
+        : DEFAULT_MARGIN_PERCENT;
+
+  return roundMoney(source + (source * percent) / 100);
+};
+
+// Human readable margin, e.g. "+100%" or "+₹200 flat".
+const marginLabelFor = (entry = {}) => {
+  if (String(entry.marginType || "").toLowerCase() === "flat") {
+    return `+₹${Number(entry.marginValue) || 0} flat`;
+  }
+
+  const legacyMultiplier = Number(entry.multiplier);
+  const percent =
+    Number.isFinite(Number(entry.marginValue)) && Number(entry.marginValue) >= 0
+      ? Number(entry.marginValue)
+      : Number.isFinite(legacyMultiplier) && legacyMultiplier > 0
+        ? Math.max(0, (legacyMultiplier - 1) * 100)
+        : DEFAULT_MARGIN_PERCENT;
+
+  return `+${percent}%`;
+};
+
 const platformForUrl = (url) => {
   let host = "";
 
@@ -211,8 +258,10 @@ const parseStock = (html, platform = "") => {
   return null;
 };
 
-// Fetches the live price + stock for one marketplace product URL.
-async function fetchSourceProduct({ url, platform }) {
+// Downloads the raw source page plus the resolved platform. The admin
+// "extract details" flow needs the HTML too (title/description/images), while
+// the price sync only needs the parsed numbers.
+async function fetchSourcePage({ url, platform }) {
   const sourceUrl = String(url || "").trim();
 
   if (!/^https?:\/\//i.test(sourceUrl)) {
@@ -224,10 +273,17 @@ async function fetchSourceProduct({ url, platform }) {
   const resolvedPlatform = platform || platformForUrl(sourceUrl);
   const html = await fetchHtml(sourceUrl);
 
+  return { platform: resolvedPlatform, html };
+}
+
+// Fetches the live price + stock for one marketplace product URL.
+async function fetchSourceProduct({ url, platform }) {
+  const page = await fetchSourcePage({ url, platform });
+
   return {
-    platform: resolvedPlatform,
-    price: parsePrice(html, resolvedPlatform),
-    inStock: parseStock(html, resolvedPlatform),
+    platform: page.platform,
+    price: parsePrice(page.html, page.platform),
+    inStock: parseStock(page.html, page.platform),
     fetchedAt: new Date(),
   };
 }
@@ -278,7 +334,7 @@ function createDropshipSyncService({ Product, DropshipProduct }) {
       return { updated: false, reason: "product-missing" };
     }
 
-    const sellingPrice = roundMoney(live.price * entry.multiplier);
+    const sellingPrice = sellingPriceFor(live.price, entry);
     const update = {
       price: sellingPrice,
       // MRP must never sit below the selling price.
@@ -344,6 +400,13 @@ function createDropshipSyncService({ Product, DropshipProduct }) {
 
 module.exports = {
   DROPSHIP_PLATFORMS,
+  DEFAULT_MARGIN_PERCENT,
+  fetchSourcePage,
   fetchSourceProduct,
+  marginLabelFor,
+  parsePrice,
+  parseStock,
+  platformForUrl,
+  sellingPriceFor,
   createDropshipSyncService,
 };

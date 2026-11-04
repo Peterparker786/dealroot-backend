@@ -16,7 +16,13 @@ const { v2: cloudinary } = require("cloudinary");
 const { syncPurchaseFormToGoogle } = require("./google-sync");
 const {
   DROPSHIP_PLATFORMS,
+  fetchSourcePage,
   fetchSourceProduct,
+  marginLabelFor,
+  parsePrice,
+  parseStock,
+  platformForUrl,
+  sellingPriceFor,
   createDropshipSyncService,
 } = require("./dropship-sync");
 
@@ -1577,6 +1583,14 @@ const dropshipProductSchema = new mongoose.Schema(
     },
     sourceUrl: { type: String, required: true, trim: true },
     multiplier: { type: Number, default: 2, min: 1, max: 10 },
+    // Margin rule applied on top of the live source price. `percentage` is the
+    // default (100% = the old 2x), `flat` adds a fixed rupee amount.
+    marginType: {
+      type: String,
+      enum: ["percentage", "flat"],
+      default: "percentage",
+    },
+    marginValue: { type: Number, default: 100, min: 0 },
     // Last successfully fetched source price (never overwritten by a failure).
     sourcePrice: { type: Number, default: 0, min: 0 },
     sellingPrice: { type: Number, default: 0, min: 0 },
@@ -6264,6 +6278,206 @@ app.delete("/api/products/:id", requireAdmin, async (req, res) => {
 // collection. On submit it fetches the live source price, multiplies it and
 // creates an ordinary catalog product that the storefront already knows how
 // to render.
+// "Extract from link" for the dropship form: pulls title/description/images
+// from the marketplace page and the live source price (through the very same
+// parser the 4-hour sync uses). Reuses the existing extraction helpers, so the
+// regular Products form keeps its own untouched endpoint.
+app.post(
+  "/api/admin/dropship-products/extract",
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const url = String(req.body?.url || "").trim();
+
+      if (!/^https?:\/\//i.test(url)) {
+        return res.status(400).json({
+          success: false,
+          message: "Valid product link paste karein (https://...)",
+        });
+      }
+
+      // URL decides the platform; the form's own dropdown is the fallback for
+      // links on a mirror domain.
+      const requestedPlatform = String(req.body?.platform || "").trim();
+      const platform =
+        platformForUrl(url) ||
+        DROPSHIP_PLATFORMS.find(
+          (item) => item.toLowerCase() === requestedPlatform.toLowerCase()
+        ) ||
+        "";
+
+      if (!platform) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Sirf Amazon / Flipkart / Meesho / DigiHaat links support hote hain",
+        });
+      }
+
+      let page;
+
+      try {
+        page = await fetchSourcePage({ url, platform });
+      } catch (error) {
+        return res.status(422).json({
+          success: false,
+          message: `Link load nahi hua: ${error.message}`,
+        });
+      }
+
+      const html = page.html;
+      const sourcePrice = parsePrice(html, platform) || 0;
+      const inStock = parseStock(html, platform);
+
+      const pageImages = [
+        ...new Set([
+          ...extractProductImagesFromHtml(html, url),
+          ...(await extractFirstCryGalleryImages(html, url)),
+        ]),
+      ].slice(0, 8);
+
+      const metaContent = (name) => {
+        const pattern = new RegExp(
+          `<meta[^>]*(?:name|property)=["']${name}["'][^>]*content=["']([^"']+)["']`,
+          "i"
+        );
+        return html.match(pattern)?.[1] || "";
+      };
+
+      const info = {
+        brand:
+          html.match(/"brand"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"/i)?.[1] ||
+          metaContent("brand") ||
+          "",
+        title: (
+          metaContent("og:title") ||
+          html.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1] ||
+          ""
+        ).trim(),
+        price: sourcePrice,
+        mrp: 0,
+        description: (metaContent("og:description") || metaContent("description") || "").trim(),
+        specifications: [],
+        highlights: [],
+      };
+
+      const contextText = [
+        info.title,
+        info.description,
+        sourcePrice ? `Price: Rs ${sourcePrice}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n")
+        .slice(0, 1000);
+
+      const uploadedImages = [];
+      const pushUploaded = (imageUrl) => {
+        if (imageUrl && !uploadedImages.includes(imageUrl)) {
+          uploadedImages.push(imageUrl);
+        }
+      };
+
+      if (pageImages.length > 0) {
+        const mainImage = pageImages[0];
+
+        // Same vision extraction as the regular form: specs + bullet points
+        // come from the product photo, with the page title/price as context.
+        try {
+          const imageResponse = await fetch(mainImage, {
+            headers: {
+              "User-Agent":
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+            },
+            signal: AbortSignal.timeout(30000),
+          });
+
+          const imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
+          const mimeType =
+            imageResponse.headers.get("content-type") || "image/jpeg";
+
+          if (imageBuffer.length > 5000) {
+            try {
+              pushUploaded(await uploadBufferToCloudinary(imageBuffer));
+            } catch (error) {
+              console.error(
+                "Dropship extract image upload failed:",
+                error.message
+              );
+            }
+          }
+
+          const aiInfo = await extractProductFromScreenshot(
+            imageBuffer,
+            mimeType,
+            contextText
+          );
+
+          info.brand = aiInfo.brand || info.brand;
+          info.title = aiInfo.title || info.title;
+          info.description = aiInfo.description || info.description;
+          info.specifications = aiInfo.specifications || [];
+          info.highlights = aiInfo.highlights || [];
+
+          if (!info.price && aiInfo.price > 0) info.price = aiInfo.price;
+        } catch (error) {
+          // AI is a bonus here — the page data above is still usable.
+          console.error("Dropship extract AI failed:", error.message);
+        }
+
+        for (const imgUrl of pageImages.slice(0, 5)) {
+          if (imgUrl === mainImage) continue;
+
+          try {
+            const response2 = await fetch(imgUrl, {
+              headers: {
+                "User-Agent":
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+              },
+              signal: AbortSignal.timeout(20000),
+            });
+
+            const buffer2 = Buffer.from(await response2.arrayBuffer());
+            const type2 = response2.headers.get("content-type") || "";
+
+            if (buffer2.length > 10000 && /^image\//i.test(type2)) {
+              try {
+                pushUploaded(await uploadBufferToCloudinary(buffer2));
+              } catch (error) {
+                console.error(
+                  "Dropship extract image upload failed:",
+                  error.message
+                );
+              }
+            }
+          } catch (error) {
+            console.error("Dropship extract image download failed:", error.message);
+          }
+        }
+      }
+
+      // Cloudinary par upload na ho to bhi original CDN URLs wapas do.
+      const images =
+        uploadedImages.length > 0 ? uploadedImages : pageImages.slice(0, 5);
+
+      res.set("Cache-Control", "no-store");
+      res.json({
+        success: true,
+        platform,
+        sourcePrice,
+        inStock,
+        info,
+        images,
+      });
+    } catch (error) {
+      console.error("Dropship link extract failed:", error.message);
+      res.status(500).json({
+        success: false,
+        message: error.message || "Could not extract from link",
+      });
+    }
+  }
+);
+
 app.post("/api/admin/dropship-products", requireAdmin, async (req, res) => {
   try {
     const body = req.body || {};
@@ -6273,7 +6487,12 @@ app.post("/api/admin/dropship-products", requireAdmin, async (req, res) => {
     const platform = String(body.platform || "").trim();
     const sourceUrl = String(body.sourceUrl || "").trim();
     const description = String(body.description || "").trim();
-    const multiplier = Number(body.multiplier || 2);
+    const marginType = String(body.marginType || "percentage").toLowerCase();
+    const marginValue = Number(
+      body.marginValue === undefined || body.marginValue === ""
+        ? 100
+        : body.marginValue
+    );
 
     if (!title) {
       return res
@@ -6301,10 +6520,31 @@ app.post("/api/admin/dropship-products", requireAdmin, async (req, res) => {
       });
     }
 
-    if (!Number.isFinite(multiplier) || multiplier < 1 || multiplier > 10) {
+    if (!["percentage", "flat"].includes(marginType)) {
       return res.status(400).json({
         success: false,
-        message: "Markup multiplier 1 se 10 ke beech hona chahiye",
+        message: "Margin type percentage ya flat hona chahiye",
+      });
+    }
+
+    if (!Number.isFinite(marginValue) || marginValue < 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Margin 0 ya usse zyada hona chahiye",
+      });
+    }
+
+    if (marginType === "percentage" && marginValue > 1000) {
+      return res.status(400).json({
+        success: false,
+        message: "Percentage margin 1000% se zyada nahi ho sakta",
+      });
+    }
+
+    if (marginType === "flat" && marginValue > 1000000) {
+      return res.status(400).json({
+        success: false,
+        message: "Flat margin bahut zyada hai",
       });
     }
 
@@ -6328,7 +6568,8 @@ app.post("/api/admin/dropship-products", requireAdmin, async (req, res) => {
       });
     }
 
-    const sellingPrice = roundMoney(live.price * multiplier);
+    const marginRule = { marginType, marginValue };
+    const sellingPrice = sellingPriceFor(live.price, marginRule);
     const outOfStock = live.inStock === false;
     const stockWhenAvailable = Math.max(
       1,
@@ -6339,16 +6580,42 @@ app.post("/api/admin/dropship-products", requireAdmin, async (req, res) => {
       ? body.images.map((img) => String(img).trim()).filter(Boolean)
       : [];
 
+    // Same extra fields the regular product form sends with a product.
+    const specifications = Array.isArray(body.specifications)
+      ? body.specifications
+          .map((spec) => ({
+            label: String(spec?.label || "").trim(),
+            value: String(spec?.value || "").trim(),
+          }))
+          .filter((spec) => spec.label && spec.value)
+          .slice(0, 30)
+      : [];
+
+    const highlights = Array.isArray(body.highlights)
+      ? body.highlights
+          .map((item) => String(item).trim())
+          .filter(Boolean)
+          .slice(0, 15)
+      : [];
+
+    const requestedMrp = Number(body.mrp);
+    const mrp =
+      Number.isFinite(requestedMrp) && requestedMrp > 0
+        ? Math.max(sellingPrice, requestedMrp)
+        : sellingPrice;
+
     const product = await Product.create({
       brand: brand || platform,
       title,
       description,
       category,
       price: sellingPrice,
-      mrp: sellingPrice,
-      rating: 0,
-      reviews: 0,
+      mrp,
+      rating: Number(body.rating) || 0,
+      reviews: Number(body.reviews) || 0,
       images,
+      specifications,
+      highlights,
       stock: outOfStock ? 0 : stockWhenAvailable,
       dealType: "none",
       marketplaceLinks: [{ platform, url: sourceUrl }],
@@ -6365,7 +6632,12 @@ app.post("/api/admin/dropship-products", requireAdmin, async (req, res) => {
         title,
         platform,
         sourceUrl,
-        multiplier,
+        marginType,
+        marginValue,
+        multiplier:
+          marginType === "percentage"
+            ? Math.min(10, Math.max(1, 1 + marginValue / 100))
+            : 1,
         sourcePrice: live.price,
         sellingPrice,
         inStock: !outOfStock,
@@ -6384,7 +6656,9 @@ app.post("/api/admin/dropship-products", requireAdmin, async (req, res) => {
 
     res.status(201).json({
       success: true,
-      message: `Dropship product added — source ₹${live.price} × ${multiplier} = ₹${sellingPrice}`,
+      message: `Dropship product added — source ₹${live.price} ${marginLabelFor(
+        marginRule
+      )} = ₹${sellingPrice}`,
       product,
       dropship,
     });
@@ -6481,7 +6755,9 @@ app.post(
         success: true,
         updated: Boolean(result.updated),
         message: result.updated
-          ? `Synced — source ₹${entry.sourcePrice} × ${entry.multiplier} = ₹${entry.sellingPrice}`
+          ? `Synced — source ₹${entry.sourcePrice} ${marginLabelFor(
+              entry
+            )} = ₹${entry.sellingPrice}`
           : `Sync failed — purana price rakha gaya (${
               entry.lastSyncError || "live price nahi mila"
             })`,
