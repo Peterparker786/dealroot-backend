@@ -14,6 +14,11 @@ const Razorpay = require("razorpay");
 const multer = require("multer");
 const { v2: cloudinary } = require("cloudinary");
 const { syncPurchaseFormToGoogle } = require("./google-sync");
+const {
+  DROPSHIP_PLATFORMS,
+  fetchSourceProduct,
+  createDropshipSyncService,
+} = require("./dropship-sync");
 
 // Escapes user-provided text before it is placed inside HTML emails.
 const xmlEscape = (value) =>
@@ -1547,6 +1552,55 @@ const salesEntrySchema = new mongoose.Schema(
 );
 
 const SalesEntry = mongoose.model("SalesEntry", salesEntrySchema);
+
+// ===================== DROPSHIP PRODUCTS =====================
+// Kept in its OWN collection on purpose: the existing Product schema, product
+// listing and checkout flow are not modified at all. A dropship product is a
+// normal Product document (so the storefront, cart and orders work as usual)
+// plus one of these records holding its marketplace source + sync state.
+const dropshipProductSchema = new mongoose.Schema(
+  {
+    product: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Product",
+      required: true,
+      unique: true,
+      index: true,
+    },
+    // Marks this catalog entry as dropshipped, as opposed to a regular one.
+    isDropship: { type: Boolean, default: true },
+    title: { type: String, default: "", trim: true },
+    platform: {
+      type: String,
+      enum: DROPSHIP_PLATFORMS,
+      required: true,
+    },
+    sourceUrl: { type: String, required: true, trim: true },
+    multiplier: { type: Number, default: 2, min: 1, max: 10 },
+    // Last successfully fetched source price (never overwritten by a failure).
+    sourcePrice: { type: Number, default: 0, min: 0 },
+    sellingPrice: { type: Number, default: 0, min: 0 },
+    inStock: { type: Boolean, default: true },
+    // Stock the catalog entry should return to when the source is back in stock.
+    stockWhenAvailable: { type: Number, default: 20, min: 1 },
+    active: { type: Boolean, default: true },
+    lastCheckedAt: { type: Date, default: null },
+    lastSyncedAt: { type: Date, default: null },
+    lastSyncStatus: { type: String, enum: ["ok", "failed", ""], default: "" },
+    lastSyncError: { type: String, default: "" },
+  },
+  { timestamps: true }
+);
+
+const DropshipProduct = mongoose.model(
+  "DropshipProduct",
+  dropshipProductSchema
+);
+
+const dropshipSync = createDropshipSyncService({
+  Product,
+  DropshipProduct,
+});
 
 const getStoreSettings = async () => {
   let record = null;
@@ -6205,6 +6259,255 @@ app.delete("/api/products/:id", requireAdmin, async (req, res) => {
   }
 });
 
+// ===================== DROPSHIP PRODUCT ADD (admin) =====================
+// Follows the same "Add product" pattern, but in its own routes and its own
+// collection. On submit it fetches the live source price, multiplies it and
+// creates an ordinary catalog product that the storefront already knows how
+// to render.
+app.post("/api/admin/dropship-products", requireAdmin, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const title = String(body.title || "").trim();
+    const brand = String(body.brand || "").trim();
+    const category = String(body.category || "").trim();
+    const platform = String(body.platform || "").trim();
+    const sourceUrl = String(body.sourceUrl || "").trim();
+    const description = String(body.description || "").trim();
+    const multiplier = Number(body.multiplier || 2);
+
+    if (!title) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Product title is required" });
+    }
+
+    if (!category) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Please choose a category" });
+    }
+
+    if (!DROPSHIP_PLATFORMS.includes(platform)) {
+      return res.status(400).json({
+        success: false,
+        message: "Platform Amazon, Flipkart ya Meesho hona chahiye",
+      });
+    }
+
+    if (!/^https?:\/\//i.test(sourceUrl)) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid source product URL daalein (https://...)",
+      });
+    }
+
+    if (!Number.isFinite(multiplier) || multiplier < 1 || multiplier > 10) {
+      return res.status(400).json({
+        success: false,
+        message: "Markup multiplier 1 se 10 ke beech hona chahiye",
+      });
+    }
+
+    // Live fetch on submit — the first price is always the real source price.
+    let live = null;
+
+    try {
+      live = await fetchSourceProduct({ url: sourceUrl, platform });
+    } catch (error) {
+      return res.status(422).json({
+        success: false,
+        message: `Source product fetch nahi ho paya: ${error.message}`,
+      });
+    }
+
+    if (!live.price || live.price <= 0) {
+      return res.status(422).json({
+        success: false,
+        message:
+          "Source page se live price nahi mila. Link check karein (ya doosra marketplace link try karein) — product add nahi kiya gaya.",
+      });
+    }
+
+    const sellingPrice = roundMoney(live.price * multiplier);
+    const outOfStock = live.inStock === false;
+    const stockWhenAvailable = Math.max(
+      1,
+      Math.round(Number(body.stock) || 20)
+    );
+
+    const images = Array.isArray(body.images)
+      ? body.images.map((img) => String(img).trim()).filter(Boolean)
+      : [];
+
+    const product = await Product.create({
+      brand: brand || platform,
+      title,
+      description,
+      category,
+      price: sellingPrice,
+      mrp: sellingPrice,
+      rating: 0,
+      reviews: 0,
+      images,
+      stock: outOfStock ? 0 : stockWhenAvailable,
+      dealType: "none",
+      marketplaceLinks: [{ platform, url: sourceUrl }],
+      buyLink: sourceUrl,
+      buyLinkLabel: `Buy on ${platform}`,
+    });
+
+    let dropship;
+
+    try {
+      dropship = await DropshipProduct.create({
+        product: product._id,
+        isDropship: true,
+        title,
+        platform,
+        sourceUrl,
+        multiplier,
+        sourcePrice: live.price,
+        sellingPrice,
+        inStock: !outOfStock,
+        stockWhenAvailable,
+        active: true,
+        lastCheckedAt: live.fetchedAt,
+        lastSyncedAt: live.fetchedAt,
+        lastSyncStatus: "ok",
+        lastSyncError: "",
+      });
+    } catch (error) {
+      // Never leave a catalog product behind without its dropship record.
+      await Product.findByIdAndDelete(product._id).catch(() => {});
+      throw error;
+    }
+
+    res.status(201).json({
+      success: true,
+      message: `Dropship product added — source ₹${live.price} × ${multiplier} = ₹${sellingPrice}`,
+      product,
+      dropship,
+    });
+  } catch (error) {
+    console.error("Dropship product add failed:", error.message);
+    res.status(500).json({
+      success: false,
+      message: "Could not add dropship product",
+    });
+  }
+});
+
+// Admin listing for the Dropship tab only — the regular product list is
+// served by the untouched /api/products endpoint.
+app.get("/api/admin/dropship-products", requireAdmin, async (req, res) => {
+  try {
+    const dropshipProducts = await DropshipProduct.find({})
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const productIds = dropshipProducts.map((item) => item.product);
+    const products = await Product.find({ _id: { $in: productIds } })
+      .select("title price mrp stock images")
+      .lean();
+
+    const productById = new Map(
+      products.map((product) => [String(product._id), product])
+    );
+
+    res.set("Cache-Control", "no-store");
+    res.json({
+      success: true,
+      dropshipProducts: dropshipProducts.map((item) => ({
+        ...item,
+        catalog: productById.get(String(item.product)) || null,
+      })),
+    });
+  } catch (error) {
+    console.error("Dropship list failed:", error.message);
+    res.status(500).json({
+      success: false,
+      message: "Could not load dropship products",
+    });
+  }
+});
+
+// Manual "sync now" for the admin tab. The periodic scheduler below calls the
+// exact same routine every 4 hours.
+app.post("/api/admin/dropship-products/sync", requireAdmin, async (req, res) => {
+  try {
+    const report = await dropshipSync.syncAll();
+
+    res.json({
+      success: true,
+      message: report.skipped
+        ? "Sync already running — thodi der baad check karein"
+        : `Sync complete — ${report.updated} updated, ${report.failed} failed (of ${report.checked})`,
+      report,
+    });
+  } catch (error) {
+    console.error("Dropship sync failed:", error.message);
+    res.status(500).json({
+      success: false,
+      message: "Could not run dropship sync",
+    });
+  }
+});
+
+app.delete(
+  "/api/admin/dropship-products/:id",
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const entry = await DropshipProduct.findById(req.params.id);
+
+      if (!entry) {
+        return res.status(404).json({
+          success: false,
+          message: "Dropship product not found",
+        });
+      }
+
+      // Removing the dropship record also removes its catalog entry, so the
+      // storefront never keeps showing a product nobody syncs any more.
+      await Product.findByIdAndDelete(entry.product).catch(() => {});
+      await entry.deleteOne();
+
+      res.json({ success: true, message: "Dropship product deleted" });
+    } catch (error) {
+      console.error("Dropship delete failed:", error.message);
+      res.status(400).json({
+        success: false,
+        message: "Could not delete dropship product",
+      });
+    }
+  }
+);
+
+// Periodic price/stock sync — every 4 hours (inside the requested 4-6h window).
+function startDropshipSyncScheduler() {
+  // Give the server a couple of minutes to settle after a cold start.
+  setTimeout(() => {
+    dropshipSync.syncAll().catch(() => {});
+  }, 2 * 60 * 1000);
+
+  setInterval(() => {
+    dropshipSync
+      .syncAll()
+      .then((report) => {
+        if (report.checked > 0) {
+          console.log(
+            `Dropship sync: ${report.updated} updated, ${report.failed} failed (of ${report.checked})`
+          );
+        }
+      })
+      .catch((error) => {
+        console.error("Dropship sync failed:", error.message);
+      });
+  }, 4 * 60 * 60 * 1000);
+
+  console.log("Dropship sync scheduler started (every 4 hours)");
+}
+
 app.post(
   "/api/payments/razorpay/create-order",
   paymentLimiter,
@@ -9600,6 +9903,7 @@ const startServer = async () => {
     backfillReferralCodes();
     startCartRecoveryScheduler();
     startNewProductEmailScheduler();
+    startDropshipSyncScheduler();
 
     try {
       const count = await Category.countDocuments();
