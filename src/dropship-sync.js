@@ -48,7 +48,11 @@ const BROWSER_PROFILES = [
   },
 ];
 
-const FETCH_TIMEOUT_MS = 25000;
+// Whole-page budget (direct attempts + every proxy gateway). Without a budget
+// a blocked Flipkart page could burn minutes on retries and time the whole
+// admin request out.
+const PAGE_BUDGET_MS = 45000;
+const FETCH_TIMEOUT_MS = 12000;
 
 const PLATFORM_HOME = {
   Amazon: "https://www.amazon.in/",
@@ -105,6 +109,10 @@ const looksBlocked = (html = "", status = 200) => {
 // can be set in .env to put a dedicated proxy in front of all of them.
 const PROXY_GATEWAYS = [
   {
+    name: "reader",
+    build: (url) => `https://r.jina.ai/${url}`,
+  },
+  {
     name: "allorigins",
     build: (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
   },
@@ -115,10 +123,6 @@ const PROXY_GATEWAYS = [
   {
     name: "corsproxy",
     build: (url) => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
-  },
-  {
-    name: "reader",
-    build: (url) => `https://r.jina.ai/${url}`,
   },
 ];
 
@@ -139,8 +143,15 @@ const proxyGateways = () => {
 // One request through the first gateway that answers with something usable.
 // Binary (images) and text (HTML/markdown) are both handled, because the
 // gateways return whatever content type the origin sent.
-const fetchThroughGateways = async (url, { timeoutMs = 20000 } = {}) => {
-  for (const gateway of proxyGateways()) {
+const fetchThroughGateways = async (
+  url,
+  { timeoutMs = 12000, budgetMs = 0, maxGateways = 4 } = {}
+) => {
+  const deadline = budgetMs > 0 ? Date.now() + budgetMs : 0;
+
+  for (const gateway of proxyGateways().slice(0, maxGateways)) {
+    if (deadline && Date.now() + 2000 > deadline) break;
+
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -250,7 +261,10 @@ const imageMagicOk = (buffer) => {
 // Downloads one product image. A 403 on the image host (Flipkart blocks the
 // CDN per-IP too) is retried through the free gateways, and the bytes are
 // magic-checked so a "blocked" HTML error page is never treated as an image.
-const fetchImageBuffer = async (imageUrl, { referer = "", timeoutMs = 20000 } = {}) => {
+const fetchImageBuffer = async (
+  imageUrl,
+  { referer = "", timeoutMs = 12000, budgetMs = 0 } = {}
+) => {
   try {
     const response = await fetch(imageUrl, {
       headers: {
@@ -277,7 +291,9 @@ const fetchImageBuffer = async (imageUrl, { referer = "", timeoutMs = 20000 } = 
   }
 
   const proxied = await fetchThroughGateways(imageUrl, {
-    timeoutMs: Math.min(timeoutMs, 20000),
+    timeoutMs: Math.min(timeoutMs, 10000),
+    budgetMs,
+    maxGateways: 2,
   });
 
   if (proxied?.buffer && imageMagicOk(proxied.buffer)) {
@@ -369,9 +385,18 @@ async function fetchPageHtml(url, { platform = "" } = {}) {
   let sawBlock = false;
   let sawTimeout = false;
 
+  const deadline = Date.now() + PAGE_BUDGET_MS;
+
   for (let attempt = 0; attempt < BROWSER_PROFILES.length; attempt += 1) {
+    const remaining = deadline - Date.now();
+
+    if (remaining < 8000) break;
+
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    const timer = setTimeout(
+      () => controller.abort(),
+      Math.min(FETCH_TIMEOUT_MS, remaining)
+    );
 
     try {
       const response = await fetch(url, {
@@ -396,8 +421,11 @@ async function fetchPageHtml(url, { platform = "" } = {}) {
     }
   }
 
-  // Stage 2 — the free read-through gateways.
-  const proxied = await fetchThroughGateways(url);
+  // Stage 2 — the free read-through gateways, inside the remaining budget.
+  const proxied = await fetchThroughGateways(url, {
+    timeoutMs: FETCH_TIMEOUT_MS,
+    budgetMs: Math.max(0, deadline - Date.now()),
+  });
 
   if (proxied?.text && !looksBlocked(proxied.text, 200)) {
     const isMarkdown =

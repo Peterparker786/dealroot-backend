@@ -6397,14 +6397,20 @@ app.post(
       } else {
         // Prefer the first image, but a blocked (403) or placeholder image must
         // not kill the extraction: try the next gallery images until one works.
+        // Everything image-related shares one budget so a blocked CDN can never
+        // stall the whole request.
+        const imageDeadline = Date.now() + 30000;
         let usableImage = null;
         let chosenIndex = -1;
 
         for (let i = 0; i < Math.min(pageImages.length, 3); i += 1) {
+          if (Date.now() + 3000 > imageDeadline) break;
+
           try {
             const downloaded = await fetchImageBuffer(pageImages[i], {
               referer: url,
-              timeoutMs: 25000,
+              timeoutMs: 10000,
+              budgetMs: Math.max(0, imageDeadline - Date.now()),
             });
 
             if (downloaded) {
@@ -6453,14 +6459,16 @@ app.post(
           }
         }
 
-        // Remaining gallery images — each one fails on its own.
+        // Remaining gallery images — each one fails on its own, inside budget.
         for (let i = 0; i < Math.min(pageImages.length, 6); i += 1) {
           if (i === chosenIndex) continue;
+          if (Date.now() + 3000 > imageDeadline) break;
 
           try {
             const extra = await fetchImageBuffer(pageImages[i], {
               referer: url,
-              timeoutMs: 20000,
+              timeoutMs: 8000,
+              budgetMs: Math.max(0, imageDeadline - Date.now()),
             });
 
             if (!extra || extra.buffer.length <= 10000) continue;
