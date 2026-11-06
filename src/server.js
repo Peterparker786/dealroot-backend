@@ -56,21 +56,42 @@ const smtpTransporter =
       })
     : null;
 
-async function brevoSendMail({ from, to, subject, html }) {
+// Free mailbox providers publish DMARC policies for their own domain, so an
+// email "from" @gmail.com sent through a third-party relay (Brevo) fails
+// authentication at providers like Gmail and gets deferred as "Delivery
+// incomplete". The sender must be an address on the store's own domain.
+const FREE_MAIL_DOMAINS =
+  /@(gmail|googlemail|yahoo|outlook|hotmail|live|rediffmail|aol|proton|icloud)\./i;
+
+const brevoSenderEmail = () =>
+  String(
+    process.env.BREVO_SENDER_EMAIL ||
+      process.env.EMAIL_USER ||
+      "dealroot.store@gmail.com"
+  ).trim();
+
+async function brevoSendMail({ from, to, subject, html, text, replyTo, headers }) {
   const key = process.env.BREVO_API_KEY;
   if (!key) throw new Error("BREVO_API_KEY is not set");
   const https = require("https");
+
+  // Replies should reach the real inbox even when the sender is a no-reply
+  // address on the store's domain.
+  const replyAddress = String(
+    replyTo || process.env.EMAIL_REPLY_TO || process.env.EMAIL_USER || ""
+  ).trim();
+
   const body = JSON.stringify({
     sender: {
-      email:
-        process.env.BREVO_SENDER_EMAIL ||
-        process.env.EMAIL_USER ||
-        "dealroot.store@gmail.com",
+      email: brevoSenderEmail(),
       name: "DEALROOT Beauty",
     },
+    ...(replyAddress ? { replyTo: { email: replyAddress } } : {}),
     to: [{ email: to }],
     subject,
     htmlContent: html,
+    ...(text ? { textContent: text } : {}),
+    ...(headers && Object.keys(headers).length ? { headers } : {}),
   });
   return new Promise((resolve, reject) => {
     const req = https.request(
@@ -2892,6 +2913,8 @@ app.get("/api/admin/net-test", requireAdmin, async (req, res) => {
 app.get("/api/admin/email-status", requireAdmin, async (req, res) => {
   try {
     const brevoMode = Boolean(process.env.BREVO_API_KEY);
+    const senderEmail = brevoMode ? brevoSenderEmail() : String(process.env.EMAIL_USER || "");
+    const senderDomain = senderEmail.split("@")[1] || "";
     const status = {
       transport: brevoMode ? "brevo-api" : "gmail-smtp",
       emailUserSet: Boolean(process.env.EMAIL_USER),
@@ -2900,7 +2923,25 @@ app.get("/api/admin/email-status", requireAdmin, async (req, res) => {
       adminEmailSet: Boolean(process.env.ADMIN_EMAIL),
       dryRun: process.env.ORDER_STATUS_EMAIL_DRY_RUN === "true",
       from: process.env.EMAIL_USER ? String(process.env.EMAIL_USER).replace(/./g, (c, i) => (i < 3 ? c : "*")) : null,
+      // Deliverability: a relay sending "from" a gmail.com address cannot pass
+      // DMARC, so providers defer or reject it ("Delivery incomplete").
+      senderDomain: senderDomain || null,
+      senderIsFreeMailbox: brevoMode ? FREE_MAIL_DOMAINS.test(senderEmail) : false,
     };
+
+    if (status.senderIsFreeMailbox) {
+      status.deliverability = {
+        ok: false,
+        problem:
+          "Brevo se @" +
+          senderDomain +
+          " address se mail ja raha hai. Gmail/Yahoo apne domain ka DMARC enforce karte hain, isliye aise mails defer ya reject hote hain (\"Delivery incomplete\").",
+        fix:
+          "Brevo me dealroot.store domain verify karein (SPF + DKIM), phir BREVO_SENDER_EMAIL=orders@dealroot.store set karein. EMAIL_USER (Gmail) sirf reply-to rahega.",
+      };
+    } else {
+      status.deliverability = { ok: true };
+    }
 
     if (!process.env.EMAIL_USER) {
       status.smtp = "not-configured: EMAIL_USER missing";
@@ -8310,6 +8351,7 @@ let lastNewProductEmailSent = null;
 let lastNewProductEmailCount = 0;
 let newProductEmailRunning = false;
 let newProductEmailError = null;
+let lastNewProductEmailFailures = [];
 
 async function sendNewProductEmails() {
   const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
@@ -8447,29 +8489,71 @@ async function sendNewProductEmails() {
       </table>
     </div>`;
 
-  // Send emails in batches to avoid rate limits.
+  // Plain-text alternative — bulk mail with HTML only scores worse with Gmail
+  // and friends, which is where the "Delivery incomplete" deferrals come from.
+  const textBody = [
+    `${newProducts.length} new arrivals just dropped on DEALROOT`,
+    "",
+    ...newProducts.slice(0, 12).map((p, index) => `${index + 1}. ${p.title} — ${money(p.price)}`),
+    "",
+    `Shop all new arrivals: ${siteUrl}`,
+  ].join("\n");
+
+  // One bad address used to bounce (or hang) on its own; skip malformed ones
+  // and remember every rejection so the status panel can show it.
+  const recipients = customers
+    .map((customer) => String(customer.email || "").trim())
+    .filter((email) => /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email));
+
   let sent = 0;
+  const failures = [];
   const BATCH_SIZE = 10;
   const BATCH_DELAY_MS = 2000;
 
-  for (let i = 0; i < customers.length; i += BATCH_SIZE) {
-    const batch = customers.slice(i, i + BATCH_SIZE);
+  for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
+    const batch = recipients.slice(i, i + BATCH_SIZE);
     const results = await Promise.allSettled(
-      batch.map((customer) =>
+      batch.map((email) =>
         transporter.sendMail({
           from: `"DEALROOT Beauty" <${process.env.EMAIL_USER}>`,
-          to: customer.email,
+          to: email,
           subject,
           html,
+          text: textBody,
+          replyTo: process.env.EMAIL_REPLY_TO || process.env.EMAIL_USER,
+          // Gmail/Yahoo want a one-click unsubscribe on bulk mail; without it
+          // campaigns get throttled or filed as spam.
+          headers: {
+            "List-Unsubscribe": `<${siteUrl}/account>, <mailto:${process.env.EMAIL_USER}?subject=unsubscribe>`,
+            "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+          },
         })
       )
     );
-    sent += results.filter((r) => r.status === "fulfilled").length;
+
+    results.forEach((result, index) => {
+      if (result.status === "fulfilled") {
+        sent += 1;
+      } else {
+        failures.push({
+          email: batch[index],
+          error: String(result.reason?.message || result.reason || "send failed").slice(0, 200),
+        });
+      }
+    });
 
     // Small delay between batches.
-    if (i + BATCH_SIZE < customers.length) {
+    if (i + BATCH_SIZE < recipients.length) {
       await new Promise((resolve) => setTimeout(resolve, BATCH_DELAY_MS));
     }
+  }
+
+  lastNewProductEmailFailures = failures;
+
+  if (failures.length) {
+    console.warn(
+      `New product email: ${failures.length} failed — first: ${failures[0].email} (${failures[0].error})`
+    );
   }
 
   lastNewProductEmailSent = new Date();
@@ -8525,6 +8609,7 @@ app.get("/api/admin/new-product-email/status", requireAdmin, async (req, res) =>
     lastCount: lastNewProductEmailCount,
     running: newProductEmailRunning,
     error: newProductEmailError,
+    failures: lastNewProductEmailFailures,
     nextRun: lastNewProductEmailSent
       ? new Date(lastNewProductEmailSent.getTime() + 24 * 60 * 60 * 1000)
       : null,
