@@ -88,7 +88,7 @@ const browserHeadersFor = (url, attempt = 0, platform = "") => {
 // Text that marketplaces put on their block / CAPTCHA pages. Matched only on
 // the first chunk of the page so a normal product description can never trip it.
 const BLOCK_MARKERS =
-  /ip[\s_-]?blocked|access denied|unusual traffic|are you a robot|verify (?:that )?you are (?:a )?human|request blocked|px-captcha|incapsula|cf-error|just a moment\.\.\.|enable javascript and cookies to continue/i;
+  /ip[\s_-]?blocked|access denied|unusual traffic|are you a robot|verify (?:that )?you are (?:a )?human|request blocked|px-captcha|incapsula|cf-error|just a moment\.\.\.|enable javascript and cookies to continue|enter the characters you see below|type the characters you see|api-services-support@amazon\.com|to discuss automated access|sorry,? we just need to make sure you(?:'|&#39;|’)re not a robot/i;
 
 const BLOCK_STATUSES = [403, 429, 451, 503];
 
@@ -103,6 +103,14 @@ const looksBlocked = (html = "", status = 200) => {
 
   return BLOCK_MARKERS.test(head);
 };
+
+// A product page must carry some product data. Amazon also answers with a
+// short "continue shopping" interstitial (HTTP 200) that has no price, stock
+// or title, which would otherwise look like a valid page with an empty price.
+const looksLikeProductPage = (html = "") =>
+  /id=["']productTitle["']|class=["'][^"']*a-price-whole|itemprop=["']price["']|"og:title"|class=["'][^"']*_30jeq3|add\s+to\s+cart|add\s+to\s+bag|buy\s+now/i.test(
+    String(html).slice(0, 400000)
+  );
 
 // Free read-through gateways, tried in order when a platform blocks our IP.
 // `SCRAPER_PROXY_TEMPLATE` (e.g. "https://user:pass@proxy.example/fetch?url={url}")
@@ -424,11 +432,20 @@ async function fetchPageHtml(url, { platform = "" } = {}) {
 
       const html = (await response.text()).slice(0, 3000000);
 
-      if (response.ok && !looksBlocked(html, response.status)) {
+      if (
+        response.ok &&
+        !looksBlocked(html, response.status) &&
+        looksLikeProductPage(html)
+      ) {
         return { html, via: "direct", status: response.status, warnings: [] };
       }
 
-      if (looksBlocked(html, response.status)) sawBlock = true;
+      if (
+        looksBlocked(html, response.status) ||
+        (response.ok && !looksLikeProductPage(html))
+      ) {
+        sawBlock = true;
+      }
     } catch (error) {
       if (error.name === "AbortError") sawTimeout = true;
     } finally {
@@ -525,6 +542,38 @@ const parseDigiHaatStock = (html) => {
   return null;
 };
 
+// Amazon's own buy-box availability, which is far more reliable than scanning
+// the whole page: product pages routinely contain "Currently unavailable" in
+// other sellers / recommendation blocks even when the main offer is in stock.
+const parseAmazonStock = (html) => {
+  if (/id=["']outOfStock["']/i.test(html)) return false;
+
+  // A rendered buy box is the strongest possible in-stock signal.
+  if (
+    /id=["']add-to-cart-button["']/i.test(html) ||
+    /name=["']submit\.add-to-cart["']/i.test(html)
+  ) {
+    return true;
+  }
+
+  const availabilityBlock =
+    html.match(/id=["']availability["'][^>]*>([\s\S]{0,400}?)<\/(?:div|span)>/i)?.[1] ||
+    "";
+
+  const availabilityText = availabilityBlock
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (/currently unavailable|out of stock|unavailable/i.test(availabilityText)) {
+    return false;
+  }
+
+  if (/in stock|only \d+ left/i.test(availabilityText)) return true;
+
+  return null;
+};
+
 // Reads the *selling* price from the source page. Tried in order of
 // reliability: structured data first, then the platform's own markup.
 const parsePrice = (html, platform = "") => {
@@ -534,6 +583,24 @@ const parsePrice = (html, platform = "") => {
     const digiHaatPrice = parseDigiHaatPrice(html);
 
     if (digiHaatPrice) return digiHaatPrice;
+  }
+
+  // Amazon: the buy-box price is what a shopper actually pays, so it wins over
+  // any other "price" that appears in the page's embedded JSON.
+  if (String(platform).toLowerCase().includes("amazon")) {
+    const amazonPatterns = [
+      /id=["'](?:corePrice_feature_div|corePriceDisplay_desktop_feature_div|priceblock_ourprice|priceblock_dealprice)["'][\s\S]{0,4000}?class=["'][^"']*a-price-whole[^"']*["'][^>]*>\s*([0-9,]+)/i,
+      /class=["'][^"']*a-price-whole[^"']*["'][^>]*>\s*([0-9,]+)/i,
+      /id=["']priceblock_ourprice["'][^>]*>\s*(?:₹|&#8377;|Rs\.?)?\s*([0-9,]+)/i,
+    ];
+
+    for (const pattern of amazonPatterns) {
+      const value = Number(
+        String(html.match(pattern)?.[1] || "").replace(/,/g, "")
+      );
+
+      if (Number.isFinite(value) && value > 0) return value;
+    }
   }
 
   const patterns = [
@@ -564,10 +631,18 @@ const parsePrice = (html, platform = "") => {
 
 // true = in stock, false = out of stock, null = could not tell.
 const parseStock = (html, platform = "") => {
+  const isAmazon = String(platform).toLowerCase().includes("amazon");
+
   if (String(platform).toLowerCase().includes("digihaat")) {
     const digiHaatStock = parseDigiHaatStock(html);
 
     if (digiHaatStock !== null) return digiHaatStock;
+  }
+
+  if (isAmazon) {
+    const amazonStock = parseAmazonStock(html);
+
+    if (amazonStock !== null) return amazonStock;
   }
 
   const availability = html.match(
@@ -581,7 +656,10 @@ const parseStock = (html, platform = "") => {
     if (/in\s*stock|limited\s*availability|online\s*only/i.test(availability)) return true;
   }
 
+  // Loose whole-page scan, skipped for Amazon where those words also appear in
+  // other-seller and recommendation blocks.
   if (
+    !isAmazon &&
     /currently unavailable|out of stock|sold out|notify me when|अभी उपलब्ध नहीं/i.test(
       html
     )
