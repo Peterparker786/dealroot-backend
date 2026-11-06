@@ -2330,7 +2330,16 @@ if (isCod && subtotal >= 499) {
   );
 }
 
-const payableNow = roundMoney(
+// Wallet balance is prepaid-only: it reduces the amount charged online and
+// an order that uses it can never be Cash on Delivery, so store credit is
+// always settled up front instead of at the door.
+if (useWallet && isCod && subtotal >= WALLET_MIN_SUBTOTAL) {
+  throw new Error(
+    "Wallet balance can only be used on prepaid orders. Pay online to use it, or uncheck wallet balance to keep Cash on Delivery."
+  );
+}
+
+let payableNow = roundMoney(
   isCod ? deliveryFee : totalAmount
 );
 
@@ -2338,17 +2347,23 @@ let codAmount = roundMoney(
   isCod ? totalAmount - deliveryFee : 0
 );
 
-// Wallet balance only ever reduces the "pay at the door" portion of a COD
-// order — the online delivery-charge prepay step is untouched, so nothing
-// about the existing Razorpay/COD flow changes when wallet isn't used.
 let walletUsed = 0;
 
-if (useWallet && userId && isCod && codAmount > 0 && subtotal >= WALLET_MIN_SUBTOTAL) {
+if (
+  useWallet &&
+  userId &&
+  !isCod &&
+  subtotal >= WALLET_MIN_SUBTOTAL &&
+  payableNow > 1
+) {
   const walletUser = await User.findById(userId).select("walletBalance");
   const availableWallet = Math.max(0, walletUser?.walletBalance || 0);
 
-  walletUsed = roundMoney(Math.min(availableWallet, codAmount));
-  codAmount = roundMoney(codAmount - walletUsed);
+  // At least ₹1 stays payable so Razorpay always has an amount to charge.
+  walletUsed = roundMoney(
+    Math.min(availableWallet, Math.max(0, payableNow - 1))
+  );
+  payableNow = roundMoney(payableNow - walletUsed);
 }
 
 const amountInPaise = Math.round(payableNow * 100);
