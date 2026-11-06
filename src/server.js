@@ -3780,7 +3780,9 @@ app.get("/api/products/:id", async (req, res) => {
       });
     }
 
-    // Tryout-exclusive products are only visible to approved members & admins.
+    // Tryout-exclusive products live only inside the Tryout area: outside of it
+    // they are not viewable, not even by an admin — the admin panel manages
+    // them through its own screens.
     if (product.tryoutOnly) {
       let viewer = null;
       const bearer = readBearerToken(req);
@@ -3792,8 +3794,8 @@ app.get("/api/products/:id", async (req, res) => {
         }
       }
 
-      let allowed = viewer?.role === "admin";
-      if (!allowed && viewer?.role === "user" && viewer.userId) {
+      let allowed = false;
+      if (viewer?.role === "user" && viewer.userId) {
         const member = await TryoutApplication.findOne({
           user: viewer.userId,
           status: "approved",
