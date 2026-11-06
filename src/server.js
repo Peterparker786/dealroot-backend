@@ -6733,6 +6733,223 @@ app.post("/api/admin/dropship-products", requireAdmin, async (req, res) => {
   }
 });
 
+// Edit a dropship product. Its catalog entry and dropship record are kept in
+// step, and the live source price is only re-read when the source link itself
+// changed — an edit never fails just because a marketplace is blocking a
+// re-fetch of an unchanged link.
+app.put("/api/admin/dropship-products/:id", requireAdmin, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const entry = await DropshipProduct.findById(req.params.id);
+
+    if (!entry) {
+      return res.status(404).json({
+        success: false,
+        message: "Dropship product not found",
+      });
+    }
+
+    const title = String(body.title || "").trim();
+    const brand = String(body.brand || "").trim();
+    const category = String(body.category || "").trim();
+    const platform = String(body.platform || "").trim();
+    const sourceUrl = String(body.sourceUrl || "").trim();
+    const description = String(body.description || "").trim();
+    const marginType = String(
+      body.marginType || entry.marginType || "percentage"
+    ).toLowerCase();
+    const marginValue = Number(
+      body.marginValue === undefined || body.marginValue === ""
+        ? entry.marginValue ?? 100
+        : body.marginValue
+    );
+
+    if (!title) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Product title is required" });
+    }
+
+    if (!category) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Please choose a category" });
+    }
+
+    if (!DROPSHIP_PLATFORMS.includes(platform)) {
+      return res.status(400).json({
+        success: false,
+        message: "Platform Amazon, Flipkart, Meesho ya DigiHaat hona chahiye",
+      });
+    }
+
+    if (!/^https?:\/\//i.test(sourceUrl)) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid source product URL daalein (https://...)",
+      });
+    }
+
+    if (!["percentage", "flat"].includes(marginType)) {
+      return res.status(400).json({
+        success: false,
+        message: "Margin type percentage ya flat hona chahiye",
+      });
+    }
+
+    if (!Number.isFinite(marginValue) || marginValue < 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Margin 0 ya usse zyada hona chahiye",
+      });
+    }
+
+    if (marginType === "percentage" && marginValue > 1000) {
+      return res.status(400).json({
+        success: false,
+        message: "Percentage margin 1000% se zyada nahi ho sakta",
+      });
+    }
+
+    if (marginType === "flat" && marginValue > 1000000) {
+      return res.status(400).json({
+        success: false,
+        message: "Flat margin bahut zyada hai",
+      });
+    }
+
+    const sourceChanged = sourceUrl !== String(entry.sourceUrl || "").trim();
+    let live = null;
+
+    if (sourceChanged) {
+      try {
+        live = await fetchSourceProduct({ url: sourceUrl, platform });
+      } catch (error) {
+        return res.status(422).json({
+          success: false,
+          message: `Source product fetch nahi ho paya: ${error.message}`,
+        });
+      }
+
+      if (!live.price || live.price <= 0) {
+        return res.status(422).json({
+          success: false,
+          message:
+            "Source page se live price nahi mila. Link check karein — changes save nahi kiye gaye.",
+        });
+      }
+    }
+
+    const sourcePrice = live
+      ? live.price
+      : Number(entry.sourcePrice) || 0;
+    const marginRule = { marginType, marginValue };
+    const sellingPrice = sellingPriceFor(sourcePrice, marginRule);
+    const inStock = live
+      ? live.inStock !== false
+      : entry.inStock !== false;
+    const stockWhenAvailable = Math.max(
+      1,
+      Math.round(Number(body.stock) || entry.stockWhenAvailable || 20)
+    );
+
+    const images = Array.isArray(body.images)
+      ? body.images.map((img) => String(img).trim()).filter(Boolean)
+      : [];
+
+    const specifications = Array.isArray(body.specifications)
+      ? body.specifications
+          .map((spec) => ({
+            label: String(spec?.label || "").trim(),
+            value: String(spec?.value || "").trim(),
+          }))
+          .filter((spec) => spec.label && spec.value)
+          .slice(0, 30)
+      : [];
+
+    const highlights = Array.isArray(body.highlights)
+      ? body.highlights
+          .map((item) => String(item).trim())
+          .filter(Boolean)
+          .slice(0, 15)
+      : [];
+
+    const requestedMrp = Number(body.mrp);
+    const mrp =
+      Number.isFinite(requestedMrp) && requestedMrp > 0
+        ? Math.max(sellingPrice, requestedMrp)
+        : sellingPrice;
+
+    const catalog = await Product.findById(entry.product);
+
+    if (!catalog) {
+      return res.status(404).json({
+        success: false,
+        message:
+          "Linked catalog product missing — delete this entry and add the product again",
+      });
+    }
+
+    await Product.findByIdAndUpdate(entry.product, {
+      brand: brand || platform,
+      title,
+      description,
+      category,
+      price: sellingPrice,
+      mrp,
+      rating: Number(body.rating) || 0,
+      reviews: Number(body.reviews) || 0,
+      images,
+      specifications,
+      highlights,
+      stock: inStock ? stockWhenAvailable : 0,
+      marketplaceLinks: [{ platform, url: sourceUrl }],
+      buyLink: sourceUrl,
+      buyLinkLabel: `Buy on ${platform}`,
+    });
+
+    entry.title = title;
+    entry.platform = platform;
+    entry.sourceUrl = sourceUrl;
+    entry.marginType = marginType;
+    entry.marginValue = marginValue;
+    entry.multiplier =
+      marginType === "percentage"
+        ? Math.min(10, Math.max(1, 1 + marginValue / 100))
+        : 1;
+    entry.sourcePrice = sourcePrice;
+    entry.sellingPrice = sellingPrice;
+    entry.inStock = inStock;
+    entry.stockWhenAvailable = stockWhenAvailable;
+
+    if (live) {
+      entry.lastCheckedAt = live.fetchedAt;
+      entry.lastSyncedAt = live.fetchedAt;
+      entry.lastSyncStatus = "ok";
+      entry.lastSyncError = "";
+    }
+
+    await entry.save();
+
+    const product = await Product.findById(entry.product).lean();
+
+    res.json({
+      success: true,
+      message: `Dropship product updated — source ₹${sourcePrice} ${marginLabelFor(
+        marginRule
+      )} = ₹${sellingPrice}`,
+      product,
+      dropship: entry,
+    });
+  } catch (error) {
+    console.error("Dropship product update failed:", error.message);
+    res.status(500).json({
+      success: false,
+      message: "Could not update dropship product",
+    });
+  }
+});
+
 // Admin listing for the Dropship tab only — the regular product list is
 // served by the untouched /api/products endpoint.
 app.get("/api/admin/dropship-products", requireAdmin, async (req, res) => {
@@ -6742,8 +6959,12 @@ app.get("/api/admin/dropship-products", requireAdmin, async (req, res) => {
       .lean();
 
     const productIds = dropshipProducts.map((item) => item.product);
+    // The Dropship tab's Edit action fills the form from this payload, so the
+    // editable catalog fields are included too.
     const products = await Product.find({ _id: { $in: productIds } })
-      .select("title price mrp stock images")
+      .select(
+        "title brand description category price mrp stock images specifications highlights rating reviews"
+      )
       .lean();
 
     const productById = new Map(
