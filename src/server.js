@@ -8345,16 +8345,28 @@ function startCartRecoveryScheduler() {
 }
 
 // ===================== NEW PRODUCTS DAILY EMAIL =====================
-// Every 24 hours, find products added in the last 24 hours and email
-// all registered customers with a "New Arrivals" newsletter.
+// Every 24 hours, find recently added products and email all registered
+// customers with a "New Arrivals" newsletter. The lookback window defaults to
+// 24 hours, but can be widened (e.g. 168 = 7 days) with NEW_ARRIVAL_WINDOW_HOURS
+// so a campaign can still go out when nothing was added in the last day.
+const newArrivalWindowHours = (() => {
+  const raw = Number(process.env.NEW_ARRIVAL_WINDOW_HOURS);
+  if (!Number.isFinite(raw) || raw <= 0) return 24;
+  return Math.min(Math.round(raw), 24 * 90); // cap at 90 days
+})();
+
+const newArrivalWindowMs = newArrivalWindowHours * 60 * 60 * 1000;
 let lastNewProductEmailSent = null;
 let lastNewProductEmailCount = 0;
 let newProductEmailRunning = false;
 let newProductEmailError = null;
 let lastNewProductEmailFailures = [];
 
-async function sendNewProductEmails() {
-  const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+async function sendNewProductEmails({ windowHours } = {}) {
+  // A one-off manual campaign can widen the window without changing what the
+  // daily scheduler does (otherwise the same products would be re-sent daily).
+  const hours = windowHours || newArrivalWindowHours;
+  const since = new Date(Date.now() - hours * 60 * 60 * 1000);
 
   // Find products created in the last 24 hours. Tryout-exclusive products
   // stay out of the newsletter — only approved members can see them.
@@ -8366,7 +8378,9 @@ async function sendNewProductEmails() {
     .lean();
 
   if (!newProducts || newProducts.length === 0) {
-    console.log("New product email: no new products in last 24h — skipped");
+    console.log(
+      `New product email: no new products in the last ${hours}h — skipped`
+    );
     return 0;
   }
 
@@ -8433,7 +8447,7 @@ async function sendNewProductEmails() {
                 <td style="background:linear-gradient(135deg,#7c3aed,#ec4899);padding:32px 40px;text-align:center;">
                   <div style="font-size:28px;margin-bottom:8px;">🛍️</div>
                   <h1 style="margin:0;color:#fff;font-size:24px;font-weight:700;letter-spacing:-0.5px;">New Arrivals Just Dropped!</h1>
-                  <p style="margin:8px 0 0;color:rgba(255,255,255,0.85);font-size:14px;">${newProducts.length} fresh products added in the last 24 hours</p>
+                  <p style="margin:8px 0 0;color:rgba(255,255,255,0.85);font-size:14px;">${newProducts.length} fresh products added in the last ${hours >= 24 ? Math.round(hours / 24) + " days" : hours + " hours"}</p>
                 </td>
               </tr>
 
@@ -8565,12 +8579,12 @@ async function sendNewProductEmails() {
 // Send the newsletter in the background so the admin endpoint can respond
 // instantly — batch-sending to dozens of customers over SMTP easily takes
 // 30-60s, far beyond a normal HTTP request timeout.
-async function runNewProductEmailJob() {
+async function runNewProductEmailJob(options = {}) {
   if (newProductEmailRunning) return;
   newProductEmailRunning = true;
   newProductEmailError = null;
   try {
-    await sendNewProductEmails();
+    await sendNewProductEmails(options);
   } catch (error) {
     newProductEmailError = error.message;
     console.error("New product email job failed:", error.message);
@@ -8591,10 +8605,17 @@ app.post("/api/admin/new-product-email/run", requireAdmin, async (req, res) => {
     });
   }
 
-  runNewProductEmailJob();
+  const requestedHours = Number(req.body?.hours);
+  const windowHours =
+    Number.isFinite(requestedHours) && requestedHours > 0
+      ? Math.min(Math.round(requestedHours), 24 * 90)
+      : undefined;
+
+  runNewProductEmailJob({ windowHours });
 
   res.json({
     success: true,
+    windowHours: windowHours || newArrivalWindowHours,
     message: "Newsletter sending started — it will finish in the background (check status in a minute)",
     running: true,
     sent: 0,
@@ -8610,6 +8631,7 @@ app.get("/api/admin/new-product-email/status", requireAdmin, async (req, res) =>
     running: newProductEmailRunning,
     error: newProductEmailError,
     failures: lastNewProductEmailFailures,
+    windowHours: newArrivalWindowHours,
     nextRun: lastNewProductEmailSent
       ? new Date(lastNewProductEmailSent.getTime() + 24 * 60 * 60 * 1000)
       : null,
