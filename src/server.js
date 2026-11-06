@@ -3716,8 +3716,16 @@ app.get("/api/products", async (req, res) => {
       }
     }
 
-    let canSeeTryout = viewer?.role === "admin";
-    if (!canSeeTryout && viewer?.role === "user" && viewer.userId) {
+    // Tryout-exclusive products belong to the Tryout area only. The admin
+    // panel asks for them explicitly with `includeTryout=1`; the storefront
+    // never gets them just because the visitor happens to be signed in as an
+    // admin, and an approved member only sees them from the Tryout pages.
+    const includeTryout =
+      String(req.query.includeTryout || "") === "1" &&
+      viewer?.role === "admin";
+
+    let canSeeTryout = false;
+    if (!includeTryout && viewer?.role === "user" && viewer.userId) {
       const member = await TryoutApplication.findOne({
         user: viewer.userId,
         status: "approved",
@@ -3727,7 +3735,7 @@ app.get("/api/products", async (req, res) => {
       canSeeTryout = Boolean(member);
     }
 
-    if (!canSeeTryout) {
+    if (!includeTryout && !canSeeTryout) {
       filter.tryoutOnly = { $ne: true };
     }
 
@@ -3743,7 +3751,7 @@ app.get("/api/products", async (req, res) => {
     // 60s browser cache was making those edits look like they hadn't
     // saved (the list kept showing the old number until the cache expired).
     let cacheControl = "public, max-age=120, stale-while-revalidate=600";
-    if (viewer?.role === "admin") {
+    if (viewer?.role === "admin" || includeTryout) {
       cacheControl = "no-store";
     } else if (canSeeTryout) {
       // Members must never get a cached response: a browser that had cached
