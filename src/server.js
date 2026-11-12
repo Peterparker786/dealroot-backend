@@ -1604,6 +1604,15 @@ const storeSettingsSchema = new mongoose.Schema(
       min: 0,
       max: 1000,
     },
+    // What the courier company charges the store per delivered order. Profit
+    // subtracts this (times the number of delivered orders), not the delivery
+    // fee customers pay. An order-level override still wins — see Order.deliveryCost.
+    courierCostPerOrder: {
+      type: Number,
+      default: DEFAULT_DELIVERY_FEE,
+      min: 0,
+      max: 1000,
+    },
   },
   { timestamps: true }
 );
@@ -1692,11 +1701,16 @@ const getStoreSettings = async () => {
   }
 
   const savedFee = Number(record?.deliveryFee);
+  const savedCourierCost = Number(record?.courierCostPerOrder);
 
   return {
     deliveryFee:
       Number.isFinite(savedFee) && savedFee > 0
         ? savedFee
+        : DEFAULT_DELIVERY_FEE,
+    courierCostPerOrder:
+      Number.isFinite(savedCourierCost) && savedCourierCost >= 0
+        ? savedCourierCost
         : DEFAULT_DELIVERY_FEE,
     freeDeliveryThreshold: FREE_DELIVERY_THRESHOLD,
   };
@@ -5054,6 +5068,42 @@ app.post("/api/coupons", requireAdmin, async (req, res) => {
   }
 });
 
+// Admin: the courier company's rate per delivered order. Every delivered
+// order in the sales report is costed at this rate unless that order has its
+// own override. Independent of the delivery fee customers are charged.
+app.put("/api/admin/courier-cost", requireAdmin, async (req, res) => {
+  try {
+    const courierCostPerOrder = Number(req.body?.courierCostPerOrder);
+
+    if (
+      !Number.isInteger(courierCostPerOrder) ||
+      courierCostPerOrder < 0 ||
+      courierCostPerOrder > 1000
+    ) {
+      throw new Error(
+        "Courier cost must be a whole number between ₹0 and ₹1000"
+      );
+    }
+
+    const saved = await StoreSettings.findOneAndUpdate(
+      { key: STORE_SETTINGS_KEY },
+      { $set: { courierCostPerOrder } },
+      { new: true, upsert: true, runValidators: true }
+    );
+
+    res.json({
+      success: true,
+      message: `Courier cost updated to ₹${saved.courierCostPerOrder} per order`,
+      courierCostPerOrder: saved.courierCostPerOrder,
+    });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      message: error.message || "Could not save the courier cost",
+    });
+  }
+});
+
 app.put("/api/admin/store-settings", requireAdmin, async (req, res) => {
   try {
     const deliveryFee = Number(req.body?.deliveryFee);
@@ -5224,7 +5274,7 @@ app.get("/api/admin/sales-stats", requireAdmin, async (req, res) => {
 
     const storeSettings = await getStoreSettings();
 
-    const deliveryFee = storeSettings.deliveryFee;
+    const courierCostPerOrder = storeSettings.courierCostPerOrder;
 
     const freeDeliveryThreshold = FREE_DELIVERY_THRESHOLD;
 
@@ -5232,11 +5282,12 @@ app.get("/api/admin/sales-stats", requireAdmin, async (req, res) => {
 
     orders.forEach(order => {
       const orderRevenue = order.totalAmount || 0;
-      // Actual courier cost when the admin entered one, otherwise the
-      // delivery fee charged to the customer.
+      // What the courier company charges the store: the admin-set rate per
+      // order, unless this order has its own override. The delivery fee the
+      // customer pays is deliberately NOT used as a cost.
       const deliveryFee =
         order.deliveryCost === null || order.deliveryCost === undefined
-          ? order.deliveryFee || 0
+          ? courierCostPerOrder
           : order.deliveryCost;
       // Cashback only costs the store when the customer actually spends it
       // from their wallet on an order. Adding it to a wallet (or a coupon
@@ -5411,6 +5462,7 @@ app.get("/api/admin/sales-stats", requireAdmin, async (req, res) => {
         totalDeliveryFees: totalDeliveryFees,
         totalCashbackGiven: totalWalletCashbackUsed,
         totalCashbackRecovered: totalCashbackRecovered,
+        courierCostPerOrder: courierCostPerOrder,
         totalRazorpayFees: totalRazorpayFees,
         offlineIncome: offlineIncome,
         extraExpenses: extraExpenses,
