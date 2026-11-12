@@ -246,7 +246,7 @@ async function sendOrderEmails(order) {
     <tr><td style="padding:6px 12px;font-size:13px;color:#666;">Delivery fee</td><td style="padding:6px 12px;font-size:13px;color:#333;text-align:right;">${order.deliveryFee ? money(order.deliveryFee) : "FREE"}</td></tr>
     <tr><td style="padding:10px 12px;font-size:15px;font-weight:700;color:#111;">Order total</td><td style="padding:10px 12px;font-size:15px;font-weight:700;color:#111;text-align:right;">${money(order.totalAmount)}</td></tr>
     ${order.discountAmount
-      ? `<tr><td colspan="2" style="padding:12px 12px 2px;font-size:13px;color:#7c3aed;font-weight:600;">🎉 You'll earn ${money(order.discountAmount)} cashback${order.couponCode ? ` (code ${order.couponCode})` : ""} — credited to your wallet once this order is delivered.</td></tr>`
+      ? `<tr><td colspan="2" style="padding:12px 12px 2px;font-size:13px;color:#7c3aed;font-weight:600;">🎉 You'll earn ${money(order.discountAmount)} cashback${order.couponCode ? ` (code ${order.couponCode})` : ""} — added to your wallet after delivery.</td></tr>`
       : ""}
   `;
 
@@ -457,14 +457,15 @@ async function sendOrderCashbackEmail({ user, order, amount, newBalance }) {
   });
 }
 
-// Credits a delivered order's coupon cashback (discountAmount) to the
-// buyer's wallet, exactly once. Guarded by an atomic claim on
-// cashbackCredited so a status toggled back and forth, or two concurrent
-// requests, can never double-credit. Guest orders (no linked account) are
-// skipped — there's no wallet to credit.
+// Credits an order's coupon cashback (discountAmount) to the buyer's wallet,
+// exactly once. This only runs when the store owner asks for it from the
+// admin Orders tab — nothing is credited automatically on delivery any more.
+// Guarded by an atomic claim on cashbackCredited so a double click, or two
+// concurrent requests, can never credit twice. Guest orders (no linked
+// account) are skipped — there's no wallet to credit.
 async function creditOrderCashback(order) {
   if (!order?.discountAmount || order.discountAmount <= 0 || !order.user) {
-    return;
+    return false;
   }
 
   const claimed = await Order.updateOne(
@@ -472,7 +473,7 @@ async function creditOrderCashback(order) {
     { $set: { cashbackCredited: true } }
   );
 
-  if (claimed.modifiedCount !== 1) return; // already credited (or no such order)
+  if (claimed.modifiedCount !== 1) return false; // already credited (or no such order)
 
   const buyer = await User.findByIdAndUpdate(
     order.user,
@@ -480,7 +481,7 @@ async function creditOrderCashback(order) {
     { new: true }
   );
 
-  if (!buyer) return;
+  if (!buyer) return false;
 
   await WalletTransaction.create({
     user: buyer._id,
@@ -503,6 +504,8 @@ async function creditOrderCashback(order) {
   }).catch((error) =>
     console.error("Order cashback email failed:", error.message)
   );
+
+  return true;
 }
 
 // Reverses a delivered order's cashback when its return is approved — takes
@@ -7833,14 +7836,11 @@ app.patch("/api/orders/:id/status", requireAdmin, async (req, res) => {
         console.error("Order status email failed:", error.message)
       );
 
-      // Coupon cashback is only ever earned once the order actually reaches
-      // the customer — credit it automatically the moment it's delivered.
+      // Coupon cashback is NOT credited automatically: the store owner adds
+      // it from the Orders tab once they are ready (see the admin cashback
+      // endpoint below). Only the personal referral program still settles on
+      // delivery.
       if (orderStatus === "delivered") {
-        creditOrderCashback(order).catch((error) =>
-          console.error("Order cashback credit failed:", error.message)
-        );
-
-        // Personal referral program — same "only on delivery" rule.
         creditReferralBonus(order).catch((error) =>
           console.error("Referral bonus credit failed:", error.message)
         );
@@ -7861,6 +7861,72 @@ app.patch("/api/orders/:id/status", requireAdmin, async (req, res) => {
     res.status(400).json({
       success: false,
       message: "Could not update order status",
+    });
+  }
+});
+
+// Admin: credit an order's coupon cashback to the buyer's wallet. Nothing is
+// credited automatically on delivery, so this is the only way cashback goes
+// out — it keeps the wallet ledger, the cashbackCredited flag (which the
+// return flow uses to claw the amount back) and the customer email in sync.
+app.post("/api/admin/orders/:id/cashback", requireAdmin, async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id);
+
+    if (!order) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Order not found" });
+    }
+
+    if (order.orderStatus === "cancelled") {
+      return res.status(400).json({
+        success: false,
+        message: "Cancelled orders don't get cashback",
+      });
+    }
+
+    if (!order.user) {
+      return res.status(400).json({
+        success: false,
+        message: "This is a guest order — there is no wallet to credit",
+      });
+    }
+
+    if (!(order.discountAmount > 0)) {
+      return res.status(400).json({
+        success: false,
+        message: "This order has no coupon cashback",
+      });
+    }
+
+    if (order.cashbackCredited) {
+      return res.status(400).json({
+        success: false,
+        message: "Cashback is already credited for this order",
+      });
+    }
+
+    const credited = await creditOrderCashback(order);
+
+    if (!credited) {
+      return res.status(400).json({
+        success: false,
+        message: "Could not credit this cashback",
+      });
+    }
+
+    const updated = await Order.findById(order._id);
+
+    res.json({
+      success: true,
+      message: `Cashback \u20b9${order.discountAmount} added to the customer's wallet`,
+      order: updated,
+    });
+  } catch (err) {
+    res.status(400).json({
+      success: false,
+      message: err.message || "Could not credit this cashback",
     });
   }
 });
