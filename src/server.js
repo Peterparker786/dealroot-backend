@@ -160,15 +160,49 @@ function brevoVerify() {
   });
 }
 
+// Reserved domains (RFC 2606) and malformed addresses can never receive mail.
+// Sending to them only bounces the notice back into the store's inbox — the
+// "Address not found" / "Delivery incomplete" mails — so skip them instead.
+const UNDELIVERABLE_EMAIL =
+  /^[^@\s]+@(?:[^@\s.]+\.)*(?:example\.(?:com|net|org)|invalid|test|localhost)$/i;
+
+const isDeliverableEmail = (email) => {
+  const value = String(email || "").trim();
+
+  return (
+    /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(value) &&
+    !UNDELIVERABLE_EMAIL.test(value)
+  );
+};
+
 // Provider-aware transport: same sendMail/verify interface used everywhere.
 const transporter = {
   async sendMail(opts) {
-    if (process.env.BREVO_API_KEY) return brevoSendMail(opts);
+    const requested = Array.isArray(opts?.to)
+      ? opts.to.map((value) => String(value).trim())
+      : [String(opts?.to || "").trim()];
+    const deliverable = requested.filter(isDeliverableEmail);
+
+    if (!deliverable.length) {
+      console.warn(
+        `Email skipped — undeliverable recipient: ${
+          requested.join(", ") || "(empty)"
+        }`
+      );
+      return { skipped: true, messageId: null };
+    }
+
+    const safeOpts = {
+      ...opts,
+      to: Array.isArray(opts.to) ? deliverable : deliverable[0],
+    };
+
+    if (process.env.BREVO_API_KEY) return brevoSendMail(safeOpts);
     if (!smtpTransporter)
       throw new Error(
         "No email transport configured (set BREVO_API_KEY or EMAIL_USER/EMAIL_PASS)"
       );
-    return smtpTransporter.sendMail(opts);
+    return smtpTransporter.sendMail(safeOpts);
   },
   async verify() {
     if (process.env.BREVO_API_KEY) return brevoVerify();
