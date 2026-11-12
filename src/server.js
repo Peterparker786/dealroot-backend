@@ -5172,7 +5172,7 @@ app.get("/api/admin/sales-stats", requireAdmin, async (req, res) => {
 
     let totalDeliveryFees = 0;
 
-    let totalCashbackGiven = 0;
+    let totalWalletCashbackUsed = 0;
 
     let totalRazorpayFees = 0;
 
@@ -5193,30 +5193,31 @@ app.get("/api/admin/sales-stats", requireAdmin, async (req, res) => {
     orders.forEach(order => {
       const orderRevenue = order.totalAmount || 0;
       const deliveryFee = order.deliveryFee || 0;
-      const cashback = order.discountAmount || 0;
+      // Cashback only costs the store when the customer actually spends it
+      // from their wallet on an order. Adding it to a wallet (or a coupon
+      // promising it) is not an expense by itself.
+      const walletUsed = Math.max(order.walletUsed || 0, 0);
+      const moneyReceived = Math.max(orderRevenue - walletUsed, 0);
 
       // Razorpay only charges the part actually paid online: the full amount
       // for prepaid orders, and just the prepaid delivery charge for COD.
       const onlinePaid =
         order.paymentMethod === "razorpay"
-          ? Math.max(orderRevenue - (order.walletUsed || 0), 0)
+          ? moneyReceived
           : order.deliveryChargePaid
             ? Math.max(order.deliveryChargeAmount || 0, 0)
             : 0;
 
       const razorpayFee = Math.round(onlinePaid * 0.02);
 
-      // Profit = what the customer paid
-      //          - delivery charge (goes to the courier)
-      //          - Razorpay fee (2% of the online-paid amount)
-      //          - cashback credited to the customer's wallet
-      const orderProfit =
-        orderRevenue - deliveryFee - razorpayFee - cashback;
+      // Profit = money the customer actually paid (order total minus wallet
+      // cashback spent on it) - delivery charge - Razorpay fee.
+      const orderProfit = moneyReceived - deliveryFee - razorpayFee;
 
       totalSales += orderRevenue;
       totalProfit += orderProfit;
       totalDeliveryFees += deliveryFee;
-      totalCashbackGiven += cashback;
+      totalWalletCashbackUsed += walletUsed;
       totalRazorpayFees += razorpayFee;
       orderCount++;
     });
@@ -5325,7 +5326,7 @@ app.get("/api/admin/sales-stats", requireAdmin, async (req, res) => {
         totalSales: totalSales,
         totalProfit: totalProfit,
         totalDeliveryFees: totalDeliveryFees,
-        totalCashbackGiven: totalCashbackGiven,
+        totalCashbackGiven: totalWalletCashbackUsed,
         totalRazorpayFees: totalRazorpayFees,
         offlineIncome: offlineIncome,
         extraExpenses: extraExpenses,
