@@ -5222,6 +5222,44 @@ app.get("/api/admin/sales-stats", requireAdmin, async (req, res) => {
       orderCount++;
     });
 
+    totalWalletCashbackUsed = roundMoney(totalWalletCashbackUsed);
+
+    // Cashback that only sits in a wallet is not a cost (above), but money the
+    // admin takes BACK out of a wallet is a recovery: it returns to profit.
+    // Cap it at the cashback actually credited to wallets, so a deduction can
+    // never invent profit that was never given away.
+    const cashbackQuery = {
+      status: "approved",
+      type: { $in: ["cashback", "admin"] },
+    };
+
+    if (since) {
+      cashbackQuery.createdAt = { $gte: since };
+    }
+
+    const cashbackTxns = await WalletTransaction.find(cashbackQuery)
+      .select("amount")
+      .lean();
+
+    let totalCashbackCredited = 0;
+    let totalCashbackDeducted = 0;
+
+    cashbackTxns.forEach((txn) => {
+      const amount = txn.amount || 0;
+
+      if (amount > 0) {
+        totalCashbackCredited += amount;
+      } else {
+        totalCashbackDeducted += Math.abs(amount);
+      }
+    });
+
+    const totalCashbackRecovered = roundMoney(
+      Math.min(roundMoney(totalCashbackDeducted), roundMoney(totalCashbackCredited))
+    );
+
+    totalProfit = roundMoney(totalProfit + totalCashbackRecovered);
+
     // ---- Sales trend + top products for the dashboard charts ----
     const dayKey = (date) => date.toISOString().slice(0, 10);
     const monthKey = (date) => date.toISOString().slice(0, 7);
@@ -5327,6 +5365,7 @@ app.get("/api/admin/sales-stats", requireAdmin, async (req, res) => {
         totalProfit: totalProfit,
         totalDeliveryFees: totalDeliveryFees,
         totalCashbackGiven: totalWalletCashbackUsed,
+        totalCashbackRecovered: totalCashbackRecovered,
         totalRazorpayFees: totalRazorpayFees,
         offlineIncome: offlineIncome,
         extraExpenses: extraExpenses,
