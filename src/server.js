@@ -26,6 +26,7 @@ const {
   sellingPriceFor,
   createDropshipSyncService,
 } = require("./dropship-sync");
+const { fetchDigihaatRenderedProduct } = require("./digihaat-render");
 
 // Escapes user-provided text before it is placed inside HTML emails.
 const xmlEscape = (value) =>
@@ -6480,125 +6481,6 @@ app.delete("/api/products/:id", requireAdmin, async (req, res) => {
   }
 });
 
-// DigiHaat's share links (…/digilink/CODE) are a client-rendered app: the raw
-// HTML only carries the storefront's generic meta tags, so the real product —
-// title, price and gallery images — never appears in it. The reader gateway
-// renders the page like a browser and returns markdown, which does.
-const DIGIHAAT_LIVE_HOST = "https://digihaat.in";
-
-const normalizeDigihaatUrl = (rawUrl) => {
-  try {
-    const parsed = new URL(rawUrl);
-    const host = parsed.hostname.toLowerCase().replace(/^www\./, "");
-
-    if (
-      ["digihat.com", "digihaat.com", "digihat.in", "digihaat.in"].includes(
-        host
-      )
-    ) {
-      return `${DIGIHAAT_LIVE_HOST}${parsed.pathname}${parsed.search}`;
-    }
-  } catch {
-    // Not a URL — fall through and let the caller report it.
-  }
-
-  return rawUrl;
-};
-
-const fetchDigihaatRenderedProduct = async (rawUrl) => {
-  const url = normalizeDigihaatUrl(rawUrl);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 45000);
-
-  try {
-    const response = await fetch(`https://r.jina.ai/${url}`, {
-      headers: {
-        Accept: "text/plain",
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      },
-      signal: controller.signal,
-    });
-
-    if (!response.ok) return null;
-
-    const text = (await response.text()).slice(0, 400000);
-
-    if (!text || text.trim().length < 200) return null;
-
-    const markdownImages = [
-      ...new Set(
-        [...text.matchAll(/!\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/g)]
-          .map((match) => match[1].trim())
-          .filter(
-            (imageUrl) =>
-              /^https?:\/\//i.test(imageUrl) &&
-              !/digihaat\.in\/images\/|google-play|app-store|logo|favicon/i.test(
-                imageUrl
-              )
-          )
-      ),
-    ];
-
-    if (markdownImages.length === 0) return null;
-
-    // Real product photos live under …/product/…; anything else is chrome.
-    const images = [
-      ...markdownImages.filter((imageUrl) => /\/product\//i.test(imageUrl)),
-      ...markdownImages.filter((imageUrl) => !/\/product\//i.test(imageUrl)),
-    ].slice(0, 8);
-
-    const title =
-      text
-        .match(/^#\s+(.{5,220})$/m)?.[1]
-        ?.replace(/\s+/g, " ")
-        .trim() || "";
-
-    const priceMatch = text.match(/₹\s*([0-9][0-9,]*(?:\.[0-9]+)?)/);
-    const price = priceMatch ? Number(priceMatch[1].replace(/,/g, "")) : 0;
-
-    const mrpMatch = text.match(
-      /₹\s*[0-9][0-9,]*(?:\.[0-9]+)?\s*₹\s*([0-9][0-9,]*(?:\.[0-9]+)?)/
-    );
-    const mrp = mrpMatch ? Number(mrpMatch[1].replace(/,/g, "")) : 0;
-
-    const brand =
-      text.match(/\[Home\][^\n]*?\/\[([^\]]+)\]/)?.[1]?.trim() || "";
-
-    const description = text
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => /^\*\s+/.test(line))
-      .map((line) => line.replace(/^\*\s+/, ""))
-      .slice(0, 6)
-      .join(" ");
-
-    return {
-      url,
-      title,
-      brand,
-      price,
-      mrp,
-      description,
-      images,
-      // The rendered product page loaded with a price; treat it as buyable
-      // unless it explicitly says otherwise.
-      inStock: !/out\s+of\s+stock|sold\s+out|currently\s+unavailable|notify\s+me/i.test(
-        text
-      ),
-      context: [title, `Price: Rs ${price}`, description]
-        .filter(Boolean)
-        .join("\n")
-        .slice(0, 1000),
-    };
-  } catch (error) {
-    console.error("DigiHaat render fallback failed:", error.message);
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
-};
-
 // ===================== DROPSHIP PRODUCT ADD (admin) =====================
 // Follows the same "Add product" pattern, but in its own routes and its own
 // collection. On submit it fetches the live source price, multiplies it and
@@ -6640,32 +6522,41 @@ app.post(
         });
       }
 
-      // DigiHaat renders its product page client-side, so load the rendered
-      // version up front for that platform. It is also the fallback when the
-      // direct request cannot reach the site at all.
-      const rendered =
+      // DigiHaat renders its product page client-side, so read the rendered
+      // version in parallel with the normal fetch. It is also the fallback when
+      // the direct request cannot reach the site at all.
+      const renderedPromise =
         platform === "DigiHaat"
-          ? await fetchDigihaatRenderedProduct(url)
-          : null;
+          ? fetchDigihaatRenderedProduct(url)
+          : Promise.resolve(null);
 
-      let page;
+      let page = null;
+      let pageError = null;
 
       try {
         page = await fetchSourcePage({ url, platform });
       } catch (error) {
-        if (!rendered) {
-          // Both the direct request and the free proxy fallback failed. The UI
-          // uses `fallback` to offer AI Screenshot Extract / manual images
-          // instead of leaving the admin stuck.
-          return res.status(422).json({
-            success: false,
-            code: error.code || "FETCH_FAILED",
-            canFallback: true,
-            fallback: { screenshot: true, manualImages: true },
-            message: `Link load nahi hua: ${error.message}`,
-          });
-        }
+        pageError = error;
+      }
 
+      const rendered = await renderedPromise;
+
+      if (!page && !rendered) {
+        // Both the direct request and the free proxy fallback failed. The UI
+        // uses `fallback` to offer AI Screenshot Extract / manual images
+        // instead of leaving the admin stuck.
+        return res.status(422).json({
+          success: false,
+          code: pageError?.code || "FETCH_FAILED",
+          canFallback: true,
+          fallback: { screenshot: true, manualImages: true },
+          message: `Link load nahi hua: ${
+            pageError?.message || "page khali aaya"
+          }`,
+        });
+      }
+
+      if (!page) {
         page = { html: "", via: "rendered", warnings: [] };
       }
 

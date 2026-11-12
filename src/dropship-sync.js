@@ -9,6 +9,8 @@
 // Fallback rule (important): if a scrape fails, is blocked, or returns 0,
 // the saved price is never overwritten — the entry is only marked as failed.
 
+const { fetchDigihaatRenderedProduct } = require("./digihaat-render");
+
 const DROPSHIP_PLATFORMS = ["Amazon", "Flipkart", "Meesho", "DigiHaat"];
 
 // Amazon / Flipkart / Meesho / DigiHaat block a User-Agent after a few
@@ -697,12 +699,66 @@ async function fetchSourcePage({ url, platform }) {
 
 // Fetches the live price + stock for one marketplace product URL.
 async function fetchSourceProduct({ url, platform }) {
-  const page = await fetchSourcePage({ url, platform });
+  const initialPlatform = platform || platformForUrl(url) || "";
+
+  // DigiHaat's product pages are rendered client-side, so the raw HTML has no
+  // price. Start reading the rendered page in parallel with the normal fetch
+  // so the admin does not wait for two timeouts back to back.
+  const renderedPromise =
+    initialPlatform === "DigiHaat"
+      ? fetchDigihaatRenderedProduct(url)
+      : Promise.resolve(null);
+
+  // Everything DigiHaat needs (price, stock) comes from the rendered page, so
+  // only hit the raw HTML when that fails.
+  if (initialPlatform === "DigiHaat") {
+    const renderedFirst = await renderedPromise;
+
+    if (renderedFirst?.price > 0) {
+      return {
+        platform: "DigiHaat",
+        price: renderedFirst.price,
+        inStock: renderedFirst.inStock ?? null,
+        fetchedAt: new Date(),
+      };
+    }
+  }
+
+  let page = null;
+  let pageError = null;
+
+  try {
+    page = await fetchSourcePage({ url, platform });
+  } catch (error) {
+    pageError = error;
+  }
+
+  const resolvedPlatform =
+    page?.platform || platform || platformForUrl(url) || "";
+
+  let price = page ? parsePrice(page.html, resolvedPlatform) : 0;
+  let inStock = page ? parseStock(page.html, resolvedPlatform) : null;
+
+  const rendered = await renderedPromise;
+
+  if (resolvedPlatform === "DigiHaat" && (!price || price <= 0)) {
+    if (rendered?.price > 0) {
+      price = rendered.price;
+
+      if (inStock === null && rendered.inStock !== undefined) {
+        inStock = rendered.inStock;
+      }
+    }
+  }
+
+  if (!price || price <= 0) {
+    if (!page && pageError) throw pageError;
+  }
 
   return {
-    platform: page.platform,
-    price: parsePrice(page.html, page.platform),
-    inStock: parseStock(page.html, page.platform),
+    platform: resolvedPlatform,
+    price,
+    inStock,
     fetchedAt: new Date(),
   };
 }
