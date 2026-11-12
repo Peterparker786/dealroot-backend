@@ -1146,6 +1146,12 @@ const orderSchema = new mongoose.Schema(
   min: 0,
 },
   
+    // What the courier actually charged for this order. The admin can set it
+    // from the Orders tab when delivery rates fluctuate; profit uses it
+    // instead of the delivery fee charged to the customer. null = use that
+    // customer-facing fee.
+    deliveryCost: { type: Number, default: null, min: 0 },
+
     deliveryType: {
       type: String,
       enum: ["local", "courier"],
@@ -5226,7 +5232,12 @@ app.get("/api/admin/sales-stats", requireAdmin, async (req, res) => {
 
     orders.forEach(order => {
       const orderRevenue = order.totalAmount || 0;
-      const deliveryFee = order.deliveryFee || 0;
+      // Actual courier cost when the admin entered one, otherwise the
+      // delivery fee charged to the customer.
+      const deliveryFee =
+        order.deliveryCost === null || order.deliveryCost === undefined
+          ? order.deliveryFee || 0
+          : order.deliveryCost;
       // Cashback only costs the store when the customer actually spends it
       // from their wallet on an order. Adding it to a wallet (or a coupon
       // promising it) is not an expense by itself.
@@ -8001,6 +8012,52 @@ app.post("/api/admin/orders/:id/cashback", requireAdmin, async (req, res) => {
     res.status(400).json({
       success: false,
       message: err.message || "Could not credit this cashback",
+    });
+  }
+});
+
+// Admin: record what the courier actually charged for this order. The sales
+// tab subtracts this instead of the delivery fee charged to the customer, so
+// a fluctuating delivery rate still leaves profit accurate. Send null/"" to
+// clear it and fall back to the customer-facing fee.
+app.patch("/api/orders/:id/delivery-cost", requireAdmin, async (req, res) => {
+  try {
+    const raw = req.body?.deliveryCost;
+    const clearing =
+      raw === null || raw === undefined || String(raw).trim() === "";
+    const deliveryCost = clearing ? null : Number(raw);
+
+    if (!clearing && (!Number.isFinite(deliveryCost) || deliveryCost < 0)) {
+      return res.status(400).json({
+        success: false,
+        message: "Delivery cost must be 0 or more",
+      });
+    }
+
+    const order = await Order.findByIdAndUpdate(
+      req.params.id,
+      { deliveryCost },
+      { new: true, runValidators: true }
+    );
+
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: clearing
+        ? "Delivery cost cleared — using the customer delivery fee"
+        : `Delivery cost set to ₹${deliveryCost}`,
+      order,
+    });
+  } catch {
+    res.status(400).json({
+      success: false,
+      message: "Could not update delivery cost",
     });
   }
 });
