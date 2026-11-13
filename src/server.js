@@ -1592,8 +1592,8 @@ const WalletTransaction = mongoose.model(
 // each hardcoding it.
 const STORE_SETTINGS_KEY = "store";
 const DEFAULT_DELIVERY_FEE = 59;
-// Orders at or above this subtotal always ship free (this is also the point
-// where Cash on Delivery stops being offered).
+// Orders at or above this subtotal must be paid online — Cash on Delivery is
+// not offered above it. Delivery itself is always charged.
 const FREE_DELIVERY_THRESHOLD = 499;
 
 const storeSettingsSchema = new mongoose.Schema(
@@ -1717,10 +1717,8 @@ const getStoreSettings = async () => {
   };
 };
 
-// Delivery is free from the threshold up; below it the admin-set charge applies.
-const deliveryFeeFor = async (subtotal) => {
-  if (subtotal >= FREE_DELIVERY_THRESHOLD) return 0;
-
+// Delivery is charged on every order at the admin-set flat rate.
+const deliveryFeeFor = async () => {
   const { deliveryFee } = await getStoreSettings();
 
   return roundMoney(deliveryFee);
