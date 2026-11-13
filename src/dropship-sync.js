@@ -447,30 +447,42 @@ const fetchFlipkartApiPage = async (url) => {
 
     if (!/(^|\.)flipkart\.com$/i.test(parsed.hostname)) return null;
 
-    const response = await fetch("https://www.flipkart.com/api/4/page/fetch", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "user-agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        // Flipkart's API rejects the request without this browser fingerprint.
-        "x-user-agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 FKUA/website/42/website/Desktop",
-        accept: "*/*",
-        "accept-language": "en-IN,en;q=0.9",
-        origin: "https://www.flipkart.com",
-        referer: "https://www.flipkart.com/",
-      },
-      body: JSON.stringify({
-        pageUri: `${parsed.pathname}${parsed.search}`,
-        requestContext: { type: "BROWSE_PAGE" },
-      }),
-      signal: AbortSignal.timeout(20000),
-    });
+    const requestPage = () =>
+      fetch("https://www.flipkart.com/api/4/page/fetch", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "user-agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+          // Flipkart's API rejects the request without this browser fingerprint.
+          "x-user-agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 FKUA/website/42/website/Desktop",
+          accept: "*/*",
+          "accept-language": "en-IN,en;q=0.9",
+          origin: "https://www.flipkart.com",
+          referer: "https://www.flipkart.com/",
+        },
+        body: JSON.stringify({
+          pageUri: `${parsed.pathname}${parsed.search}`,
+          requestContext: { type: "BROWSE_PAGE" },
+        }),
+        signal: AbortSignal.timeout(20000),
+      });
 
-    if (!response.ok) return null;
+    // The endpoint sometimes answers "temporarily unavailable due to high
+    // load"; one short retry is usually enough.
+    let text = "";
 
-    const text = await response.text();
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const response = await requestPage();
+      text = response.ok ? await response.text() : "";
+
+      if (text.length >= 5000) break;
+
+      if (attempt === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 900));
+      }
+    }
 
     if (text.length < 5000) return null;
 
