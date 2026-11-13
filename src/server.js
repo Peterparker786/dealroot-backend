@@ -6553,6 +6553,49 @@ app.get("/api/admin/scrape-probe", requireAdmin, async (req, res) => {
     }
   }
 
+  // Flipkart's own page API — the same endpoint its web app calls. It is worth
+  // probing because the HTML page answers 429 while this one may not.
+  {
+    const started = Date.now();
+
+    try {
+      const response = await fetch("https://www.flipkart.com/api/4/page/fetch", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "user-agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+          "x-user-agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 FKUA/website/42/website/Desktop",
+          accept: "*/*",
+          origin: "https://www.flipkart.com",
+          referer: "https://www.flipkart.com/",
+        },
+        body: JSON.stringify({
+          pageUri: `${parsed.pathname}${parsed.search}`,
+          requestContext: { type: "BROWSE_PAGE" },
+        }),
+        signal: AbortSignal.timeout(20000),
+      });
+
+      const text = await response.text();
+
+      results.push({
+        name: "flipkart-api",
+        status: response.status,
+        len: text.length,
+        ms: Date.now() - started,
+        sample: text.replace(/\s+/g, " ").slice(0, 160),
+      });
+    } catch (error) {
+      results.push({
+        name: "flipkart-api",
+        error: error.message,
+        ms: Date.now() - started,
+      });
+    }
+  }
+
   res.set("Cache-Control", "no-store");
   res.json({ success: true, results });
 });
