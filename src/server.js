@@ -6490,6 +6490,64 @@ app.delete("/api/products/:id", requireAdmin, async (req, res) => {
 // from the marketplace page and the live source price (through the very same
 // parser the 4-hour sync uses). Reuses the existing extraction helpers, so the
 // regular Products form keeps its own untouched endpoint.
+// Temporary diagnostic: reports what each fetch path returns from the server's
+// own network, which is the only way to tell a marketplace block from a proxy
+// block when extraction fails in production but works locally.
+app.get("/api/admin/scrape-probe", requireAdmin, async (req, res) => {
+  const url = String(req.query.url || "").trim();
+
+  if (!/^https?:\/\//i.test(url)) {
+    return res.status(400).json({ success: false, message: "url chahiye" });
+  }
+
+  const parsed = new URL(url);
+  const targets = [
+    ["direct", url],
+    [
+      "translate",
+      `https://${parsed.hostname.replace(/\./g, "-")}.translate.goog${parsed.pathname}?_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en&_x_tr_pto=wapp`,
+    ],
+    ["reader", `https://r.jina.ai/${url}`],
+  ];
+
+  const results = [];
+
+  for (const [name, target] of targets) {
+    const started = Date.now();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20000);
+
+    try {
+      const response = await fetch(target, {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+          "Accept-Language": "en-IN,en;q=0.9",
+        },
+        redirect: "follow",
+        signal: controller.signal,
+      });
+
+      const text = await response.text();
+
+      results.push({
+        name,
+        status: response.status,
+        len: text.length,
+        ms: Date.now() - started,
+        sample: text.replace(/\s+/g, " ").slice(0, 160),
+      });
+    } catch (error) {
+      results.push({ name, error: error.message, ms: Date.now() - started });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  res.set("Cache-Control", "no-store");
+  res.json({ success: true, results });
+});
+
 app.post(
   "/api/admin/dropship-products/extract",
   requireAdmin,
