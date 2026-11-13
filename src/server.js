@@ -6691,6 +6691,17 @@ app.post(
         ]),
       ].slice(0, 8);
 
+      // Amazon prints the MRP only as a label ("M.R.P.: ₹10,999.00"), never as
+      // structured data, so the markup is the only place to read it from.
+      const parseMrpFromHtml = (markup) => {
+        const match = String(markup).match(
+          /(?:M\.?\s?R\.?\s?P\.?\s*:?|Maximum Retail Price)[\s\S]{0,160}?(?:₹|&#8377;|Rs\.?\s*)([0-9][0-9,]*(?:\.[0-9]+)?)/i
+        );
+        const value = Number(String(match?.[1] || "").replace(/,/g, ""));
+
+        return Number.isFinite(value) && value > 0 ? value : 0;
+      };
+
       const metaContent = (name) => {
         const pattern = new RegExp(
           `<meta[^>]*(?:name|property)=["']${name}["'][^>]*content=["']([^"']+)["']`,
@@ -6714,7 +6725,7 @@ app.post(
           ""
         ).trim(),
         price: sourcePrice,
-        mrp: rendered?.mrp || apiProduct?.mrp || 0,
+        mrp: rendered?.mrp || apiProduct?.mrp || parseMrpFromHtml(html),
         description: (
           rendered?.description ||
           apiProduct?.description ||
