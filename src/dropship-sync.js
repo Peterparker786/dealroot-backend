@@ -437,12 +437,145 @@ const platformForUrl = (url) => {
   return "";
 };
 
+// Flipkart blocks its HTML pages (HTTP 429) for every datacenter IP, including
+// Render and every free proxy, but the endpoint its own web app calls still
+// answers normally. It returns the product JSON, which is turned into the same
+// small markup the shared extractors already understand.
+const fetchFlipkartApiPage = async (url) => {
+  try {
+    const parsed = new URL(url);
+
+    if (!/(^|\.)flipkart\.com$/i.test(parsed.hostname)) return null;
+
+    const response = await fetch("https://www.flipkart.com/api/4/page/fetch", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "user-agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        // Flipkart's API rejects the request without this browser fingerprint.
+        "x-user-agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 FKUA/website/42/website/Desktop",
+        accept: "*/*",
+        "accept-language": "en-IN,en;q=0.9",
+        origin: "https://www.flipkart.com",
+        referer: "https://www.flipkart.com/",
+      },
+      body: JSON.stringify({
+        pageUri: `${parsed.pathname}${parsed.search}`,
+        requestContext: { type: "BROWSE_PAGE" },
+      }),
+      signal: AbortSignal.timeout(20000),
+    });
+
+    if (!response.ok) return null;
+
+    const text = await response.text();
+
+    if (text.length < 5000) return null;
+
+    const priceBlock = text.match(
+      /"ppd":\{"fsp":([0-9.]+),"finalPrice":([0-9.]+),"mrp":([0-9.]+)/
+    );
+    const price = Number(priceBlock?.[2] || priceBlock?.[1] || 0);
+
+    if (!Number.isFinite(price) || price <= 0) return null;
+
+    const mrp = Number(priceBlock?.[3] || 0);
+
+    const decode = (value) =>
+      String(value || "")
+        .replace(/\\u002F/g, "/")
+        .replace(/\\+/g, " ")
+        .replace(/&amp;/g, "&")
+        .replace(/&#39;/g, "'")
+        .replace(/&quot;/g, '"')
+        .trim();
+
+    const title = decode(text.match(/"ogTitle":"([^"]+)"/)?.[1])
+      .replace(/\s*Online at Best Price.*$/i, "")
+      .trim();
+
+    const description = decode(text.match(/"ogDescription":"([^"]+)"/)?.[1]);
+    const brand = decode(text.match(/"bd":"([^"]{1,40})"/)?.[1]);
+
+    const availability = text.match(
+      /"availability":"https:\/\/schema\.org\/(InStock|OutOfStock|[A-Za-z]+)"/
+    )?.[1];
+    const inStock =
+      availability === "InStock"
+        ? true
+        : availability === "OutOfStock"
+          ? false
+          : null;
+
+    const images = [
+      ...new Set(
+        (
+          text.match(
+            /https:\\?\/\\?\/rukmini[^"\\]*?\/image\/[^"\\]+/g
+          ) || []
+        )
+          .map((imageUrl) =>
+            imageUrl
+              .replace(/\\\//g, "/")
+              .replace(/\{@width\}/g, "832")
+              .replace(/\{@height\}/g, "832")
+              .replace(/\{@quality\}/g, "80")
+          )
+          .filter((imageUrl) => !/\/promos\//i.test(imageUrl))
+      ),
+    ].slice(0, 8);
+
+    const escape = (value) =>
+      String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+
+    const html = [
+      "<html><head>",
+      `<title>${escape(title)}</title>`,
+      `<meta property="og:title" content="${escape(title)}" />`,
+      `<meta property="og:description" content="${escape(description)}" />`,
+      images[0]
+        ? `<meta property="og:image" content="${escape(images[0])}" />`
+        : "",
+      `<meta property="og:url" content="${escape(url)}" />`,
+      `<meta name="brand" content="${escape(brand)}" />`,
+      "</head><body>",
+      `<div class="_30jeq3 _16Jk6d">\u20b9${price.toLocaleString("en-IN")}</div>`,
+      mrp > price
+        ? `<div class="_3I9_wc">\u20b9${mrp.toLocaleString("en-IN")}</div>`
+        : "",
+      // The shared stock parser reads these two strings; only one is present.
+      inStock === false ? "<p>Out of stock</p>" : "<p>Add to cart</p>",
+      ...images.map((src) => `<img src="${escape(src)}" />`),
+      "</body></html>",
+    ].join("");
+
+    return { html, via: "flipkart-api", status: 200, warnings: [] };
+  } catch (error) {
+    console.error("Flipkart API fallback failed:", error.message);
+    return null;
+  }
+};
+
 // Loads the raw page HTML with a two stage strategy:
 //   1. direct request using rotating realistic browser fingerprints
 //   2. free proxy gateway (Flipkart/Amazon answer 403 to a datacenter IP)
+// Flipkart additionally uses its own page API first, because its HTML pages are
+// blocked outright for datacenter IPs.
 // Throws an error with `code = "BLOCKED"` when both stages fail, so the admin
 // UI can offer the screenshot / manual-image fallbacks instead of a dead end.
 async function fetchPageHtml(url, { platform = "" } = {}) {
+  if (String(platform || platformForUrl(url) || "").toLowerCase() === "flipkart") {
+    const apiPage = await fetchFlipkartApiPage(url);
+
+    if (apiPage) return apiPage;
+  }
+
   let lastStatus = 0;
   let sawBlock = false;
   let sawTimeout = false;
