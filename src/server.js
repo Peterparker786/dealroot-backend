@@ -2049,6 +2049,11 @@ const validateDeliveryCustomer = (customer) => {
 const normaliseCouponCode = (couponCode) =>
   String(couponCode || "").trim().toUpperCase();
 
+// Cashback that needs no coupon: carts from ₹500 up earn 10% of the subtotal,
+// credited to the wallet after delivery exactly like coupon cashback.
+const AUTO_CASHBACK_MIN_SUBTOTAL = 500;
+const AUTO_CASHBACK_PERCENT = 10;
+
 const roundMoney = (amount) =>
   Math.round((Number(amount) + Number.EPSILON) * 100) / 100;
 
@@ -2181,6 +2186,15 @@ const resolveCouponForOrder = async (
         }`
       );
     }
+  }
+
+  // Without a coupon, every cart of this value still earns the automatic
+  // cashback. Coupon orders deliberately keep whatever the admin configured
+  // for that coupon instead of stacking on top of it.
+  if (!normalizedCoupon && subtotal >= AUTO_CASHBACK_MIN_SUBTOTAL) {
+    discountAmount = Math.round(
+      (subtotal * AUTO_CASHBACK_PERCENT) / 100
+    );
   }
 
   return {
