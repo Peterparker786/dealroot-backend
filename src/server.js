@@ -6501,6 +6501,7 @@ app.get("/api/admin/scrape-probe", requireAdmin, async (req, res) => {
   }
 
   const parsed = new URL(url);
+  const encoded = encodeURIComponent(url);
   const targets = [
     ["direct", url],
     [
@@ -6508,6 +6509,14 @@ app.get("/api/admin/scrape-probe", requireAdmin, async (req, res) => {
       `https://${parsed.hostname.replace(/\./g, "-")}.translate.goog${parsed.pathname}?_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en&_x_tr_pto=wapp`,
     ],
     ["reader", `https://r.jina.ai/${url}`],
+    ["allorigins", `https://api.allorigins.win/raw?url=${encoded}`],
+    ["codetabs", `https://api.codetabs.com/v1/proxy/?quest=${encoded}`],
+    ["thingproxy", `https://thingproxy.freeboard.io/fetch/${url}`],
+    ["isomorphic", `https://cors.isomorphic-git.org/${url}`],
+    [
+      "workers",
+      `https://corsproxy.garmeeh.workers.dev/?url=${encoded}`,
+    ],
   ];
 
   const results = [];
