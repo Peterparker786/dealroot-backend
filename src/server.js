@@ -6670,17 +6670,22 @@ app.post(
         page = { html: "", via: "rendered", warnings: [] };
       }
 
+      // Flipkart's page API already returns the product as structured data.
+      const apiProduct = page.product || null;
       const html = page.html;
       const sourcePrice =
-        parsePrice(html, platform) || rendered?.price || 0;
+        parsePrice(html, platform) || rendered?.price || apiProduct?.price || 0;
       const inStock =
-        rendered?.inStock === undefined
-          ? parseStock(html, platform)
-          : rendered.inStock;
+        rendered?.inStock !== undefined
+          ? rendered.inStock
+          : apiProduct?.inStock !== undefined
+            ? apiProduct.inStock
+            : parseStock(html, platform);
 
       const pageImages = [
         ...new Set([
           ...(rendered?.images || []),
+          ...(apiProduct?.images || []),
           ...extractProductImagesFromHtml(html, url),
           ...(await extractFirstCryGalleryImages(html, url)),
         ]),
@@ -6697,19 +6702,22 @@ app.post(
       const info = {
         brand:
           rendered?.brand ||
+          apiProduct?.brand ||
           html.match(/"brand"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"/i)?.[1] ||
           metaContent("brand") ||
           "",
         title: (
           rendered?.title ||
+          apiProduct?.title ||
           metaContent("og:title") ||
           html.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1] ||
           ""
         ).trim(),
         price: sourcePrice,
-        mrp: rendered?.mrp || 0,
+        mrp: rendered?.mrp || apiProduct?.mrp || 0,
         description: (
           rendered?.description ||
+          apiProduct?.description ||
           metaContent("og:description") ||
           metaContent("description") ||
           ""

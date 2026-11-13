@@ -496,7 +496,10 @@ const fetchFlipkartApiPage = async (url) => {
       .replace(/\s*Online at Best Price.*$/i, "")
       .trim();
 
-    const description = decode(text.match(/"ogDescription":"([^"]+)"/)?.[1]);
+    const description = decode(
+      text.match(/"ogDescription":"([^"]+)"/)?.[1] ||
+        text.match(/"description":"(Buy [^"]{20,600})"/)?.[1]
+    );
     const brand = decode(text.match(/"bd":"([^"]{1,40})"/)?.[1]);
 
     const availability = text.match(
@@ -555,7 +558,14 @@ const fetchFlipkartApiPage = async (url) => {
       "</body></html>",
     ].join("");
 
-    return { html, via: "flipkart-api", status: 200, warnings: [] };
+    return {
+      html,
+      via: "flipkart-api",
+      status: 200,
+      warnings: [],
+      // The extractor prefers this structured form over re-reading the markup.
+      product: { title, brand, price, mrp, description, images, inStock },
+    };
   } catch (error) {
     console.error("Flipkart API fallback failed:", error.message);
     return null;
@@ -871,6 +881,7 @@ async function fetchSourcePage({ url, platform }) {
     html: page.html,
     via: page.via,
     warnings: page.warnings || [],
+    product: page.product || null,
   };
 }
 
