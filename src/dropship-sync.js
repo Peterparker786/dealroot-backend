@@ -441,11 +441,53 @@ const platformForUrl = (url) => {
 // Render and every free proxy, but the endpoint its own web app calls still
 // answers normally. It returns the product JSON, which is turned into the same
 // small markup the shared extractors already understand.
+// Repeat extracts (admin re-reading a link, price sync, add-after-extract) do
+// not need a fresh call — and every call risks Flipkart's "high load" answer.
+const FLIPKART_CACHE_TTL_MS = 15 * 60 * 1000;
+const FLIPKART_CACHE_MAX_ENTRIES = 200;
+const flipkartPageCache = new Map();
+
+const cacheKeyForUrl = (url) => {
+  try {
+    const parsed = new URL(url);
+
+    return `${parsed.hostname.toLowerCase()}${parsed.pathname}${parsed.search}`;
+  } catch {
+    return url;
+  }
+};
+
+const readFlipkartCache = (key) => {
+  const entry = flipkartPageCache.get(key);
+
+  if (!entry) return null;
+
+  if (Date.now() - entry.at > FLIPKART_CACHE_TTL_MS) {
+    flipkartPageCache.delete(key);
+    return null;
+  }
+
+  return entry.page;
+};
+
+const writeFlipkartCache = (key, page) => {
+  flipkartPageCache.set(key, { at: Date.now(), page });
+
+  if (flipkartPageCache.size > FLIPKART_CACHE_MAX_ENTRIES) {
+    flipkartPageCache.delete(flipkartPageCache.keys().next().value);
+  }
+};
+
 const fetchFlipkartApiPage = async (url) => {
   try {
     const parsed = new URL(url);
 
     if (!/(^|\.)flipkart\.com$/i.test(parsed.hostname)) return null;
+
+    const cacheKey = cacheKeyForUrl(url);
+    const cachedPage = readFlipkartCache(cacheKey);
+
+    if (cachedPage) return cachedPage;
 
     const requestPage = () =>
       fetch("https://www.flipkart.com/api/4/page/fetch", {
@@ -570,7 +612,7 @@ const fetchFlipkartApiPage = async (url) => {
       "</body></html>",
     ].join("");
 
-    return {
+    const page = {
       html,
       via: "flipkart-api",
       status: 200,
@@ -578,6 +620,10 @@ const fetchFlipkartApiPage = async (url) => {
       // The extractor prefers this structured form over re-reading the markup.
       product: { title, brand, price, mrp, description, images, inStock },
     };
+
+    writeFlipkartCache(cacheKey, page);
+
+    return page;
   } catch (error) {
     console.error("Flipkart API fallback failed:", error.message);
     return null;
