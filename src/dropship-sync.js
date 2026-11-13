@@ -117,7 +117,39 @@ const looksLikeProductPage = (html = "") =>
 // Free read-through gateways, tried in order when a platform blocks our IP.
 // `SCRAPER_PROXY_TEMPLATE` (e.g. "https://user:pass@proxy.example/fetch?url={url}")
 // can be set in .env to put a dedicated proxy in front of all of them.
+// Flipkart answers 429 to datacenter IPs (Render included) and every free
+// read-through proxy is either rate limited or already blocked by Flipkart.
+// Google's translate proxy still serves the full page from its own IPs, with
+// the original markup, so it is the gateway that actually rescues Flipkart.
+const TRANSLATE_PROXY_HOSTS =
+  /^(?:www\.)?(?:flipkart|amazon|meesho)\.(?:com|in)$/i;
+
+const googleTranslateProxyUrl = (url) => {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+
+    if (!TRANSLATE_PROXY_HOSTS.test(host)) return "";
+
+    const params = new URLSearchParams(parsed.search);
+    params.set("_x_tr_sl", "auto");
+    params.set("_x_tr_tl", "en");
+    params.set("_x_tr_hl", "en");
+    params.set("_x_tr_pto", "wapp");
+
+    return `https://${host.replace(/\./g, "-")}.translate.goog${parsed.pathname}?${params.toString()}`;
+  } catch {
+    return "";
+  }
+};
+
 const PROXY_GATEWAYS = [
+  {
+    // Text only: an image request must never be routed through it.
+    name: "translate",
+    textOnly: true,
+    build: (url) => googleTranslateProxyUrl(url),
+  },
   {
     name: "reader",
     build: (url) => `https://r.jina.ai/${url}`,
@@ -161,12 +193,17 @@ const fetchThroughGateways = async (
 
   for (const gateway of proxyGateways().slice(0, maxGateways)) {
     if (deadline && Date.now() + 2000 > deadline) break;
+    if (binaryOnly && gateway.textOnly) continue;
+
+    const gatewayUrl = gateway.build(url);
+
+    if (!gatewayUrl) continue;
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
-      const response = await fetch(gateway.build(url), {
+      const response = await fetch(gatewayUrl, {
         headers: {
           "User-Agent": BROWSER_PROFILES[0]["User-Agent"],
           Accept: "*/*",
@@ -466,7 +503,14 @@ async function fetchPageHtml(url, { platform = "" } = {}) {
       proxied.gateway === "reader" || /^Title:\s*.+$/m.test(proxied.text.slice(0, 2000));
 
     return {
-      html: isMarkdown ? markdownToPseudoHtml(proxied.text, url) : proxied.text,
+      html: isMarkdown
+        ? markdownToPseudoHtml(proxied.text, url)
+        : // The translate proxy serves a copy with its own base URL; restoring
+          // the real one keeps relative image links pointing at the marketplace.
+          proxied.text.replace(
+            /<base\s+href=["'][^"']*["']\s*\/?>/i,
+            `<base href="${url}">`
+          ),
       via: proxied.gateway,
       status: 200,
       warnings: [
