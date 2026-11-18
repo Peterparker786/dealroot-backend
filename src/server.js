@@ -2274,6 +2274,8 @@ const resolveFreeGift = async (giftProductId, subtotal) => {
 
 // Wallet balance can only be used to pay down a cart worth at least this
 // much — stops someone emptying their whole wallet onto a ₹20 order.
+// (Legacy constant kept for existing COD order logic that may reference it;
+//  the new per-product rule below supersedes it for wallet deductions.)
 const WALLET_MIN_SUBTOTAL = 100;
 
 const buildOnlinePaymentQuote = async ({
@@ -2312,8 +2314,19 @@ const buildOnlinePaymentQuote = async ({
     );
   }
 
+  const productIds = Array.from(requestedProducts.keys());
+  const dropshipRecords = await DropshipProduct.find({
+    product: { $in: productIds },
+  })
+    .select("product")
+    .lean();
+  const dropshipProductIdSet = new Set(
+    dropshipRecords.map((r) => String(r.product))
+  );
+
   const orderItems = [];
   let subtotal = 0;
+  let nonDropshipSubtotal = 0; // wallet can only cover this portion
   let hasTryoutItem = false;
 
   for (const [productId, quantity] of requestedProducts.entries()) {
@@ -2344,6 +2357,13 @@ const buildOnlinePaymentQuote = async ({
 
     const lineTotal = roundMoney(product.price * quantity);
     subtotal = roundMoney(subtotal + lineTotal);
+
+    // Check if this product is a dropship product — wallet is never applied
+    // to dropship items (they are low-margin fulfilment products).
+    const isDropship = dropshipProductIdSet.has(String(product._id));
+    if (!isDropship) {
+      nonDropshipSubtotal = roundMoney(nonDropshipSubtotal + lineTotal);
+    }
 
     orderItems.push({
       product: product._id,
@@ -2421,10 +2441,9 @@ if (isCod && subtotal >= 499) {
   );
 }
 
-// Wallet balance is prepaid-only: it reduces the amount charged online and
-// an order that uses it can never be Cash on Delivery, so store credit is
-// always settled up front instead of at the door.
-if (useWallet && isCod && subtotal >= WALLET_MIN_SUBTOTAL) {
+// Wallet balance is prepaid-only: applying any wallet balance immediately
+// forces online/prepaid payment regardless of subtotal.
+if (useWallet && isCod) {
   throw new Error(
     "Wallet balance can only be used on prepaid orders. Pay online to use it, or uncheck wallet balance to keep Cash on Delivery."
   );
@@ -2440,21 +2459,36 @@ let codAmount = roundMoney(
 
 let walletUsed = 0;
 
+// Wallet rules:
+// 1. Only applies on prepaid (non-COD) orders.
+// 2. Wallet can ONLY cover the non-dropship (high-margin) product subtotal —
+//    never dropship items and never shipping charges.
+// 3. No minimum order value: users can use wallet on any non-dropship subtotal > 0.
+// 4. Applying wallet forces prepaid — COD is disabled (enforced above).
+// 5. At least ₹1 stays payable (the shipping charge) so Razorpay always has
+//    an amount to charge.
 if (
   useWallet &&
   userId &&
   !isCod &&
-  subtotal >= WALLET_MIN_SUBTOTAL &&
-  payableNow > 1
+  nonDropshipSubtotal > 0
 ) {
   const walletUser = await User.findById(userId).select("walletBalance");
   const availableWallet = Math.max(0, walletUser?.walletBalance || 0);
 
-  // At least ₹1 stays payable so Razorpay always has an amount to charge.
-  walletUsed = roundMoney(
-    Math.min(availableWallet, Math.max(0, payableNow - 1))
-  );
+  // Cap wallet deduction at the non-dropship subtotal; shipping is ALWAYS
+  // paid online (never covered by wallet).
+  const maxWalletDeduction = Math.min(availableWallet, nonDropshipSubtotal);
+  walletUsed = roundMoney(maxWalletDeduction);
   payableNow = roundMoney(payableNow - walletUsed);
+}
+
+// Shipping charge (deliveryFee) is always payable, so payableNow >= deliveryFee.
+// Clamp to avoid floating-point artifacts going below deliveryFee.
+if (!isCod) {
+  payableNow = roundMoney(Math.max(deliveryFee, payableNow));
+  // Recalculate walletUsed based on clamped payableNow to stay consistent.
+  walletUsed = roundMoney(totalAmount - payableNow);
 }
 
 const amountInPaise = Math.round(payableNow * 100);
@@ -3855,6 +3889,22 @@ app.get("/api/products", async (req, res) => {
       .sort({ createdAt: -1 })
       .lean();
 
+    // Annotate each product with isDropship so the storefront can display the
+    // "Wallet Redeem Product" badge only on non-dropship (high-margin) items.
+    const productIds = products.map((p) => p._id);
+    const dropshipRecords = await DropshipProduct.find({
+      product: { $in: productIds },
+    })
+      .select("product")
+      .lean();
+    const dropshipProductIdSet = new Set(
+      dropshipRecords.map((r) => String(r.product))
+    );
+    const annotatedProducts = products.map((p) => ({
+      ...p,
+      isDropship: dropshipProductIdSet.has(String(p._id)),
+    }));
+
     // Member/admin responses must never be cached publicly by the CDN,
     // otherwise a guest could be served a member's tryout products.
     // Admins additionally get "no-store": the admin panel edits stock/
@@ -3877,8 +3927,8 @@ app.get("/api/products", async (req, res) => {
 
     res.json({
       success: true,
-      count: products.length,
-      products,
+      count: annotatedProducts.length,
+      products: annotatedProducts,
     });
   } catch {
     res.status(500).json({
@@ -3932,7 +3982,16 @@ app.get("/api/products/:id", async (req, res) => {
       }
     }
 
-    res.json({ success: true, product });
+    // Annotate with isDropship so the product detail page can show the
+    // "Wallet Redeem Product" badge only on non-dropship (high-margin) items.
+    const dropshipRecord = await DropshipProduct.findOne({ product: product._id })
+      .select("_id")
+      .lean();
+    const productData = product.toObject
+      ? { ...product.toObject(), isDropship: Boolean(dropshipRecord) }
+      : { ...product, isDropship: Boolean(dropshipRecord) };
+
+    res.json({ success: true, product: productData });
   } catch {
     res.status(400).json({
       success: false,
