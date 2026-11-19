@@ -871,6 +871,8 @@ const orderStatuses = [
   "shipped",
   "delivered",
   "cancelled",
+  "returned",
+  "not_delivered",
 ];
 const couponSchema = new mongoose.Schema(
   
@@ -1264,8 +1266,11 @@ referralOwnerCredited: { type: Boolean, default: false },
       {
         status: { type: String, enum: orderStatuses },
         at: { type: Date, default: Date.now },
+        note: { type: String, default: "", trim: true },
       },
     ],
+    adminNote: { type: String, default: "", trim: true },
+    returnReason: { type: String, default: "", trim: true },
     stockRestored: { type: Boolean, default: false },
     cancelledAt: { type: Date, default: null },
     // True when the order contains at least one Tryout-exclusive product.
@@ -8095,6 +8100,8 @@ const orderStatusLabels = {
   shipped: "Order Shipped",
   delivered: "Order Delivered",
   cancelled: "Order Cancelled",
+  returned: "Order Returned",
+  not_delivered: "Not Delivered / Returned to Origin",
 };
 
 const orderStatusEmojis = {
@@ -8104,10 +8111,12 @@ const orderStatusEmojis = {
   shipped: "🚚",
   delivered: "🏠",
   cancelled: "❌",
+  returned: "↩️",
+  not_delivered: "📦❌",
 };
 
 // Notify the customer by email whenever their order status changes.
-async function sendOrderStatusEmail(order) {
+async function sendOrderStatusEmail(order, customNote = "") {
   if (!order) return;
 
   const customerEmail =
@@ -8130,22 +8139,123 @@ async function sendOrderStatusEmail(order) {
   const emoji = orderStatusEmojis[order.orderStatus] || "📦";
   const siteUrl = seoSiteUrl;
   const trackUrl = siteUrl + "/account";
+  const noteToShow = String(customNote || order.adminNote || "").trim();
+
+  const isReturnOrUndelivered =
+    order.orderStatus === "returned" || order.orderStatus === "not_delivered";
+
+  const bannerColor =
+    order.orderStatus === "not_delivered"
+      ? "#be123c"
+      : order.orderStatus === "returned"
+      ? "#b45309"
+      : "#e21c48";
+
+  const bannerSubtitle =
+    order.orderStatus === "not_delivered"
+      ? "Delivery update on your order 📦"
+      : order.orderStatus === "returned"
+      ? "Return update on your order ↩️"
+      : "Your order is on the move 🛍️";
+
+  const cardBg =
+    order.orderStatus === "not_delivered"
+      ? "#fff1f2"
+      : order.orderStatus === "returned"
+      ? "#fffbeb"
+      : "#fff5f7";
+
+  const cardBorder =
+    order.orderStatus === "not_delivered"
+      ? "#fecdd3"
+      : order.orderStatus === "returned"
+      ? "#fef3c7"
+      : "#ffd6de";
+
+  const cardTitleColor =
+    order.orderStatus === "not_delivered"
+      ? "#9f1239"
+      : order.orderStatus === "returned"
+      ? "#92400e"
+      : "#e21c48";
+
+  const subject =
+    order.orderStatus === "not_delivered"
+      ? `📦❌ Delivery Unsuccessful — Order ${order.orderNumber}`
+      : order.orderStatus === "returned"
+      ? `↩️ Order Returned — ${order.orderNumber}`
+      : `${emoji} ${label} — ${order.orderNumber}`;
+
+  const messageText =
+    order.orderStatus === "delivered"
+      ? "Your order has been delivered. We hope you love it! A gentle reminder — you can review your products anytime."
+      : order.orderStatus === "shipped"
+      ? "Great news — your order is out for delivery and will reach you soon."
+      : order.orderStatus === "not_delivered"
+      ? "We wanted to let you know that the delivery partner was unable to deliver your package, and it has been marked as returned to origin."
+      : order.orderStatus === "returned"
+      ? "Your order has been marked as returned to our fulfillment warehouse."
+      : order.orderStatus === "cancelled"
+      ? "Your order has been cancelled."
+      : "We're updating you on the progress of your order.";
+
+  const reasonHtml = noteToShow
+    ? '    <div style="background:#fff8e6;border:1px solid #fed7aa;border-left:4px solid #f97316;border-radius:8px;padding:14px 18px;margin:20px 0;text-align:left;">\n' +
+      '      <strong style="color:#c2410c;font-size:12px;text-transform:uppercase;letter-spacing:0.5px;display:block;margin-bottom:6px;">Reason / Delivery Update:</strong>\n' +
+      '      <p style="margin:0;font-size:14px;color:#374151;line-height:1.6;font-weight:500;">' +
+      xmlEscape(noteToShow) +
+      "</p>\n" +
+      "    </div>\n"
+    : "";
+
+  const itemsHtml =
+    Array.isArray(order.items) && order.items.length > 0
+      ? '    <div style="margin:20px 0;border-top:1px solid #f0f0f0;padding-top:14px;text-align:left;">\n' +
+        '      <div style="font-size:12px;color:#888;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px;">Order Items</div>\n' +
+        order.items
+          .map(
+            (item) =>
+              '      <div style="font-size:13px;color:#444;margin-bottom:4px;">• ' +
+              xmlEscape(item.title || "Product") +
+              " × " +
+              (item.quantity || 1) +
+              " — ₹" +
+              (item.subtotal || item.price || 0) +
+              "</div>\n"
+          )
+          .join("") +
+        "    </div>\n"
+      : "";
+
+  const helpText = isReturnOrUndelivered
+    ? "Questions or want to re-order? Reply to this email, write to us at dealroot.store@gmail.com, or reach us on Telegram at @Tom_andrew72."
+    : "Questions? Reach us at dealroot.store@gmail.com or @Tom_andrew72 on Telegram.";
 
   const html =
     '<div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;background:#fff;">\n' +
-    '  <div style="background:#e21c48;padding:22px 28px;text-align:center;">\n' +
+    '  <div style="background:' +
+    bannerColor +
+    ';padding:22px 28px;text-align:center;">\n' +
     '    <h1 style="color:#fff;margin:0;font-size:20px;">DEALROOT BEAUTY</h1>\n' +
-    '    <p style="color:#ffe4e9;margin:6px 0 0;font-size:13px;">Your order is on the move 🛍️</p>\n' +
+    '    <p style="color:#ffe4e9;margin:6px 0 0;font-size:13px;">' +
+    bannerSubtitle +
+    "</p>\n" +
     "  </div>\n" +
     '  <div style="padding:28px;">\n' +
     '    <p style="font-size:14px;color:#333;">Hi ' +
     xmlEscape(order.customer?.name || "there") +
     ",</p>\n" +
-    '    <div style="background:#fff5f7;border:1px solid #ffd6de;border-radius:10px;padding:16px 20px;margin:18px 0;text-align:center;">\n' +
+    '    <div style="background:' +
+    cardBg +
+    ";border:1px solid " +
+    cardBorder +
+    ';border-radius:10px;padding:16px 20px;margin:18px 0;text-align:center;">\n' +
     '      <span style="font-size:44px;line-height:1;">' +
     emoji +
     "</span>\n" +
-    '      <h2 style="margin:8px 0 4px;font-size:20px;color:#e21c48;">' +
+    '      <h2 style="margin:8px 0 4px;font-size:20px;color:' +
+    cardTitleColor +
+    ';">' +
     label +
     "</h2>\n" +
     '      <span style="font-size:12px;color:#999;">Order ' +
@@ -8153,30 +8263,32 @@ async function sendOrderStatusEmail(order) {
     "</span>\n" +
     "    </div>\n" +
     '    <p style="font-size:14px;color:#555;line-height:1.6;">' +
-    (order.orderStatus === "delivered"
-      ? "Your order has been delivered. We hope you love it! A gentle reminder — you can review your products anytime."
-      : order.orderStatus === "shipped"
-      ? "Great news — your order is out for delivery and will reach you soon."
-      : "We're updating you on the progress of your order.") +
+    messageText +
     "</p>\n" +
+    reasonHtml +
+    itemsHtml +
     '    <a href="' +
     trackUrl +
-    '" style="display:block;text-align:center;background:#e21c48;color:#fff;text-decoration:none;padding:14px;border-radius:999px;font-size:14px;font-weight:700;">Track your order</a>\n' +
-    '    <p style="font-size:12px;color:#999;margin-top:20px;line-height:1.6;text-align:center;">Questions? Reach us at dealroot.store@gmail.com or @Tom_andrew72 on Telegram.</p>\n' +
+    '" style="display:block;text-align:center;background:' +
+    bannerColor +
+    ';color:#fff;text-decoration:none;padding:14px;border-radius:999px;font-size:14px;font-weight:700;">Track your order</a>\n' +
+    '    <p style="font-size:12px;color:#999;margin-top:20px;line-height:1.6;text-align:center;">' +
+    helpText +
+    "</p>\n" +
     "  </div>\n" +
     "</div>";
 
   await transporter.sendMail({
     from: '"DEALROOT Beauty" <' + process.env.EMAIL_USER + ">",
     to: customerEmail,
-    subject: emoji + " " + label + " — " + order.orderNumber,
+    subject,
     html,
   });
 }
 
 app.patch("/api/orders/:id/status", requireAdmin, async (req, res) => {
   try {
-    const { orderStatus } = req.body;
+    const { orderStatus, adminNote, restock } = req.body;
 
     if (!orderStatuses.includes(orderStatus)) {
       return res.status(400).json({
@@ -8201,26 +8313,69 @@ app.patch("/api/orders/:id/status", requireAdmin, async (req, res) => {
       });
     }
 
-    const order = await Order.findByIdAndUpdate(
-      req.params.id,
-      {
-        orderStatus,
-        $push: {
-          statusHistory: { status: orderStatus, at: new Date() },
-        },
-      },
-      { new: true, runValidators: true }
-    );
+    const trimmedNote = typeof adminNote === "string" ? adminNote.trim() : "";
+    const historyEntry = {
+      status: orderStatus,
+      at: new Date(),
+      note: trimmedNote,
+    };
 
-    if (orderStatus !== previous.orderStatus) {
-      sendOrderStatusEmail(order).catch((error) =>
+    const updateDoc = {
+      orderStatus,
+      $push: {
+        statusHistory: historyEntry,
+      },
+    };
+
+    if (trimmedNote) {
+      updateDoc.adminNote = trimmedNote;
+    }
+
+    // Auto-restock logic:
+    // If order is marked "not_delivered" OR ("returned" with restock !== false) AND stock hasn't been restored yet:
+    let stockRestockedNow = false;
+    const shouldRestock =
+      (orderStatus === "not_delivered" ||
+        (orderStatus === "returned" && restock !== false)) &&
+      !previous.stockRestored;
+
+    if (shouldRestock && Array.isArray(previous.items)) {
+      for (const item of previous.items) {
+        const productId = item.product?._id || item.product;
+        const quantity = Number(item.quantity);
+        if (productId && Number.isInteger(quantity) && quantity > 0) {
+          await Product.findByIdAndUpdate(productId, {
+            $inc: { stock: quantity },
+          });
+        }
+      }
+      updateDoc.stockRestored = true;
+      stockRestockedNow = true;
+    }
+
+    // If an order was previously delivered and is now returned/undelivered, claw back rewards
+    if (
+      previous.orderStatus === "delivered" &&
+      (orderStatus === "returned" || orderStatus === "not_delivered")
+    ) {
+      reverseOrderCashback(previous).catch((error) =>
+        console.error("Cashback reversal on return failed:", error.message)
+      );
+      reverseReferralBonus(previous).catch((error) =>
+        console.error("Referral reversal on return failed:", error.message)
+      );
+    }
+
+    const order = await Order.findByIdAndUpdate(req.params.id, updateDoc, {
+      new: true,
+      runValidators: true,
+    });
+
+    if (orderStatus !== previous.orderStatus || trimmedNote) {
+      sendOrderStatusEmail(order, trimmedNote).catch((error) =>
         console.error("Order status email failed:", error.message)
       );
 
-      // Coupon cashback is NOT credited automatically: the store owner adds
-      // it from the Orders tab once they are ready (see the admin cashback
-      // endpoint below). Only the personal referral program still settles on
-      // delivery.
       if (orderStatus === "delivered") {
         creditReferralBonus(order).catch((error) =>
           console.error("Referral bonus credit failed:", error.message)
@@ -8233,15 +8388,17 @@ app.patch("/api/orders/:id/status", requireAdmin, async (req, res) => {
       message:
         orderStatus !== previous.orderStatus
           ? "Order marked as " +
-            orderStatus +
+            (orderStatusLabels[orderStatus] || orderStatus) +
+            (stockRestockedNow ? " · Stock restored" : "") +
             " — customer notified by email"
-          : "Order status is already " + orderStatus,
+          : "Order status updated",
       order,
     });
-  } catch {
-    res.status(400).json({
+  } catch (error) {
+    console.error("Order status update failed:", error.message);
+    res.status(500).json({
       success: false,
-      message: "Could not update order status",
+      message: error.message || "Could not update order status",
     });
   }
 });
