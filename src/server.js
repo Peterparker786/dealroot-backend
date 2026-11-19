@@ -5320,10 +5320,8 @@ app.get("/api/admin/sales-stats", requireAdmin, async (req, res) => {
 
     const since = salesRangeSince(range);
 
-    // Active orders inside the selected window (excludes cancelled, returned, not_delivered)
-    const orderQuery = {
-      orderStatus: { $nin: ["cancelled", "returned", "not_delivered"] },
-    };
+    // Get delivered/completed orders inside the selected window
+    const orderQuery = { orderStatus: { $in: ["delivered", "completed"] } };
 
     if (since) {
       orderQuery.createdAt = { $gte: since };
