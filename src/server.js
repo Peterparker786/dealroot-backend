@@ -6866,9 +6866,16 @@ app.post(
         }
 
         if (!usableImage) {
-          warnings.push(
-            "Product images block ho gayi hain (HTTP 403) — images AI Screenshot Extract ya local upload se add karein. Title, price aur description phir bhi bhar diye gaye hain."
-          );
+          // Server could not download images to upload to Cloudinary, but the
+          // original CDN URLs are still returned and will display fine in a
+          // browser. Only add a scary warning if there are genuinely NO image
+          // URLs at all — if pageImages has URLs, the preview will show them.
+          if (pageImages.length === 0) {
+            warnings.push(
+              "Product images block ho gayi hain (HTTP 403) — images AI Screenshot Extract ya local upload se add karein. Title, price aur description phir bhi bhar diye gaye hain."
+            );
+          }
+          // else: original CDN URLs will be returned below; browser shows them fine.
         } else {
           if (usableImage.via !== "direct") {
             warnings.push("Main image backup proxy se download hui hai.");
@@ -6941,7 +6948,7 @@ app.post(
 
       if (pageImages.length > 0 && uploadedImages.length === 0) {
         warnings.push(
-          "Images Cloudinary par upload nahi hui — original CDN links diye gaye hain, save karte waqt local upload kar sakte hain."
+          "ℹ️ Images preview mein dikh rahi hain (original CDN links). Cloudinary par upload ke liye product save karne ke baad image URLs manually re-upload kar sakte hain."
         );
       }
 
