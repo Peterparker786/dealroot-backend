@@ -7089,7 +7089,7 @@ app.post(
         return res.status(400).json({
           success: false,
           message:
-            "Sirf Amazon / Flipkart / Meesho / DigiHaat links support hote hain",
+            "Sirf Amazon / Flipkart / Shopsy / Meesho / DigiHaat links support hote hain",
         });
       }
 
@@ -7134,8 +7134,10 @@ app.post(
       // Flipkart's page API already returns the product as structured data.
       const apiProduct = page.product || null;
       const html = page.html;
+      // Structured data first: the page API returns the exact buy-box price,
+      // while a markup scan can catch a different variant or an EMI amount.
       const sourcePrice =
-        parsePrice(html, platform) || rendered?.price || apiProduct?.price || 0;
+        rendered?.price || apiProduct?.price || parsePrice(html, platform) || 0;
       const inStock =
         rendered?.inStock !== undefined
           ? rendered.inStock

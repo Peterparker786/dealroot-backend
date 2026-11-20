@@ -11,7 +11,13 @@
 
 const { fetchDigihaatRenderedProduct } = require("./digihaat-render");
 
-const DROPSHIP_PLATFORMS = ["Amazon", "Flipkart", "Meesho", "DigiHaat"];
+const DROPSHIP_PLATFORMS = [
+  "Amazon",
+  "Flipkart",
+  "Shopsy",
+  "Meesho",
+  "DigiHaat",
+];
 
 // Amazon / Flipkart / Meesho / DigiHaat block a User-Agent after a few
 // requests, so we rotate through a small set of FULL browser fingerprints
@@ -59,6 +65,7 @@ const FETCH_TIMEOUT_MS = 12000;
 const PLATFORM_HOME = {
   Amazon: "https://www.amazon.in/",
   Flipkart: "https://www.flipkart.com/",
+  Shopsy: "https://www.shopsy.in/",
   Meesho: "https://www.meesho.com/",
   DigiHaat: "https://www.digihaat.in/",
 };
@@ -430,6 +437,8 @@ const platformForUrl = (url) => {
     return "Amazon";
   }
   if (host.includes("flipkart") || /(^|\.)fkrt\.it$/.test(host)) return "Flipkart";
+  // Shopsy is Flipkart's value marketplace on its own domain.
+  if (host.includes("shopsy")) return "Shopsy";
   if (host.includes("meesho")) return "Meesho";
   // DigiHaat is the ONDC marketplace at digihaat.in — accept the common
   // "digihat" spelling too, since people type it both ways.
@@ -630,6 +639,284 @@ const fetchFlipkartApiPage = async (url) => {
   }
 };
 
+// Shopsy runs on Flipkart's stack: its product pages embed the same JSON
+// (ppd / ogTitle / bd / availability) and serve images from the same rukmini
+// CDN. It also exposes the same page-fetch endpoint, which returns that JSON
+// directly and tolerates datacenter IPs far better than the HTML page, so it
+// is tried first — exactly like Flipkart.
+const fetchShopsyApiPage = async (url) => {
+  try {
+    const parsed = new URL(url);
+
+    if (!/(^|\.)shopsy\.in$/i.test(parsed.hostname)) return null;
+
+    const cacheKey = cacheKeyForUrl(url);
+    const cachedPage = readFlipkartCache(cacheKey);
+
+    if (cachedPage) return cachedPage;
+
+    const requestPage = () =>
+      fetch("https://www.shopsy.in/api/4/page/fetch", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "user-agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+          "x-user-agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 FKUA/website/42/website/Desktop",
+          accept: "*/*",
+          "accept-language": "en-IN,en;q=0.9",
+          origin: "https://www.shopsy.in",
+          referer: "https://www.shopsy.in/",
+        },
+        body: JSON.stringify({
+          pageUri: `${parsed.pathname}${parsed.search}`,
+          requestContext: { type: "BROWSE_PAGE" },
+        }),
+        signal: AbortSignal.timeout(20000),
+      });
+
+    let text = "";
+
+    // Shopsy's page API answers 529 ("high load") in short bursts, like
+    // Flipkart's does; one backed-off retry rides that out without making the
+    // admin extract slow.
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const response = await requestPage();
+      text = response.ok ? await response.text() : "";
+
+      if (text.length >= 5000) break;
+
+      if (attempt === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+    }
+
+    if (text.length < 5000) return null;
+
+    // Shopsy pads the payload ("isSpecialPrice" comes before "fsp"), so the
+    // Flipkart price regex cannot be reused as-is.
+    const priceBlock = text.match(
+      /"ppd":\{[^{}]*?"fsp":([0-9.]+)\s*,\s*"finalPrice":([0-9.]+)\s*,\s*"mrp":([0-9.]+)/
+    );
+    const price = Number(priceBlock?.[2] || priceBlock?.[1] || 0);
+
+    if (!Number.isFinite(price) || price <= 0) return null;
+
+    const mrp = Number(priceBlock?.[3] || 0);
+
+    const decode = (value) =>
+      String(value || "")
+        .replace(/\\u002F/g, "/")
+        .replace(/\\+/g, " ")
+        .replace(/&amp;/g, "&")
+        .replace(/&#39;/g, "'")
+        .replace(/&quot;/g, '"')
+        .trim();
+
+    // Shopsy titles are "<product> Price in India - Buy <product> online at
+    // Shopsy.in"; keep just the product name.
+    const title = decode(text.match(/"ogTitle":"([^"]+)"/)?.[1])
+      .replace(/\s*Price in India.*$/i, "")
+      .replace(/\s*Online at Best Price.*$/i, "")
+      .trim();
+
+    const description = decode(
+      text.match(/"ogDescription":"([^"]+)"/)?.[1] ||
+        text.match(/"description":"(Buy [^"]{20,600})"/)?.[1]
+    );
+    const brand = decode(text.match(/"bd":"([^"]{1,40})"/)?.[1]);
+
+    const availability = text.match(
+      /"availability":"https:\/\/schema\.org\/(InStock|OutOfStock|[A-Za-z]+)"/
+    )?.[1];
+    const inStock =
+      availability === "InStock"
+        ? true
+        : availability === "OutOfStock"
+          ? false
+          : null;
+
+    // JSON escapes the slashes and Shopsy serves the plain rukmini URLs, so
+    // decode once and match a single plain pattern.
+    const plainText = text.replace(/\\\//g, "/");
+
+    const images = [
+      ...new Set(
+        (plainText.match(/https:\/\/rukmini[^"'\s]*?\/image\/[^"'\s]+/g) || [])
+          .map((imageUrl) =>
+            imageUrl
+              .replace(/&amp;/g, "&")
+              .replace(/\{@width\}/g, "832")
+              .replace(/\{@height\}/g, "832")
+              .replace(/\{@quality\}/g, "80")
+          )
+          .filter((imageUrl) => !/\/promos\//i.test(imageUrl))
+      ),
+    ].slice(0, 8);
+
+    const escape = (value) =>
+      String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+
+    // Same synthetic markup the Flipkart API path builds, so the shared
+    // extractors read price, stock and images without Shopsy-specific code.
+    const html = [
+      "<html><head>",
+      `<title>${escape(title)}</title>`,
+      `<meta property="og:title" content="${escape(title)}" />`,
+      `<meta property="og:description" content="${escape(description)}" />`,
+      images[0]
+        ? `<meta property="og:image" content="${escape(images[0])}" />`
+        : "",
+      `<meta property="og:url" content="${escape(url)}" />`,
+      `<meta name="brand" content="${escape(brand)}" />`,
+      "</head><body>",
+      `<div class="_30jeq3 _16Jk6d">₹${price.toLocaleString("en-IN")}</div>`,
+      mrp > price
+        ? `<div class="_3I9_wc">₹${mrp.toLocaleString("en-IN")}</div>`
+        : "",
+      // The shared stock parser reads these two strings; only one is present.
+      inStock === false ? "<p>Out of stock</p>" : "<p>Add to cart</p>",
+      ...images.map((src) => `<img src="${escape(src)}" />`),
+      "</body></html>",
+    ].join("");
+
+    const page = {
+      html,
+      via: "shopsy-api",
+      status: 200,
+      warnings: [],
+      // The extractor prefers this structured form over re-reading the markup.
+      product: { title, brand, price, mrp, description, images, inStock },
+    };
+
+    writeFlipkartCache(cacheKey, page);
+
+    return page;
+  } catch (error) {
+    console.error("Shopsy API fallback failed:", error.message);
+    return null;
+  }
+};
+
+// The identical product JSON is embedded in Shopsy's rendered HTML, so the
+// admin extract still works when the page API is answering 529 — it just reads
+// the markup a browser would have received.
+const parseShopsyProductFromHtml = (html) => {
+  const text = String(html || "");
+
+  if (!/"ppd"\s*:/.test(text)) return null;
+
+  const priceBlock = text.match(
+    /"ppd":\{[^{}]*?"fsp":([0-9.]+)\s*,\s*"finalPrice":([0-9.]+)\s*,\s*"mrp":([0-9.]+)/
+  );
+  const price = Number(priceBlock?.[2] || priceBlock?.[1] || 0);
+
+  if (!Number.isFinite(price) || price <= 0) return null;
+
+  const mrp = Number(priceBlock?.[3] || 0);
+
+  const decode = (value) =>
+    String(value || "")
+      .replace(/\\u002F/g, "/")
+      .replace(/\\+/g, " ")
+      .replace(/&amp;/g, "&")
+      .replace(/&#39;/g, "'")
+      .replace(/&quot;/g, '"')
+      .trim();
+
+  const title = decode(text.match(/"ogTitle":"([^"]+)"/)?.[1])
+    .replace(/\s*Price in India.*$/i, "")
+    .replace(/\s*Online at Best Price.*$/i, "")
+    .trim();
+
+  const description = decode(
+    text.match(/"ogDescription":"([^"]+)"/)?.[1] ||
+      text.match(/"description":"(Buy [^"]{20,600})"/)?.[1]
+  );
+  const brand = decode(text.match(/"bd":"([^"]{1,40})"/)?.[1]);
+
+  const availability = text.match(
+    /"availability":"https:\/\/schema\.org\/(InStock|OutOfStock|[A-Za-z]+)"/
+  )?.[1];
+  const inStock =
+    availability === "InStock"
+      ? true
+      : availability === "OutOfStock"
+        ? false
+        : null;
+
+  const plainText = text.replace(/\\\//g, "/");
+
+  const images = [
+    ...new Set(
+      (plainText.match(/https:\/\/rukmini[^"'\s]*?\/image\/[^"'\s]+/g) || [])
+        .map((imageUrl) =>
+          imageUrl
+            .replace(/&amp;/g, "&")
+            .replace(/\{@width\}/g, "832")
+            .replace(/\{@height\}/g, "832")
+            .replace(/\{@quality\}/g, "80")
+        )
+        .filter((imageUrl) => !/\/promos\//i.test(imageUrl))
+    ),
+  ].slice(0, 8);
+
+  return { title, brand, price, mrp, description, images, inStock };
+};
+
+// Last resort when Shopsy answers 529 to both the page API and the HTML: the
+// reader copy is markdown, which still has the title, the rupee prices and the
+// rukmini gallery.
+const parseShopsyProductFromMarkdown = (markdown) => {
+  const text = String(markdown || "");
+
+  if (text.length < 200) return null;
+
+  const title =
+    text.match(/^Title:\s*(.+)$/m)?.[1]?.trim() ||
+    text.match(/^#\s+(.{5,200})$/m)?.[1]?.trim() ||
+    "";
+
+  if (!title) return null;
+
+  const prices = [
+    ...text.matchAll(/₹\s*([0-9][0-9,]*(?:\.[0-9]+)?)/g),
+  ]
+    .map((match) => Number(match[1].replace(/,/g, "")))
+    .filter((value) => Number.isFinite(value) && value > 0);
+
+  if (!prices.length) return null;
+
+  const price = Math.min(...prices);
+  const mrp = prices.find((value) => value > price) || 0;
+
+  const images = [
+    ...new Set(
+      [...text.matchAll(/!\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/g)]
+        .map((match) => match[1].trim())
+        .filter((imageUrl) => /rukmini|flixcart/i.test(imageUrl))
+    ),
+  ].slice(0, 8);
+
+  const brand =
+    text.match(/\*\*Brand\*\*\s*:?\s*([^\n*]{2,40})/i)?.[1]?.trim() || "";
+
+  return {
+    title: title.replace(/\s*Price in India.*$/i, "").trim(),
+    brand,
+    price,
+    mrp,
+    description: "",
+    images,
+    inStock: !/out\s+of\s+stock|sold\s+out/i.test(text),
+  };
+};
+
 // Loads the raw page HTML with a two stage strategy:
 //   1. direct request using rotating realistic browser fingerprints
 //   2. free proxy gateway (Flipkart/Amazon answer 403 to a datacenter IP)
@@ -638,8 +925,20 @@ const fetchFlipkartApiPage = async (url) => {
 // Throws an error with `code = "BLOCKED"` when both stages fail, so the admin
 // UI can offer the screenshot / manual-image fallbacks instead of a dead end.
 async function fetchPageHtml(url, { platform = "" } = {}) {
-  if (String(platform || platformForUrl(url) || "").toLowerCase() === "flipkart") {
+  const detectedPlatform = String(
+    platform || platformForUrl(url) || ""
+  ).toLowerCase();
+
+  // Both Flipkart and Shopsy expose a page API that answers with the product
+  // JSON, and both block their HTML pages for datacenter IPs.
+  if (detectedPlatform === "flipkart") {
     const apiPage = await fetchFlipkartApiPage(url);
+
+    if (apiPage) return apiPage;
+  }
+
+  if (detectedPlatform === "shopsy") {
+    const apiPage = await fetchShopsyApiPage(url);
 
     if (apiPage) return apiPage;
   }
@@ -677,7 +976,22 @@ async function fetchPageHtml(url, { platform = "" } = {}) {
         !looksBlocked(html, response.status) &&
         looksLikeProductPage(html)
       ) {
-        return { html, via: "direct", status: response.status, warnings: [] };
+        const page = {
+          html,
+          via: "direct",
+          status: response.status,
+          warnings: [],
+        };
+
+        // Shopsy embeds the same JSON the page API returns, so the structured
+        // product is recoverable from the HTML too.
+        if (detectedPlatform === "shopsy") {
+          const parsedProduct = parseShopsyProductFromHtml(html);
+
+          if (parsedProduct) page.product = parsedProduct;
+        }
+
+        return page;
       }
 
       if (
@@ -691,6 +1005,16 @@ async function fetchPageHtml(url, { platform = "" } = {}) {
     } finally {
       clearTimeout(timer);
     }
+
+    // Flipkart and Shopsy answer 529 ("high load") in short bursts; a pause
+    // before the next fingerprint usually clears it instead of burning the
+    // whole page budget on back-to-back retries.
+    if (
+      attempt < BROWSER_PROFILES.length - 1 &&
+      (detectedPlatform === "shopsy" || detectedPlatform === "flipkart")
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 900));
+    }
   }
 
   // Stage 2 — the free read-through gateways, inside the remaining budget.
@@ -703,7 +1027,7 @@ async function fetchPageHtml(url, { platform = "" } = {}) {
     const isMarkdown =
       proxied.gateway === "reader" || /^Title:\s*.+$/m.test(proxied.text.slice(0, 2000));
 
-    return {
+    const page = {
       html: isMarkdown
         ? markdownToPseudoHtml(proxied.text, url)
         : // The translate proxy serves a copy with its own base URL; restoring
@@ -718,6 +1042,16 @@ async function fetchPageHtml(url, { platform = "" } = {}) {
         `${platform || platformForUrl(url) || "Source"} ne direct request block kar di — backup proxy (${proxied.gateway}) se data liya gaya. Images kam aa sakti hain.`,
       ],
     };
+
+    // Shopsy throttles hard (529). The reader copy still carries the title,
+    // price and gallery, so the admin extract stays useful instead of empty.
+    if (detectedPlatform === "shopsy" && isMarkdown) {
+      const parsedProduct = parseShopsyProductFromMarkdown(proxied.text);
+
+      if (parsedProduct) page.product = parsedProduct;
+    }
+
+    return page;
   }
 
   const label = platform || platformForUrl(url) || "Source page";
@@ -985,6 +1319,17 @@ async function fetchSourceProduct({ url, platform }) {
   let price = page ? parsePrice(page.html, resolvedPlatform) : 0;
   let inStock = page ? parseStock(page.html, resolvedPlatform) : null;
 
+  // A page API (Flipkart/Shopsy) carries the exact buy-box price and stock;
+  // the markup scan can otherwise pick up a different variant or an EMI
+  // number that happens to appear earlier in the page.
+  if (page?.product) {
+    if (page.product.price > 0) price = page.product.price;
+
+    if (inStock === null && typeof page.product.inStock === "boolean") {
+      inStock = page.product.inStock;
+    }
+  }
+
   const rendered = await renderedPromise;
 
   if (resolvedPlatform === "DigiHaat" && (!price || price <= 0)) {
@@ -1128,6 +1473,8 @@ module.exports = {
   looksBlocked,
   marginLabelFor,
   parsePrice,
+  parseShopsyProductFromHtml,
+  parseShopsyProductFromMarkdown,
   parseStock,
   platformForUrl,
   sellingPriceFor,
