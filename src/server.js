@@ -1657,6 +1657,13 @@ const storeSettingsSchema = new mongoose.Schema(
       min: 0,
       max: 1000,
     },
+    // The admin's "free delivery" switch. When on, every order ships free —
+    // including Cash on Delivery, where €0 payable online is handled by
+    // creating the order directly instead of opening Razorpay.
+    freeDelivery: {
+      type: Boolean,
+      default: false,
+    },
     // What the courier company charges the store per delivered order. Profit
     // subtracts this (times the number of delivered orders), not the delivery
     // fee customers pay. An order-level override still wins — see Order.deliveryCost.
@@ -1755,12 +1762,17 @@ const getStoreSettings = async () => {
 
   const savedFee = Number(record?.deliveryFee);
   const savedCourierCost = Number(record?.courierCostPerOrder);
+  // Either the explicit switch, or a stored ₹0, means free delivery. Neither
+  // may silently fall back to the ₹59 default.
+  const freeDelivery = record?.freeDelivery === true || savedFee === 0;
 
   return {
-    deliveryFee:
-      Number.isFinite(savedFee) && savedFee > 0
+    deliveryFee: freeDelivery
+      ? 0
+      : Number.isFinite(savedFee) && savedFee > 0
         ? savedFee
         : DEFAULT_DELIVERY_FEE,
+    freeDelivery,
     courierCostPerOrder:
       Number.isFinite(savedCourierCost) && savedCourierCost >= 0
         ? savedCourierCost
@@ -2551,7 +2563,10 @@ if (!isCod) {
 }
 
 const amountInPaise = Math.round(payableNow * 100);
-  if (amountInPaise < 1) {
+  // ₹0 online is valid now: with free delivery a Cash on Delivery order has
+  // nothing to prepay (see createZeroPaymentOrder). The order itself must
+  // still be worth something.
+  if (amountInPaise < 1 && totalAmount < 1) {
     throw new Error("Order total must be greater than zero");
   }
 
@@ -2960,6 +2975,137 @@ codAmount: currentPaymentSession.codAmount,
   } finally {
     await databaseSession.endSession();
   }
+};
+
+// Free delivery + Cash on Delivery leaves ₹0 to charge online, and Razorpay
+// cannot open for ₹0. The order is created directly instead, with the same
+// stock, wallet, coupon and referral handling as a paid order.
+const createZeroPaymentOrder = async ({ quote, orderNumber, userId }) => {
+  const databaseSession = await mongoose.startSession();
+  let completedOrder = null;
+
+  try {
+    await databaseSession.withTransaction(async () => {
+      for (const item of quote.orderItems) {
+        const stockUpdate = await Product.updateOne(
+          { _id: item.product, stock: { $gte: item.quantity } },
+          { $inc: { stock: -item.quantity } },
+          { session: databaseSession }
+        );
+
+        if (stockUpdate.modifiedCount !== 1) {
+          const error = new Error(
+            "A product went out of stock while the order was being placed"
+          );
+          error.statusCode = 409;
+          throw error;
+        }
+      }
+
+      if (quote.walletUsed > 0 && userId) {
+        const walletDebit = await User.updateOne(
+          { _id: userId, walletBalance: { $gte: quote.walletUsed } },
+          { $inc: { walletBalance: -quote.walletUsed } },
+          { session: databaseSession }
+        );
+
+        if (walletDebit.modifiedCount !== 1) {
+          const error = new Error(
+            "Your wallet balance changed before the order could be completed."
+          );
+          error.statusCode = 409;
+          throw error;
+        }
+      }
+
+      const isCodOrder = quote.paymentMethod === "cod";
+
+      [completedOrder] = await Order.create(
+        [
+          {
+            orderNumber,
+            user: userId,
+            customer: quote.cleanCustomer,
+            items: quote.orderItems,
+            deliveryFee: quote.deliveryFee,
+            couponCode: quote.couponCode,
+            discountAmount: quote.discountAmount,
+            totalAmount: quote.totalAmount,
+            deliveryType: quote.deliveryType,
+            paymentMethod: quote.paymentMethod,
+            tryoutOrder: quote.tryoutOrder || false,
+            // Nothing was collected online on this path.
+            paymentStatus: isCodOrder ? "pending" : "paid",
+            deliveryChargePaid: !isCodOrder,
+            deliveryChargeAmount: 0,
+            codAmount: isCodOrder ? quote.totalAmount : 0,
+            walletUsed: quote.walletUsed || 0,
+            referralOwnerEmail: quote.referralOwnerEmail || "",
+            referralBonus: quote.referralBonus || 0,
+            referralCodeUsed: quote.referralCodeUsed || "",
+            referralOwnerUser: quote.referralOwnerUser || null,
+            referralShareAmount: quote.referralShareAmount || 0,
+          },
+        ],
+        { session: databaseSession }
+      );
+
+      try {
+        await incrementCouponUsage(
+          quote.couponCode,
+          quote.cleanCustomer?.email,
+          databaseSession
+        );
+      } catch (error) {
+        console.error("Coupon usage increment failed:", error.message);
+      }
+
+      if (userId) {
+        await User.findByIdAndUpdate(
+          userId,
+          { $set: quote.cleanCustomer },
+          { session: databaseSession, runValidators: true }
+        );
+      }
+
+      // Referral bonus stays pending for the admin to approve, exactly like
+      // the Razorpay path.
+      if (quote.referralOwnerEmail && quote.referralBonus > 0) {
+        const referralOwner = await User.findOne({
+          email: quote.referralOwnerEmail,
+        }).session(databaseSession);
+
+        if (referralOwner) {
+          await WalletTransaction.create(
+            [
+              {
+                user: referralOwner._id,
+                type: "referral",
+                status: "pending",
+                amount: quote.referralBonus,
+                order: completedOrder._id,
+                orderNumber: completedOrder.orderNumber,
+                orderAmount: completedOrder.totalAmount,
+                buyerName: completedOrder.customer?.name || "",
+                couponCode: completedOrder.couponCode,
+              },
+            ],
+            { session: databaseSession }
+          );
+        }
+      }
+    });
+  } finally {
+    await databaseSession.endSession();
+  }
+
+  if (completedOrder) {
+    sendOrderEmails(completedOrder).catch((error) =>
+      console.error("Order email failed:", error.message)
+    );
+  }
+
+  return completedOrder;
 };
 
 app.get("/", (req, res) => {
@@ -5330,30 +5476,48 @@ app.put("/api/admin/courier-cost", requireAdmin, async (req, res) => {
 
 app.put("/api/admin/store-settings", requireAdmin, async (req, res) => {
   try {
-    const deliveryFee = Number(req.body?.deliveryFee);
+    const wantsFreeDelivery = req.body?.freeDelivery === true;
+    const hasFee = req.body?.deliveryFee !== undefined;
 
-    // ₹0 would leave a COD order with nothing to prepay online, which the
-    // Razorpay flow cannot handle — so the admin range starts at ₹1.
-    if (
-      !Number.isInteger(deliveryFee) ||
-      deliveryFee < 1 ||
-      deliveryFee > 1000
-    ) {
-      throw new Error(
-        "Delivery charge must be a whole number between ₹1 and ₹1000"
-      );
+    if (!wantsFreeDelivery && !hasFee) {
+      throw new Error("Nothing to update — send freeDelivery or deliveryFee");
+    }
+
+    let update = {};
+
+    if (wantsFreeDelivery) {
+      update = { freeDelivery: true };
+    } else {
+      const deliveryFee = Number(req.body?.deliveryFee);
+
+      if (
+        !Number.isInteger(deliveryFee) ||
+        deliveryFee < 1 ||
+        deliveryFee > 1000
+      ) {
+        throw new Error(
+          "Delivery charge must be a whole number between ₹1 and ₹1000, or turn on free delivery"
+        );
+      }
+
+      update = { freeDelivery: false, deliveryFee };
     }
 
     const saved = await StoreSettings.findOneAndUpdate(
       { key: STORE_SETTINGS_KEY },
-      { $set: { deliveryFee } },
+      { $set: update },
       { new: true, upsert: true, runValidators: true }
     );
 
+    const settings = await getStoreSettings();
+
     res.json({
       success: true,
-      message: `Delivery charge updated to ₹${saved.deliveryFee}`,
-      deliveryFee: saved.deliveryFee,
+      message: settings.freeDelivery
+        ? "Free delivery is ON — no delivery charge on any order"
+        : `Delivery charge updated to ₹${settings.deliveryFee}`,
+      deliveryFee: settings.deliveryFee,
+      freeDelivery: settings.freeDelivery,
       freeDeliveryThreshold: FREE_DELIVERY_THRESHOLD,
     });
   } catch (error) {
@@ -7729,6 +7893,24 @@ app.post(
   userId: req.user?.userId || null,
 });
       const orderNumber = createOrderNumber();
+
+      // Free delivery + Cash on Delivery: there is nothing to charge online.
+      if (quote.amountInPaise < 1) {
+        const order = await createZeroPaymentOrder({
+          quote,
+          orderNumber,
+          userId: req.user?.userId || null,
+        });
+
+        return res.status(201).json({
+          success: true,
+          message: "Order placed",
+          order,
+          orderNumber,
+          amount: 0,
+          currency: "INR",
+        });
+      }
 
       const razorpayOrder = await instance.orders.create({
         amount: quote.amountInPaise,
