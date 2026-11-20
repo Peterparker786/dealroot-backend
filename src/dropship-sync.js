@@ -899,12 +899,22 @@ const parseShopsyProductFromMarkdown = (markdown) => {
     ...new Set(
       [...text.matchAll(/!\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/g)]
         .map((match) => match[1].trim())
-        .filter((imageUrl) => /rukmini|flixcart/i.test(imageUrl))
+        // Only the product CDN; the page also shows help/payment icon SVGs on
+        // static-assets-web.flixcart.com, which are not product photos.
+        .filter((imageUrl) =>
+          /^https?:\/\/rukmini[a-z0-9]*\.flixcart\.com\/image\//i.test(imageUrl)
+        )
     ),
   ].slice(0, 8);
 
+  // The breadcrumb links to the brand listing (/funkari~brand/pr?...), which is
+  // the only place the reader copy names the brand.
+  const brandSlug = text.match(/\/([a-z0-9-]{2,40})~brand\/pr/i)?.[1] || "";
   const brand =
-    text.match(/\*\*Brand\*\*\s*:?\s*([^\n*]{2,40})/i)?.[1]?.trim() || "";
+    text.match(/\*\*Brand\*\*\s*:?\s*([^\n*]{2,40})/i)?.[1]?.trim() ||
+    (brandSlug
+      ? brandSlug.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())
+      : "");
 
   return {
     title: title.replace(/\s*Price in India.*$/i, "").trim(),
