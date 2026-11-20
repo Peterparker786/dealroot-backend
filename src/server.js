@@ -4204,7 +4204,7 @@ app.get("/api/products", async (req, res) => {
     }
 
     const products = await Product.find(filter)
-      .select("brand title price mrp rating reviews images badge stock dealType tryoutOnly category createdAt marketplaceLinks buyLink buyLinkLabel buyLinkTerms tnc")
+      .select("brand title price mrp rating reviews images badge stock dealType tryoutOnly freeDelivery category createdAt marketplaceLinks buyLink buyLinkLabel buyLinkTerms tnc")
       .sort({ createdAt: -1 })
       .lean();
 
