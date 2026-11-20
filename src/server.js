@@ -673,7 +673,8 @@ async function sendReferralOwnerEmail({ owner, amount, maskedBuyerEmail, order, 
 }
 
 // Credits a delivered order's personal-referral reward — only the code
-// owner's 50%, since the buyer earns nothing automatically from an account
+// owner's share (REFERRAL_SHARE_PERCENT), since the buyer earns nothing
+// automatically from an account
 // link (they only earn cashback by applying an actual coupon code at
 // checkout, handled separately). Guarded by its own atomic claim
 // (referralOwnerCredited) so this can never be double-credited by a status
@@ -681,7 +682,7 @@ async function sendReferralOwnerEmail({ owner, amount, maskedBuyerEmail, order, 
 async function creditReferralBonus(order) {
   if (!order?.referralShareAmount || order.referralShareAmount <= 0) return;
 
-  // Code owner's 50%.
+  // Code owner's share (REFERRAL_SHARE_PERCENT).
   if (order.referralOwnerUser) {
     const ownerClaim = await Order.updateOne(
       { _id: order._id, referralOwnerCredited: false },
@@ -1275,8 +1276,8 @@ referralOwnerUser: {
   ref: "User",
   default: null,
 },
-// 50% of this order's subtotal (excluding delivery/COD fee) — credited to
-// the code owner once the order is delivered.
+// A share of this order's subtotal (excluding delivery/COD fee) — credited
+// to the code owner once the order is delivered.
 referralShareAmount: { type: Number, default: 0, min: 0 },
 referralOwnerCredited: { type: Boolean, default: false },
 
@@ -1546,7 +1547,7 @@ otpExpiry: {
     // code ONCE, either at signup or later from their profile — this
     // permanently links their account (`referredBy`/`referredByCode` below)
     // to the code owner. Once linked, EVERY order that account places
-    // automatically earns the code OWNER 50% of that order's subtotal
+    // automatically earns the code OWNER a share of that order's subtotal
     // (excluding delivery fee) as wallet cashback once it's delivered — no
     // checkout action needed, see creditReferralBonus. The linked buyer does
     // NOT automatically get anything from this link; they only earn cashback
@@ -2105,6 +2106,11 @@ const normaliseCouponCode = (couponCode) =>
 const AUTO_CASHBACK_MIN_SUBTOTAL = 500;
 const AUTO_CASHBACK_PERCENT = 10;
 
+// Personal-referral program: the code OWNER earns this share of every
+// delivered order's subtotal (excluding delivery/COD fee) as wallet cashback.
+// The linked buyer earns nothing from this link — only from actual coupons.
+const REFERRAL_SHARE_PERCENT = 10;
+
 const roundMoney = (amount) =>
   Math.round((Number(amount) + Number.EPSILON) * 100) / 100;
 
@@ -2462,7 +2468,7 @@ const buildOnlinePaymentQuote = async ({
   // Personal referral program — fully independent of coupon codes. If this
   // buyer's account is permanently linked to a referral-code owner
   // (User.referredBy, set once from the profile or signup), that owner
-  // automatically earns 50% of this order's subtotal (not counting the
+  // automatically earns 10% of this order's subtotal (not counting the
   // delivery/COD fee) as wallet cashback once it's delivered — on EVERY
   // order this account places, with no checkout action required. The buyer
   // themselves earns nothing from this link.
@@ -2478,7 +2484,9 @@ const buildOnlinePaymentQuote = async ({
     if (linkedBuyer?.referredBy) {
       referralOwnerUser = linkedBuyer.referredBy;
       referralCodeUsed = linkedBuyer.referredByCode;
-      referralShareAmount = roundMoney(subtotal * 0.5);
+      referralShareAmount = roundMoney(
+        (subtotal * REFERRAL_SHARE_PERCENT) / 100
+      );
     }
   }
 
@@ -6108,14 +6116,14 @@ app.post("/api/admin/orders", requireAdmin, async (req, res) => {
 
       // Personal referral program — fully independent of the Coupon code
       // field above. If this customer's account is permanently linked to a
-      // referral-code owner, that owner automatically earns 50% of this
+      // referral-code owner, that owner automatically earns 10% of this
       // order's subtotal (not counting delivery/COD fee) as cashback once
       // delivered — same as the real checkout path (see
       // buildOnlinePaymentQuote).
       const referralOwnerUser = foundUser?.referredBy || null;
       const referralCodeUsed = foundUser?.referredByCode || "";
       const referralShareAmount = referralOwnerUser
-        ? roundMoney(subtotal * 0.5)
+        ? roundMoney((subtotal * REFERRAL_SHARE_PERCENT) / 100)
         : 0;
 
       // Manual orders skip the online delivery-fee prepay step entirely
