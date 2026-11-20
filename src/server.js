@@ -71,6 +71,19 @@ const brevoSenderEmail = () =>
       "dealroot.store@gmail.com"
   ).trim();
 
+// A Gmail/Yahoo/Outlook "from" address is rejected by Brevo for this store's
+// own domain (DMARC), and every order notification then fails silently. Say it
+// loudly at boot so it shows up in the Render logs instead of only in a
+// customer complaint that "no email came".
+if (
+  process.env.BREVO_API_KEY &&
+  FREE_MAIL_DOMAINS.test(brevoSenderEmail())
+) {
+  console.warn(
+    `Email sender "${brevoSenderEmail()}" is a free mailbox provider — Brevo will reject it. Set BREVO_SENDER_EMAIL to an address on the store's verified domain.`
+  );
+}
+
 async function brevoSendMail({ from, to, subject, html, text, replyTo, headers }) {
   const key = process.env.BREVO_API_KEY;
   if (!key) throw new Error("BREVO_API_KEY is not set");
@@ -249,13 +262,26 @@ async function sendOTP(
 async function sendOrderEmails(order) {
   if (!order) return;
 
-  const customerEmail =
-    String(order.customer?.email || "").trim() ||
-    (order.user ? (await User.findOne({ _id: order.user }).select("email"))?.email : "") ||
-    "";
+  let customerEmail = String(order.customer?.email || "").trim();
+
+  // The account lookup is a convenience only — if it fails, the owner still
+  // has to be told about the order.
+  if (!customerEmail && order.user) {
+    try {
+      customerEmail = String(
+        (await User.findOne({ _id: order.user }).select("email"))?.email || ""
+      ).trim();
+    } catch (error) {
+      console.error("Order email account lookup failed:", error.message);
+    }
+  }
 
   const ownerEmail = String(process.env.ADMIN_EMAIL || "").trim();
-  const from = `"DEALROOT Beauty" <${process.env.EMAIL_USER}>`;
+  const senderEmail =
+    String(process.env.EMAIL_USER || "").trim() ||
+    String(process.env.BREVO_SENDER_EMAIL || "").trim() ||
+    "no-reply@dealroot.store";
+  const from = `"DEALROOT Beauty" <${senderEmail}>`;
 
   const money = (n) => `₹${Number(n || 0).toLocaleString("en-IN")}`;
   const paymentLabel =
@@ -350,15 +376,35 @@ async function sendOrderEmails(order) {
   const send = (to, subject, html) =>
     transporter.sendMail({ from, to, subject, html });
 
-  // Send to the customer if we have an email.
+  // Both mails are sent independently: one bad customer address (bounce,
+  // rejected sender, provider hiccup) must never stop the owner's order
+  // notification from going out.
+  const tasks = [];
+
   if (customerEmail) {
-    await send(customerEmail, customerSubject, customerHtml);
+    tasks.push(
+      send(customerEmail, customerSubject, customerHtml).catch((error) =>
+        console.error(
+          `Order email to customer failed (${customerEmail}):`,
+          error.message
+        )
+      )
+    );
   }
 
-  // Notify the store owner.
   if (ownerEmail) {
-    await send(ownerEmail, ownerSubject, ownerHtml);
+    tasks.push(
+      send(ownerEmail, ownerSubject, ownerHtml).catch((error) => {
+        console.error(
+          `Order notification to store owner failed (${ownerEmail}):`,
+          error.message
+        );
+        throw error;
+      })
+    );
   }
+
+  await Promise.allSettled(tasks);
 }
 
 // Tell a customer that someone used the referral coupon code the admin
@@ -2533,12 +2579,22 @@ const signaturesMatch = (received, expected) => {
   );
 };
 
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Reads the payment until Razorpay confirms the money is actually captured.
+// UPI / netbanking confirmations often land a few seconds AFTER the checkout
+// window closes, so a single look was rejecting perfectly good payments —
+// the customer saw "failed", paid again, and the shop ended up with two
+// captured payments for one order. Polling (and accepting a capture that a
+// parallel request or auto-capture already did) removes that failure mode.
 const getCapturedRazorpayPayment = async ({
   razorpayOrderId,
   razorpayPaymentId,
   amountInPaise,
+  maxWaitMs = 20000,
 }) => {
   const instance = getRazorpay();
+  const startedAt = Date.now();
   let payment = await instance.payments.fetch(razorpayPaymentId);
 
   if (
@@ -2551,29 +2607,56 @@ const getCapturedRazorpayPayment = async ({
     throw error;
   }
 
-  if (payment.status === "authorized") {
-    payment = await instance.payments.capture(
-      razorpayPaymentId,
-      amountInPaise,
-      "INR"
-    );
+  while (Date.now() - startedAt < maxWaitMs) {
+    if (payment.status === "captured" && payment.captured === true) {
+      return payment;
+    }
+
+    if (payment.status === "authorized") {
+      try {
+        const captured = await instance.payments.capture(
+          razorpayPaymentId,
+          amountInPaise,
+          "INR"
+        );
+
+        if (captured?.status === "captured" && captured.captured === true) {
+          return captured;
+        }
+      } catch (captureError) {
+        // "already captured" is a success, not a failure — the next read of
+        // the payment decides, so only log the API error here.
+        console.warn(
+          "Razorpay capture attempt failed:",
+          captureError?.error?.description || captureError.message
+        );
+      }
+    } else if (payment.status === "failed") {
+      const error = new Error(
+        "The payment failed at the bank and no money was taken. Please try again."
+      );
+      error.statusCode = 402;
+      error.code = "PAYMENT_FAILED";
+      throw error;
+    }
+
+    await delay(2500);
+    payment = await instance.payments.fetch(razorpayPaymentId);
   }
 
-  if (payment.status !== "captured" || payment.captured !== true) {
-    const error = new Error(
-      "Payment has not been captured. Please do not retry payment yet."
-    );
-    error.statusCode = 409;
-    throw error;
-  }
-
-  return payment;
+  const error = new Error(
+    "Your payment is still confirming. Please do not pay again — your order will be confirmed automatically in a couple of minutes."
+  );
+  error.statusCode = 409;
+  error.code = "PAYMENT_PENDING";
+  throw error;
 };
 
 const finaliseRazorpayPayment = async ({
   paymentSessionRecord,
   payment,
   razorpaySignature = "",
+  isRetry = false,
 }) => {
   if (
     paymentSessionRecord.status === "paid" &&
@@ -2780,6 +2863,28 @@ codAmount: currentPaymentSession.codAmount,
     }
 
     if (error.code !== "OUT_OF_STOCK_AFTER_PAYMENT") {
+      // The money IS captured at this point. Letting the request fail here is
+      // what made customers pay a second time (and left the first payment
+      // with no order). A transient DB/write conflict is usually gone on a
+      // second attempt, so retry once before giving up.
+      if (!isRetry) {
+        console.warn(
+          "Order creation failed after a captured payment — retrying once:",
+          error.message
+        );
+        await delay(800);
+        return finaliseRazorpayPayment({
+          paymentSessionRecord,
+          payment,
+          razorpaySignature,
+          isRetry: true,
+        });
+      }
+
+      console.error(
+        `Order creation failed twice for captured payment ${payment.id} (session ${paymentSessionRecord._id}):`,
+        error.message
+      );
       throw error;
     }
 
@@ -3693,8 +3798,32 @@ app.put("/api/auth/me", requireUser, async (req, res) => {
 });
 
 app.get("/api/auth/orders", requireUser, async (req, res) => {
-  const orders = await Order.find({ user: req.user.userId }).sort({ createdAt: -1 });
-  res.json({ success: true, count: orders.length, orders });
+  try {
+    const account = await User.findById(req.user.userId)
+      .select("email")
+      .lean();
+    const accountEmail = String(account?.email || "")
+      .trim()
+      .toLowerCase();
+
+    // Orders are normally linked by user id, but a payment completed while a
+    // session was stale could be saved without that link. Matching the
+    // delivery email as well means a paid order always shows up in the
+    // customer's own "My Orders" list instead of silently disappearing.
+    const matchAny = [{ user: req.user.userId }];
+    if (accountEmail) matchAny.push({ "customer.email": accountEmail });
+
+    const orders = await Order.find({ $or: matchAny }).sort({
+      createdAt: -1,
+    });
+
+    res.json({ success: true, count: orders.length, orders });
+  } catch (error) {
+    console.error("Customer orders could not be loaded:", error.message);
+    res
+      .status(500)
+      .json({ success: false, message: "Could not load your orders" });
+  }
 });
 
 // Pincode → city/state autofill (proxied server-side so the browser never
