@@ -292,8 +292,8 @@ async function sendOrderEmails(order) {
       (item) => `
         <tr>
           <td style="padding:10px 12px;border-bottom:1px solid #eee;font-size:13px;color:#333;">
-            <strong>${item.title}</strong><br/>
-            <span style="color:#999;font-size:12px;">${item.brand || ""} &bull; Qty: ${item.quantity}</span>
+            <strong>${xmlEscape(item.title)}</strong><br/>
+            <span style="color:#999;font-size:12px;">${xmlEscape(item.brand || "")} &bull; Qty: ${item.quantity}</span>
           </td>
           <td style="padding:10px 12px;border-bottom:1px solid #eee;font-size:13px;color:#333;text-align:right;white-space:nowrap;">${money(item.subtotal)}</td>
         </tr>`
@@ -321,7 +321,7 @@ async function sendOrderEmails(order) {
         <p style="color:#ffe4e9;margin:6px 0 0;font-size:13px;">Thank you for placing your order!</p>
       </div>
       <div style="padding:28px;">
-        <p style="font-size:14px;color:#333;">Hi ${address.name || "there"},</p>
+        <p style="font-size:14px;color:#333;">Hi ${xmlEscape(address.name || "there")},</p>
         <p style="font-size:14px;color:#555;line-height:1.6;">
           Your order has been received and is being processed. Here are your order details:
         </p>
@@ -338,7 +338,7 @@ async function sendOrderEmails(order) {
         <div style="background:#fafafa;border-radius:10px;padding:14px 18px;margin:20px 0;">
           <strong style="font-size:12px;color:#999;display:block;margin-bottom:6px;">DELIVER TO</strong>
           <p style="margin:0;font-size:13px;color:#333;line-height:1.6;">
-            ${address.name}<br/>${address.address || ""}<br/>${address.city || ""}, ${address.state || ""} ${address.pincode || ""}<br/>Phone: ${address.phone || ""}
+            ${xmlEscape(address.name || "")}<br/>${xmlEscape(address.address || "")}<br/>${xmlEscape(address.city || "")}, ${xmlEscape(address.state || "")} ${xmlEscape(address.pincode || "")}<br/>Phone: ${xmlEscape(address.phone || "")}
           </p>
         </div>
         <a href="${trackUrl}" style="display:block;text-align:center;background:#e21c48;color:#fff;text-decoration:none;padding:14px;border-radius:999px;font-size:14px;font-weight:700;">Track Your Order</a>
@@ -362,9 +362,9 @@ async function sendOrderEmails(order) {
           <span style="font-size:12px;color:#666;">${new Date(order.createdAt || Date.now()).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</span><br/>
           <span style="font-size:13px;color:#333;">${paymentLabel} &bull; Total ${money(order.totalAmount)}</span>
         </div>
-        <p style="font-size:13px;color:#555;margin:0 0 4px;"><strong>Customer:</strong> ${address.name} (${customerEmail || "no email"})</p>
-        <p style="font-size:13px;color:#555;margin:0 0 4px;"><strong>Phone:</strong> ${address.phone || "-"}</p>
-        <p style="font-size:13px;color:#555;margin:0 0 16px;"><strong>Address:</strong> ${address.address || ""}, ${address.city || ""}, ${address.state || ""} ${address.pincode || ""}</p>
+        <p style="font-size:13px;color:#555;margin:0 0 4px;"><strong>Customer:</strong> ${xmlEscape(address.name || "")} (${xmlEscape(customerEmail || "no email")})</p>
+        <p style="font-size:13px;color:#555;margin:0 0 4px;"><strong>Phone:</strong> ${xmlEscape(address.phone || "-")}</p>
+        <p style="font-size:13px;color:#555;margin:0 0 16px;"><strong>Address:</strong> ${xmlEscape(address.address || "")}, ${xmlEscape(address.city || "")}, ${xmlEscape(address.state || "")} ${xmlEscape(address.pincode || "")}</p>
         <table style="width:100%;border-collapse:collapse;">
           <thead><tr><th style="text-align:left;padding:8px 12px;background:#fafafa;font-size:12px;color:#999;text-transform:uppercase;">Item</th><th style="text-align:right;padding:8px 12px;background:#fafafa;font-size:12px;color:#999;text-transform:uppercase;">Amount</th></tr></thead>
           <tbody>${itemsHtml}${summaryHtml}</tbody>
@@ -2641,7 +2641,17 @@ const getCapturedRazorpayPayment = async ({
     }
 
     await delay(2500);
-    payment = await instance.payments.fetch(razorpayPaymentId);
+
+    try {
+      payment = await instance.payments.fetch(razorpayPaymentId);
+    } catch (fetchError) {
+      // One failed read (network blip, Razorpay 5xx) must not end the wait —
+      // the payment itself may still be capturing in the background.
+      console.warn(
+        "Razorpay payment read failed, retrying:",
+        fetchError?.error?.description || fetchError.message
+      );
+    }
   }
 
   const error = new Error(
@@ -6330,6 +6340,10 @@ app.post("/api/coupons/apply", async (req, res) => {
   try {
     const { code, subtotal, paymentMethod } = req.body;
     const normalizedCode = String(code || "").trim().toUpperCase();
+    // The checkout window sends this as a number, but a stale client can send
+    // a string (or nothing) — coerce it so the minimum-order check and the
+    // percentage maths below can't silently produce NaN.
+    const subtotalValue = Math.max(0, Number(subtotal) || 0);
 
     const coupon = await Coupon.findOne({
       code: normalizedCode,
@@ -6353,7 +6367,7 @@ app.post("/api/coupons/apply", async (req, res) => {
       });
     }
 
-    if (subtotal < coupon.minimumOrder) {
+    if (subtotalValue < coupon.minimumOrder) {
       return res.status(400).json({
         success: false,
         message: `Minimum order ₹${coupon.minimumOrder}`,
@@ -6381,8 +6395,11 @@ app.post("/api/coupons/apply", async (req, res) => {
     let discount = 0;
 
     if (coupon.discountType === "percentage") {
-      discount =
-        subtotal * coupon.discountValue / 100;
+      // Rounded exactly like resolveCouponForOrder does at order time — an
+      // unrounded value here showed "₹24.975 cashback" but credited ₹25.
+      discount = Math.round(
+        (subtotalValue * coupon.discountValue) / 100
+      );
 
       if (
         coupon.maximumDiscount &&
