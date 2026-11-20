@@ -6508,7 +6508,7 @@ app.post(
   }
 );
 
-app.post("/api/coupons/apply", async (req, res) => {
+app.post("/api/coupons/apply", optionalUser, async (req, res) => {
   try {
     const { code, subtotal, paymentMethod } = req.body;
     const normalizedCode = String(code || "").trim().toUpperCase();
@@ -6543,6 +6543,33 @@ app.post("/api/coupons/apply", async (req, res) => {
       return res.status(400).json({
         success: false,
         message: `Minimum order ₹${coupon.minimumOrder}`,
+      });
+    }
+
+    // Per-customer usage limit — enforced here so the customer finds out at
+    // the coupon box instead of after filling out the whole checkout form.
+    // A signed-in customer is identified by the token, never by the body.
+    let customerEmail = "";
+
+    if (req.user?.userId) {
+      const account = await User.findById(req.user.userId)
+        .select("email")
+        .lean();
+      customerEmail = String(account?.email || "")
+        .trim()
+        .toLowerCase();
+    }
+
+    if (
+      coupon.maxUses &&
+      customerEmail &&
+      couponUsageForEmail(coupon, customerEmail) >= coupon.maxUses
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: `You have already used this coupon the maximum ${
+          coupon.maxUses
+        } time${coupon.maxUses > 1 ? "s" : ""}`,
       });
     }
 
