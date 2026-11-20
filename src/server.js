@@ -1072,6 +1072,9 @@ reviews: {
     stock: { type: Number, default: 20, min: 0 },
     isFeatured: { type: Boolean, default: false },
     tryoutOnly: { type: Boolean, default: false },
+    // This product ships free: the store-wide delivery charge is waived for a
+    // cart made up only of free-delivery products.
+    freeDelivery: { type: Boolean, default: false },
     dealType: {
       type: String,
       enum: allowedDealTypes,
@@ -1180,6 +1183,7 @@ const orderSchema = new mongoose.Schema(
         quantity: { type: Number, required: true, min: 1 },
         subtotal: { type: Number, required: true, min: 0 },
         freeGift: { type: Boolean, default: false },
+        freeDelivery: { type: Boolean, default: false },
       },
     ],
     deliveryFee: { type: Number, default: 0, min: 0 },
@@ -1382,6 +1386,7 @@ const paymentSessionSchema = new mongoose.Schema(
         quantity: { type: Number, required: true, min: 1 },
         subtotal: { type: Number, required: true, min: 0 },
         freeGift: { type: Boolean, default: false },
+        freeDelivery: { type: Boolean, default: false },
       },
     ],
     deliveryFee: { type: Number, default: 0, min: 0 },
@@ -1781,9 +1786,23 @@ const getStoreSettings = async () => {
   };
 };
 
-// Delivery is charged on every order at the admin-set flat rate.
-const deliveryFeeFor = async () => {
+// Delivery is charged on every order at the admin-set flat rate — except for
+// products the admin marked "free delivery". With a mixed cart the fee is
+// still charged once (something has to be shipped), so it is waived only when
+// every paid item in the cart ships free. Free gifts never affect this.
+const deliveryFeeFor = async (items = []) => {
   const { deliveryFee } = await getStoreSettings();
+
+  const paidItems = Array.isArray(items)
+    ? items.filter((item) => !item.freeGift)
+    : [];
+
+  if (
+    paidItems.length > 0 &&
+    paidItems.every((item) => item.freeDelivery === true)
+  ) {
+    return 0;
+  }
 
   return roundMoney(deliveryFee);
 };
@@ -2047,6 +2066,7 @@ const productPayload = (body) => {
 
     isFeatured: Boolean(body.isFeatured),
     tryoutOnly: Boolean(body.tryoutOnly),
+    freeDelivery: Boolean(body.freeDelivery),
     marketplaceLinks: sanitizeMarketplaceLinks(body.marketplaceLinks),
     buyLink: String(body.buyLink || "").trim(),
     buyLinkLabel: String(body.buyLinkLabel || "").trim(),
@@ -2442,6 +2462,7 @@ const buildOnlinePaymentQuote = async ({
       price: product.price,
       quantity,
       subtotal: lineTotal,
+      freeDelivery: Boolean(product.freeDelivery),
     });
   }
 
@@ -2470,7 +2491,7 @@ const buildOnlinePaymentQuote = async ({
     });
   }
 
-  const deliveryFee = await deliveryFeeFor(subtotal);
+  const deliveryFee = await deliveryFeeFor(orderItems);
   // Coupons no longer discount the order upfront — the full price is always
   // charged, and `discountAmount` (computed above) is instead credited to
   // the buyer's wallet as cashback once the order is delivered (see the
@@ -6233,6 +6254,7 @@ app.post("/api/admin/orders", requireAdmin, async (req, res) => {
           price: product.price,
           quantity,
           subtotal: lineTotal,
+          freeDelivery: Boolean(product.freeDelivery),
         });
       }
 
@@ -6269,7 +6291,7 @@ app.post("/api/admin/orders", requireAdmin, async (req, res) => {
           cleanCustomer.email
         );
 
-      const deliveryFee = await deliveryFeeFor(subtotal);
+      const deliveryFee = await deliveryFeeFor(orderItems);
       // Full price always charged — discountAmount becomes cashback, credited
       // to the buyer's wallet once this order is marked delivered.
       const totalAmount = roundMoney(subtotal + deliveryFee);
@@ -6780,12 +6802,30 @@ app.put("/api/products/:id", requireAdmin, async (req, res) => {
     // toggled through the Tryouts tab or the dedicated endpoint). Editing must
     // PRESERVE the existing flag instead of silently resetting it to public.
     let existingTryoutOnly = Boolean(req.body?.tryoutOnly);
-    if (typeof req.body?.tryoutOnly !== "boolean") {
-      const existing = await Product.findById(req.params.id).select("tryoutOnly").lean();
-      existingTryoutOnly = Boolean(existing?.tryoutOnly);
+    let existingFreeDelivery = Boolean(req.body?.freeDelivery);
+
+    // The same protection applies to freeDelivery: the dropship editor and the
+    // tryout toggle send only their own fields, and must not wipe it.
+    if (
+      typeof req.body?.tryoutOnly !== "boolean" ||
+      typeof req.body?.freeDelivery !== "boolean"
+    ) {
+      const existing = await Product.findById(req.params.id)
+        .select("tryoutOnly freeDelivery")
+        .lean();
+
+      if (typeof req.body?.tryoutOnly !== "boolean") {
+        existingTryoutOnly = Boolean(existing?.tryoutOnly);
+      }
+
+      if (typeof req.body?.freeDelivery !== "boolean") {
+        existingFreeDelivery = Boolean(existing?.freeDelivery);
+      }
     }
+
     const payload = productPayload(req.body);
     payload.tryoutOnly = existingTryoutOnly;
+    payload.freeDelivery = existingFreeDelivery;
 
     const product = await Product.findByIdAndUpdate(
       req.params.id,
@@ -8296,6 +8336,7 @@ app.post("/api/orders", requireUser, async (req, res) => {
           price: product.price,
           quantity,
           subtotal: lineTotal,
+          freeDelivery: Boolean(product.freeDelivery),
         });
       }
 
@@ -8327,7 +8368,7 @@ app.post("/api/orders", requireUser, async (req, res) => {
       }
 
       const normalizedCity = cleanCustomer.city
-      const deliveryFee = await deliveryFeeFor(subtotal);
+      const deliveryFee = await deliveryFeeFor(orderItems);
 
       // This endpoint only ever creates Cash on Delivery orders — block it
       // outright once the cart hits the free-delivery threshold, same rule
