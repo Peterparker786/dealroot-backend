@@ -1475,23 +1475,8 @@ const userSchema = new mongoose.Schema(
       index: true,
     },
     passwordHash: { type: String, required: true, select: false },
-    resetOTP: {
-  type: String,
-  default: null,
-  resetOTP: {
-  type: String,
-  default: "",
-},
-
-otpExpiry: {
-  type: Date,
-},
-},
-
-otpExpiry: {
-  type: Date,
-  default: null,
-},
+    resetOTP: { type: String, default: "" },
+    otpExpiry: { type: Date, default: null },
     phone: { type: String, default: "", trim: true },
     address: { type: String, default: "", trim: true },
     state: { type: String, default: "Uttar Pradesh", trim: true },
@@ -1581,7 +1566,7 @@ const walletTransactionSchema = new mongoose.Schema(
     },
     type: {
       type: String,
-      enum: ["referral", "admin", "cashback"],
+      enum: ["referral", "admin", "cashback", "spend"],
       required: true,
     },
     status: {
@@ -2500,6 +2485,8 @@ if (useWallet && isCod) {
   );
 }
 
+const resolvedPaymentMethod = isCod ? "cod" : "razorpay";
+
 let payableNow = roundMoney(
   isCod ? deliveryFee : totalAmount
 );
@@ -2567,8 +2554,35 @@ const amountInPaise = Math.round(payableNow * 100);
     referralCodeUsed,
     referralOwnerUser,
     referralShareAmount,
+    paymentMethod: resolvedPaymentMethod,
     deliveryType: "courier",
   };
+};
+
+// Writes the approved negative ledger entry when wallet balance is spent on an
+// order. Kept under type "spend" so sales-stats never mistakes customer spend
+// for admin-recovered cashback.
+const recordWalletSpend = async ({ userId, order, amount, session }) => {
+  const spent = roundMoney(Number(amount) || 0);
+  if (!userId || !order?._id || spent <= 0) return;
+
+  await WalletTransaction.create(
+    [
+      {
+        user: userId,
+        type: "spend",
+        status: "approved",
+        amount: -spent,
+        order: order._id,
+        orderNumber: order.orderNumber || "",
+        orderAmount: order.totalAmount || 0,
+        buyerName: order.customer?.name || "",
+        note: "Applied at checkout",
+        approvedAt: new Date(),
+      },
+    ],
+    session ? { session } : {}
+  );
 };
 
 const signaturesMatch = (received, expected) => {
@@ -2814,6 +2828,13 @@ codAmount: currentPaymentSession.codAmount,
       currentPaymentSession.order = completedOrder._id;
       await currentPaymentSession.save({ session: databaseSession });
 
+      await recordWalletSpend({
+        userId: currentPaymentSession.user,
+        order: completedOrder,
+        amount: currentPaymentSession.walletUsed,
+        session: databaseSession,
+      });
+
       if (currentPaymentSession.user) {
         await User.findByIdAndUpdate(
           currentPaymentSession.user,
@@ -3044,6 +3065,13 @@ const createZeroPaymentOrder = async ({ quote, orderNumber, userId }) => {
           { session: databaseSession, runValidators: true }
         );
       }
+
+      await recordWalletSpend({
+        userId,
+        order: completedOrder,
+        amount: quote.walletUsed,
+        session: databaseSession,
+      });
 
       // Referral bonus stays pending for the admin to approve, exactly like
       // the Razorpay path.
@@ -3424,7 +3452,14 @@ app.post("/api/auth/login", customerAuthLimiter, async (req, res) => {
 });
 app.post("/api/auth/forgot-password", async (req, res) => {
   try {
-    const { email } = req.body;
+    const email = String(req.body?.email || "").trim().toLowerCase();
+
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        message: "Please enter your email address",
+      });
+    }
 
     const user = await User.findOne({ email });
 
@@ -3444,7 +3479,7 @@ app.post("/api/auth/forgot-password", async (req, res) => {
 
     await user.save();
 
-    await sendOTP(email, otp);
+    await sendOTP(user.email, otp);
 
     res.json({
       success: true,
@@ -3464,7 +3499,15 @@ app.post("/api/auth/forgot-password", async (req, res) => {
 
 app.post("/api/auth/verify-otp", async (req, res) => {
   try {
-    const { email, otp } = req.body;
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const otp = String(req.body?.otp || "").trim();
+
+    if (!email || !otp) {
+      return res.status(400).json({
+        success: false,
+        message: "Email and OTP are required",
+      });
+    }
 
     const user = await User.findOne({ email });
 
@@ -3475,7 +3518,7 @@ app.post("/api/auth/verify-otp", async (req, res) => {
       });
     }
 
-    if (user.resetOTP !== otp) {
+    if (!user.resetOTP || user.resetOTP !== otp) {
       return res.status(400).json({
         success: false,
         message: "Invalid OTP",
@@ -3506,7 +3549,23 @@ app.post("/api/auth/verify-otp", async (req, res) => {
 
 app.post("/api/auth/reset-password", async (req, res) => {
   try {
-    const { email, otp, password } = req.body;
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const otp = String(req.body?.otp || "").trim();
+    const password = typeof req.body?.password === "string" ? req.body.password : "";
+
+    if (!email || !otp) {
+      return res.status(400).json({
+        success: false,
+        message: "Email and OTP are required",
+      });
+    }
+
+    if (password.length < 8) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must be at least 8 characters long",
+      });
+    }
 
     const user = await User.findOne({
       email,
@@ -3520,6 +3579,7 @@ app.post("/api/auth/reset-password", async (req, res) => {
     }
 
     if (
+      !user.resetOTP ||
       user.resetOTP !== otp ||
       !user.otpExpiry ||
       user.otpExpiry < Date.now()
@@ -3813,7 +3873,7 @@ app.post("/api/auth/apply-referral", requireUser, async (req, res) => {
 
     res.json({
       success: true,
-      message: `Referral code ${owner.referralCode} applied! They'll now earn 50% cashback on every order you place, once delivered.`,
+      message: `Referral code ${owner.referralCode} applied! They'll now earn ${REFERRAL_SHARE_PERCENT}% cashback on every order you place, once delivered.`,
       user: publicUser(me),
     });
   } catch (err) {
@@ -6333,6 +6393,13 @@ app.post("/api/admin/orders", requireAdmin, async (req, res) => {
         { session }
       );
 
+      await recordWalletSpend({
+        userId: foundUser?._id,
+        order,
+        amount: walletUsed,
+        session,
+      });
+
       try {
         await incrementCouponUsage(normalizedCoupon, cleanCustomer.email, session);
       } catch (error) {
@@ -8441,10 +8508,15 @@ async function sendOrderStatusEmail(order, customNote = "") {
   const emoji = orderStatusEmojis[order.orderStatus] || "📦";
   const siteUrl = seoSiteUrl;
   const trackUrl = siteUrl + "/account";
-  const noteToShow = String(customNote || order.adminNote || "").trim();
-
   const isReturnOrUndelivered =
     order.orderStatus === "returned" || order.orderStatus === "not_delivered";
+  const noteToShow = String(
+    customNote ||
+      (isReturnOrUndelivered || order.orderStatus === "cancelled"
+        ? order.adminNote
+        : "") ||
+      ""
+  ).trim();
 
   const bannerColor =
     order.orderStatus === "not_delivered"
@@ -8631,6 +8703,8 @@ app.patch("/api/orders/:id/status", requireAdmin, async (req, res) => {
 
     if (trimmedNote) {
       updateDoc.adminNote = trimmedNote;
+    } else if (orderStatus !== "returned" && orderStatus !== "not_delivered") {
+      updateDoc.adminNote = "";
     }
 
     // Auto-restock logic:
@@ -8719,10 +8793,10 @@ app.post("/api/admin/orders/:id/cashback", requireAdmin, async (req, res) => {
         .json({ success: false, message: "Order not found" });
     }
 
-    if (order.orderStatus === "cancelled") {
+    if (["cancelled", "returned", "not_delivered"].includes(order.orderStatus)) {
       return res.status(400).json({
         success: false,
-        message: "Cancelled orders don't get cashback",
+        message: "Cancelled, returned, or undelivered orders don't get cashback",
       });
     }
 
