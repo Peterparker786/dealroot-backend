@@ -3985,22 +3985,37 @@ app.put("/api/auth/me", requireUser, async (req, res) => {
 app.get("/api/auth/orders", requireUser, async (req, res) => {
   try {
     const account = await User.findById(req.user.userId)
-      .select("email")
+      .select("email phone")
       .lean();
     const accountEmail = String(account?.email || "")
       .trim()
       .toLowerCase();
 
-    // Orders are normally linked by user id, but a payment completed while a
-    // session was stale could be saved without that link. Matching the
-    // delivery email as well means a paid order always shows up in the
-    // customer's own "My Orders" list instead of silently disappearing.
+    // Orders are normally linked by user id, but a checkout completed while a
+    // session was stale, or as a guest, can be saved without that link.
+    // Matching the delivery email as well means a paid order always shows up
+    // in the customer's own "My Orders" list instead of silently disappearing.
     const matchAny = [{ user: req.user.userId }];
-    if (accountEmail) matchAny.push({ "customer.email": accountEmail });
+    if (accountEmail) {
+      matchAny.push({ "customer.email": accountEmail });
+    }
 
-    const orders = await Order.find({ $or: matchAny }).sort({
-      createdAt: -1,
-    });
+    // The delivery phone is the second identifier: an order placed as a guest
+    // (or with a different contact email) still belongs to this account when
+    // the customer typed their own number at checkout.
+    const accountPhone = String(account?.phone || account?.addresses?.[0]?.phone || "")
+      .replace(/\D/g, "")
+      .slice(-10);
+
+    if (accountPhone.length === 10) {
+      matchAny.push({ "customer.phone": { $regex: `${accountPhone}$` } });
+    }
+
+    // Case-insensitive comparison, because older orders can predate the
+    // lowercase rule on customer.email.
+    const orders = await Order.find({ $or: matchAny })
+      .collation({ locale: "en", strength: 2 })
+      .sort({ createdAt: -1 });
 
     res.json({ success: true, count: orders.length, orders });
   } catch (error) {
@@ -4070,7 +4085,9 @@ app.post("/api/orders/track", async (req, res) => {
     if (email) {
       const emailMatches = await Order.find({
         "customer.email": email,
-      }).sort({ createdAt: -1 });
+      })
+        .collation({ locale: "en", strength: 2 })
+        .sort({ createdAt: -1 });
 
       for (const order of emailMatches) {
         if (!orders.some((o) => String(o._id) === String(order._id))) {
