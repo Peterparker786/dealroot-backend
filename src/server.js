@@ -13,7 +13,6 @@ const mongoose = require("mongoose");
 const Razorpay = require("razorpay");
 const multer = require("multer");
 const { v2: cloudinary } = require("cloudinary");
-const { syncPurchaseFormToGoogle } = require("./google-sync");
 const {
   DROPSHIP_PLATFORMS,
   fetchImageBuffer,
@@ -793,23 +792,6 @@ const upload = multer({
 });
 const PORT = process.env.PORT || 5000;
 
-// Tryout refund-form uploads: 1 delivery screenshot + up to 5 review files.
-const refundUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 10 * 1024 * 1024, // 10MB per file
-    files: 6,
-  },
-});
-
-// Tryout purchase-form screenshots can be large phone captures.
-const purchaseUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 15 * 1024 * 1024, // 15MB
-  },
-});
-
 // Returns uploads allow larger videos (photos + one video).
 const returnUpload = multer({
   storage: multer.memoryStorage(),
@@ -1071,7 +1053,6 @@ reviews: {
     badge: { type: String, default: "" },
     stock: { type: Number, default: 20, min: 0 },
     isFeatured: { type: Boolean, default: false },
-    tryoutOnly: { type: Boolean, default: false },
     // This product ships free: the store-wide delivery charge is waived for a
     // cart made up only of free-delivery products.
     freeDelivery: { type: Boolean, default: false },
@@ -1090,7 +1071,7 @@ reviews: {
     buyLink: { type: String, trim: true, default: "" },
     buyLinkLabel: { type: String, trim: true, default: "Buy Now" },
     buyLinkTerms: { type: String, trim: true, default: "" },
-    // Offer TNC / T&C shown on the Tryout product card. Without this field
+    // Offer TNC / T&C shown on the product card. Without this field
     // Mongoose strict mode silently dropped it on save.
     tnc: { type: String, trim: true, default: "" },
     specifications: [
@@ -1324,8 +1305,6 @@ referralOwnerCredited: { type: Boolean, default: false },
     returnReason: { type: String, default: "", trim: true },
     stockRestored: { type: Boolean, default: false },
     cancelledAt: { type: Date, default: null },
-    // True when the order contains at least one Tryout-exclusive product.
-    tryoutOrder: { type: Boolean, default: false },
     // Admin-pasted tracking URL so customers can track their shipment.
     trackingLink: { type: String, default: "", trim: true },
     // Auto-refund tracking fields (populated when Razorpay refund is initiated).
@@ -1475,7 +1454,6 @@ amountInPaise: { type: Number, required: true, min: 1 },
       default: "",
       trim: true,
     },
-    tryoutOrder: { type: Boolean, default: false },
     expiresAt: {
       type: Date,
       required: true,
@@ -2065,7 +2043,6 @@ const productPayload = (body) => {
       : [],
 
     isFeatured: Boolean(body.isFeatured),
-    tryoutOnly: Boolean(body.tryoutOnly),
     freeDelivery: Boolean(body.freeDelivery),
     marketplaceLinks: sanitizeMarketplaceLinks(body.marketplaceLinks),
     buyLink: String(body.buyLink || "").trim(),
@@ -2416,7 +2393,6 @@ const buildOnlinePaymentQuote = async ({
   const orderItems = [];
   let subtotal = 0;
   let nonDropshipSubtotal = 0; // wallet can only cover this portion
-  let hasTryoutItem = false;
 
   for (const [productId, quantity] of requestedProducts.entries()) {
     const product = await Product.findById(productId);
@@ -2425,23 +2401,6 @@ const buildOnlinePaymentQuote = async ({
       throw new Error(
         "A product is unavailable or does not have enough stock"
       );
-    }
-
-    if (product.tryoutOnly) {
-      hasTryoutItem = true;
-
-      const tryoutMember = userId
-        ? await TryoutApplication.findOne({
-            user: userId,
-            status: "approved",
-          })
-        : null;
-
-      if (!tryoutMember) {
-        throw new Error(
-          "This product is exclusive to approved Tryout members. Kindly apply for the Tryout program first."
-        );
-      }
     }
 
     const lineTotal = roundMoney(product.price * quantity);
@@ -2609,7 +2568,6 @@ const amountInPaise = Math.round(payableNow * 100);
     referralOwnerUser,
     referralShareAmount,
     deliveryType: "courier",
-    tryoutOrder: hasTryoutItem,
   };
 };
 
@@ -2809,7 +2767,6 @@ const finaliseRazorpayPayment = async ({
             totalAmount: currentPaymentSession.totalAmount,
             deliveryType: currentPaymentSession.deliveryType,
             paymentMethod: currentPaymentSession.paymentMethod,
-            tryoutOrder: currentPaymentSession.tryoutOrder || false,
 
 paymentStatus:
   currentPaymentSession.paymentMethod === "cod"
@@ -3054,7 +3011,6 @@ const createZeroPaymentOrder = async ({ quote, orderNumber, userId }) => {
             totalAmount: quote.totalAmount,
             deliveryType: quote.deliveryType,
             paymentMethod: quote.paymentMethod,
-            tryoutOrder: quote.tryoutOrder || false,
             // Nothing was collected online on this path.
             paymentStatus: isCodOrder ? "pending" : "paid",
             deliveryChargePaid: !isCodOrder,
@@ -4222,8 +4178,6 @@ app.get("/api/products", async (req, res) => {
       }));
     }
 
-    // Tryout-exclusive products never appear in the public catalogue.
-    // They are visible only to approved Tryout members and admins.
     let viewer = null;
     const bearer = readBearerToken(req);
     if (bearer) {
@@ -4234,31 +4188,8 @@ app.get("/api/products", async (req, res) => {
       }
     }
 
-    // Tryout-exclusive products belong to the Tryout area only. The admin
-    // panel asks for them explicitly with `includeTryout=1`; the storefront
-    // never gets them just because the visitor happens to be signed in as an
-    // admin, and an approved member only sees them from the Tryout pages.
-    const includeTryout =
-      String(req.query.includeTryout || "") === "1" &&
-      viewer?.role === "admin";
-
-    let canSeeTryout = false;
-    if (!includeTryout && viewer?.role === "user" && viewer.userId) {
-      const member = await TryoutApplication.findOne({
-        user: viewer.userId,
-        status: "approved",
-      })
-        .select("_id")
-        .lean();
-      canSeeTryout = Boolean(member);
-    }
-
-    if (!includeTryout && !canSeeTryout) {
-      filter.tryoutOnly = { $ne: true };
-    }
-
     const products = await Product.find(filter)
-      .select("brand title price mrp rating reviews images badge stock dealType tryoutOnly freeDelivery category createdAt marketplaceLinks buyLink buyLinkLabel buyLinkTerms tnc")
+      .select("brand title price mrp rating reviews images badge stock dealType freeDelivery category createdAt marketplaceLinks buyLink buyLinkLabel buyLinkTerms tnc")
       .sort({ createdAt: -1 })
       .lean();
 
@@ -4278,24 +4209,16 @@ app.get("/api/products", async (req, res) => {
       isDropship: dropshipProductIdSet.has(String(p._id)),
     }));
 
-    // Member/admin responses must never be cached publicly by the CDN,
-    // otherwise a guest could be served a member's tryout products.
-    // Admins additionally get "no-store": the admin panel edits stock/
-    // products and re-fetches this same list right after saving, and a
-    // 60s browser cache was making those edits look like they hadn't
-    // saved (the list kept showing the old number until the cache expired).
+    // Admin responses must never be cached: the admin panel edits stock and
+    // products and re-fetches this same list right after saving, and a 60s
+    // browser cache was making those edits look like they hadn't saved.
     let cacheControl = "public, max-age=120, stale-while-revalidate=600";
-    if (viewer?.role === "admin" || includeTryout) {
+    if (viewer?.role === "admin") {
       cacheControl = "no-store";
-    } else if (canSeeTryout) {
-      // Members must never get a cached response: a browser that had cached
-      // the public (guest) list would otherwise keep serving it after login,
-      // hiding every Tryout-exclusive product.
-      cacheControl = "private, no-store";
     }
     res.set("Cache-Control", cacheControl);
     // Authorization must be part of the cache key — otherwise a guest's cached
-    // public list is reused for a signed-in member and Tryout products vanish.
+    // public list could be reused for a signed-in customer.
     res.set("Vary", "Accept-Encoding, Authorization");
 
     res.json({
@@ -4320,39 +4243,6 @@ app.get("/api/products/:id", async (req, res) => {
         success: false,
         message: "Product not found",
       });
-    }
-
-    // Tryout-exclusive products live only inside the Tryout area: outside of it
-    // they are not viewable, not even by an admin — the admin panel manages
-    // them through its own screens.
-    if (product.tryoutOnly) {
-      let viewer = null;
-      const bearer = readBearerToken(req);
-      if (bearer) {
-        try {
-          viewer = jwt.verify(bearer, jwtSecret);
-        } catch {
-          viewer = null;
-        }
-      }
-
-      let allowed = false;
-      if (viewer?.role === "user" && viewer.userId) {
-        const member = await TryoutApplication.findOne({
-          user: viewer.userId,
-          status: "approved",
-        })
-          .select("_id")
-          .lean();
-        allowed = Boolean(member);
-      }
-
-      if (!allowed) {
-        return res.status(404).json({
-          success: false,
-          message: "Product not found",
-        });
-      }
     }
 
     // Annotate with isDropship so the product detail page can show the
@@ -6852,33 +6742,20 @@ app.put("/api/products/:id", requireAdmin, async (req, res) => {
       });
     }
 
-    // The regular product-edit form does not send the tryoutOnly field (it is
-    // toggled through the Tryouts tab or the dedicated endpoint). Editing must
-    // PRESERVE the existing flag instead of silently resetting it to public.
-    let existingTryoutOnly = Boolean(req.body?.tryoutOnly);
+    // The regular product-edit form does not always send freeDelivery (the
+    // dropship editor sends only its own fields), so editing must PRESERVE the
+    // existing flag instead of silently resetting it.
     let existingFreeDelivery = Boolean(req.body?.freeDelivery);
 
-    // The same protection applies to freeDelivery: the dropship editor and the
-    // tryout toggle send only their own fields, and must not wipe it.
-    if (
-      typeof req.body?.tryoutOnly !== "boolean" ||
-      typeof req.body?.freeDelivery !== "boolean"
-    ) {
+    if (typeof req.body?.freeDelivery !== "boolean") {
       const existing = await Product.findById(req.params.id)
-        .select("tryoutOnly freeDelivery")
+        .select("freeDelivery")
         .lean();
 
-      if (typeof req.body?.tryoutOnly !== "boolean") {
-        existingTryoutOnly = Boolean(existing?.tryoutOnly);
-      }
-
-      if (typeof req.body?.freeDelivery !== "boolean") {
-        existingFreeDelivery = Boolean(existing?.freeDelivery);
-      }
+      existingFreeDelivery = Boolean(existing?.freeDelivery);
     }
 
     const payload = productPayload(req.body);
-    payload.tryoutOnly = existingTryoutOnly;
     payload.freeDelivery = existingFreeDelivery;
 
     const product = await Product.findByIdAndUpdate(
@@ -6941,31 +6818,6 @@ app.patch("/api/products/:id/stock", requireAdmin, async (req, res) => {
       success: false,
       message: "Could not update stock",
     });
-  }
-});
-
-// Admin: toggle a product in the Dealroot Tryouts program.
-app.patch("/api/products/:id/tryout", requireAdmin, async (req, res) => {
-  try {
-    const product = await Product.findByIdAndUpdate(
-      req.params.id,
-      { tryoutOnly: Boolean(req.body?.tryoutOnly) },
-      { new: true, runValidators: true }
-    );
-
-    if (!product) {
-      return res.status(404).json({ success: false, message: "Product not found" });
-    }
-
-    res.json({
-      success: true,
-      message: product.tryoutOnly
-        ? "Product added to Dealroot Tryouts" 
-        : "Product removed from Dealroot Tryouts",
-      product,
-    });
-  } catch {
-    res.status(400).json({ success: false, message: "Could not update tryout status" });
   }
 });
 
@@ -8064,7 +7916,6 @@ referralShareAmount: quote.referralShareAmount,
 paymentMethod: req.body.paymentMethod || "razorpay",
         amountInPaise: quote.amountInPaise,
         deliveryType: quote.deliveryType,
-        tryoutOrder: quote.tryoutOrder || false,
         razorpayOrderId: razorpayOrder.id,
         expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
       });
@@ -8338,7 +8189,6 @@ app.post("/api/orders", requireUser, async (req, res) => {
     await session.withTransaction(async () => {
       const orderItems = [];
       let subtotal = 0;
-      let hasTryoutItem = false;
 
       for (const item of items) {
         const productId = item?.productId;
@@ -8365,20 +8215,6 @@ app.post("/api/orders", requireUser, async (req, res) => {
           throw new Error(
             "A product is unavailable or does not have enough stock"
           );
-        }
-
-        if (product.tryoutOnly) {
-          hasTryoutItem = true;
-
-          const tryoutMember = await TryoutApplication.findOne({
-            user: req.user.userId,
-            status: "approved",
-          });
-          if (!tryoutMember) {
-            throw new Error(
-              "This product is exclusive to approved Tryout members. Kindly apply for the Tryout program first."
-            );
-          }
         }
 
         const lineTotal = product.price * quantity;
@@ -8493,7 +8329,6 @@ app.post("/api/orders", requireUser, async (req, res) => {
             totalAmount: subtotal + deliveryFee,
             deliveryType: "courier",
             paymentMethod: "cod",
-            tryoutOrder: hasTryoutItem,
           },
         ],
         { session }
@@ -9478,11 +9313,9 @@ async function sendNewProductEmails({ windowHours } = {}) {
   const hours = windowHours || newArrivalWindowHours;
   const since = new Date(Date.now() - hours * 60 * 60 * 1000);
 
-  // Find products created in the last 24 hours. Tryout-exclusive products
-  // stay out of the newsletter — only approved members can see them.
+  // Find products created in the last 24 hours.
   const newProducts = await Product.find({
     createdAt: { $gte: since },
-    tryoutOnly: { $ne: true },
   })
     .sort({ createdAt: -1 })
     .lean();
@@ -10330,1377 +10163,6 @@ app.post("/api/returns/:id/reject", requireAdmin, async (req, res) => {
     res.status(500).json({ success: false, message: "Could not reject return" });
   }
 });
-
-// ===================== DEALROOT TRYOUTS =====================
-const tryoutApplicationSchema = new mongoose.Schema(
-  {
-    user: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "User",
-      required: true,
-      index: true,
-    },
-    name: { type: String, required: true, trim: true },
-    email: { type: String, trim: true },
-    phone: { type: String, trim: true },
-    city: { type: String, trim: true },
-    state: { type: String, trim: true },
-    pincode: { type: String, trim: true },
-    previousProgram: { type: String, trim: true },
-    otherProgram: { type: String, trim: true },
-    reason: { type: String, default: "" },
-    status: {
-      type: String,
-      enum: ["pending", "approved", "rejected", "disqualified"],
-      default: "pending",
-      index: true,
-    },
-    requestedAt: { type: Date, default: Date.now },
-    processedAt: { type: Date, default: null },
-    cashbackAvailable: { type: Number, default: 0, min: 0 },
-    cashbackPending: { type: Number, default: 0, min: 0 },
-    cashbackReceived: { type: Number, default: 0, min: 0 },
-    cashbackHistory: [
-      {
-        amount: { type: Number, required: true, min: 0 },
-        productName: { type: String, default: "" },
-        trackId: { type: String, default: "" },
-        note: { type: String, default: "" },
-        status: {
-          type: String,
-          enum: ["available", "pending", "received"],
-          default: "available",
-        },
-        createdAt: { type: Date, default: Date.now },
-      },
-    ],
-    // Purchase-form submissions (member buys a Tryout product, then submits
-    // proof so the team can verify and add the order to their dashboard).
-    purchaseForms: [
-      {
-        phoneAtStore: { type: String, trim: true, default: "" },
-        profileName: { type: String, trim: true, default: "" },
-        orderId: { type: String, trim: true, default: "" },
-        orderAmount: { type: Number, default: 0, min: 0 },
-        productName: { type: String, trim: true, default: "" },
-        orderDate: { type: String, trim: true, default: "" },
-        screenshotUrl: { type: String, trim: true, default: "" },
-        driveUrl: { type: String, trim: true, default: "" },
-        driveFileId: { type: String, trim: true, default: "" },
-        driveImageUrl: { type: String, trim: true, default: "" },
-        otherInfo: { type: String, trim: true, default: "" },
-        status: {
-          type: String,
-          enum: ["submitted", "verified", "rejected"],
-          default: "submitted",
-        },
-        // Set when the admin rejects the submission — shown to the member on
-        // their dashboard and included in the rejection email.
-        rejectionReason: { type: String, trim: true, default: "" },
-        reviewedAt: { type: Date, default: null },
-        submittedAt: { type: Date, default: Date.now },
-      },
-    ],
-    // Refund-form submissions (delivery + review proof after receiving the
-    // Tryout product — order id, order amount, delivery screenshot, review
-    // files, notes).
-    refundForms: [
-      {
-        orderId: { type: String, trim: true, default: "" },
-        orderAmount: { type: Number, default: 0, min: 0 },
-        deliveryScreenshotUrl: { type: String, trim: true, default: "" },
-        reviewFiles: [{ type: String, trim: true }],
-        otherInfo: { type: String, trim: true, default: "" },
-        status: {
-          type: String,
-          enum: ["submitted", "verified", "rejected"],
-          default: "submitted",
-        },
-        submittedAt: { type: Date, default: Date.now },
-      },
-    ],
-    // Cashback withdrawal requests (member asks to be paid out to their UPI).
-    withdrawals: [
-      {
-        // Human-friendly reference shown in the member dashboard history.
-        referenceId: { type: String, trim: true, default: "" },
-        amount: { type: Number, required: true, min: 1 },
-        upiId: { type: String, trim: true, default: "" },
-        status: {
-          type: String,
-          enum: ["requested", "paid", "rejected"],
-          default: "requested",
-        },
-        requestedAt: { type: Date, default: Date.now },
-        processedAt: { type: Date, default: null },
-      },
-    ],
-  },
-  { timestamps: true }
-);
-
-const TryoutApplication = mongoose.model(
-  "TryoutApplication",
-  tryoutApplicationSchema
-);
-
-// Customer: apply for the Tryout program (one active application at a time).
-app.post("/api/tryouts/apply", requireUser, async (req, res) => {
-  try {
-    const name = String(req.body?.name || "").trim();
-    const phone = String(req.body?.phone || "").replace(/\D/g, "").slice(0, 10);
-    const city = String(req.body?.city || "").trim();
-    const state = String(req.body?.state || "").trim();
-    const pincode = String(req.body?.pincode || "").replace(/\D/g, "").slice(0, 6);
-    const previousProgram = String(req.body?.previousProgram || "").trim();
-    const otherProgram = String(req.body?.otherProgram || "").trim();
-    const reason = String(req.body?.reason || "").trim();
-
-    if (name.length < 2) {
-      return res.status(400).json({ success: false, message: "Please enter your full name" });
-    }
-    if (phone.length !== 10) {
-      return res.status(400).json({ success: false, message: "Please enter a valid 10-digit mobile number" });
-    }
-    if (pincode.length !== 6) {
-      return res.status(400).json({ success: false, message: "Please enter a valid 6-digit pincode" });
-    }
-    if (previousProgram === "Other" && !otherProgram) {
-      return res.status(400).json({ success: false, message: "Please tell us the name of the other program" });
-    }
-    const TRYOUT_PROGRAMS = ["Freekamaal", "Trybox", "OPA", "Other"];
-    if (previousProgram && !TRYOUT_PROGRAMS.includes(previousProgram)) {
-      return res.status(400).json({ success: false, message: "Please select a valid option for the previous program" });
-    }
-    if (previousProgram === "Freekamaal" || previousProgram === "Trybox") {
-      return res.status(403).json({ success: false, message: "Sorry, you are not eligible. This program is for new users or first-time users only." });
-    }
-
-    const existing = await TryoutApplication.findOne({
-      user: req.user.userId,
-      status: { $in: ["pending", "approved"] },
-    });
-
-    if (existing) {
-      return res.status(400).json({
-        success: false,
-        message:
-          existing.status === "approved"
-            ? "You are already an approved Tryout member"
-            : "Your Tryout application is already under review",
-      });
-    }
-
-    // Allow re-applying after a rejection or disqualification.
-    if (req.body?.replaceRejected) {
-      await TryoutApplication.deleteMany({
-        user: req.user.userId,
-        status: { $in: ["rejected", "disqualified"] },
-      });
-    }
-
-    const user = await User.findById(req.user.userId).select("email");
-
-    const application = await TryoutApplication.create({
-      user: req.user.userId,
-      name,
-      email: user?.email || "",
-      phone,
-      city,
-      state,
-      pincode,
-      previousProgram,
-      otherProgram,
-      reason,
-    });
-
-    // Notify the owner about the new application with the full form details.
-    if (process.env.ADMIN_EMAIL) {
-      if (process.env.ORDER_STATUS_EMAIL_DRY_RUN === "true") {
-        console.log("[dry-run] Tryout owner email → " + name);
-      } else {
-      const prevLabel =
-        previousProgram === "Other"
-          ? "Other (" + (otherProgram || "-") + ")"
-          : previousProgram || "-";
-      transporter
-        .sendMail({
-          from: '"DEALROOT Beauty" <' + process.env.EMAIL_USER + ">",
-          to: process.env.ADMIN_EMAIL,
-          subject: "📝 New Tryout application — " + name,
-          html:
-            '<div style="font-family:Arial;padding:30px;max-width:620px;margin:auto">' +
-            '<h2 style="color:#1f2a4d;margin:0 0 6px">New Dealroot Tryouts Application</h2>' +
-            '<p style="color:#6b7280;margin:0 0 18px">A customer just applied for the Tryout program. Details below:</p>' +
-            '<table style="width:100%;border-collapse:collapse;font-size:14px;line-height:1.6">' +
-            '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold;width:160px">Name</td><td style="padding:8px 10px">' + xmlEscape(name) + "</td></tr>" +
-            '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Email</td><td style="padding:8px 10px">' + xmlEscape(user?.email || "-") + "</td></tr>" +
-            '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Phone</td><td style="padding:8px 10px">' + xmlEscape(phone || "-") + "</td></tr>" +
-            '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">City</td><td style="padding:8px 10px">' + xmlEscape(city || "-") + "</td></tr>" +
-            '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">State</td><td style="padding:8px 10px">' + xmlEscape(state || "-") + "</td></tr>" +
-            '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Pincode</td><td style="padding:8px 10px">' + xmlEscape(pincode || "-") + "</td></tr>" +
-            '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Tried before</td><td style="padding:8px 10px">' + xmlEscape(prevLabel) + "</td></tr>" +
-            '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Reason</td><td style="padding:8px 10px">' + xmlEscape(reason || "-") + "</td></tr>" +
-            "</table>" +
-            '<p style="margin-top:18px;color:#6b7280;font-size:13px">Review this application from the DealRoot admin panel → Tryouts tab (approve / reject / disqualify).</p>' +
-            "</div>",
-        })
-        .catch((err) => console.error("Tryout owner email failed:", err.message));
-      }
-    }
-
-    res.json({
-      success: true,
-      message: "Application submitted — we will review it soon",
-      application,
-    });
-  } catch (error) {
-    console.error("Tryout apply failed:", error.message);
-    res.status(500).json({ success: false, message: "Could not submit your application" });
-  }
-});
-
-// Customer: submit the purchase form after buying a Tryout product.
-// Stores the proof (incl. screenshot) and emails the member a confirmation
-// + notifies the owner so they can verify and credit the order.
-app.post(
-  "/api/tryouts/purchase-form",
-  requireUser,
-  (req, res, next) => {
-    purchaseUpload.single("screenshot")(req, res, (err) => {
-      if (err) {
-        return res.status(400).json({
-          success: false,
-          message:
-            err.code === "LIMIT_FILE_SIZE"
-              ? "The screenshot is too large (max 15MB). Please compress it and try again."
-              : "Could not read the uploaded screenshot. Please try again.",
-        });
-      }
-      next();
-    });
-  },
-  async (req, res) => {
-    try {
-      const application = await TryoutApplication.findOne({
-        user: req.user.userId,
-        status: "approved",
-      });
-
-      if (!application) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Only approved Tryout members can submit the purchase form",
-        });
-      }
-
-      const phoneAtStore = String(req.body?.phoneAtStore || "")
-        .replace(/\D/g, "")
-        .slice(0, 10);
-      const profileName = String(req.body?.profileName || "").trim();
-      const orderId = String(req.body?.orderId || "").trim();
-      const orderAmount = Math.floor(Number(req.body?.orderAmount) || 0);
-      const productName = String(req.body?.productName || "").trim();
-      const orderDate = String(req.body?.orderDate || "").trim();
-      const otherInfo = String(req.body?.otherInfo || "").trim();
-
-      if (phoneAtStore.length !== 10) {
-        return res.status(400).json({
-          success: false,
-          message: "Please enter a valid 10-digit mobile number used at the store",
-        });
-      }
-      if (!profileName) {
-        return res.status(400).json({
-          success: false,
-          message: "Please enter your profile name on the marketplace",
-        });
-      }
-      if (!orderId) {
-        return res.status(400).json({
-          success: false,
-          message: "Please enter the order id",
-        });
-      }
-      if (orderAmount <= 0) {
-        return res.status(400).json({
-          success: false,
-          message: "Please enter the order amount",
-        });
-      }
-      if (!req.file) {
-        return res.status(400).json({
-          success: false,
-          message: "Please attach the order screenshot",
-        });
-      }
-
-      let screenshotUrl = "";
-
-      try {
-        screenshotUrl = await uploadBufferToCloudinary(req.file.buffer);
-      } catch {
-        // Proof could not be stored — do not accept the submission silently.
-        return res.status(500).json({
-          success: false,
-          message:
-            "Your screenshot could not be saved. Please try again in a moment.",
-        });
-      }
-
-      const entry = {
-        phoneAtStore,
-        profileName,
-        orderId,
-        orderAmount,
-        productName,
-        orderDate,
-        screenshotUrl,
-        driveUrl: "",
-        driveFileId: "",
-        driveImageUrl: "",
-        otherInfo,
-        status: "submitted",
-        submittedAt: new Date(),
-      };
-
-      // Push to Google Sheet + upload screenshot to Google Drive.
-      // Best-effort — never blocks the submission if sync fails.
-      const entryId = entry._id;
-      const fileMimetype = String(req.file.mimetype || "image/png");
-      const fileExt =
-        fileMimetype === "image/jpeg" || fileMimetype === "image/jpg"
-          ? "jpg"
-          : fileMimetype === "image/webp"
-          ? "webp"
-          : fileMimetype === "image/heic" || fileMimetype === "image/heif"
-          ? "heic"
-          : "png";
-
-      syncPurchaseFormToGoogle({
-        profileName,
-        orderId,
-        orderAmount,
-        productName,
-        phoneAtStore,
-        orderDate,
-        buffer: req.file.buffer,
-        mimetype: fileMimetype,
-        filename:
-          "purchase-" +
-          (profileName || "member").replace(/[^a-z0-9]+/gi, "-") +
-          "-" +
-          Date.now() +
-          "." +
-          fileExt,
-      })
-        .then((syncResult) => {
-          if (syncResult && (syncResult.driveUrl || syncResult.driveFileId)) {
-            // Persist only the drive fields on this entry — never re-save
-            // the whole document (avoids clobbering concurrent edits).
-            return TryoutApplication.updateOne(
-              {
-                _id: application._id,
-                "purchaseForms._id": entryId,
-              },
-              {
-                $set: {
-                  "purchaseForms.$.driveUrl": syncResult.driveUrl || "",
-                  "purchaseForms.$.driveFileId":
-                    syncResult.driveFileId || "",
-                  "purchaseForms.$.driveImageUrl":
-                    syncResult.driveImageUrl || "",
-                },
-              }
-            ).catch(() => {});
-          }
-          return undefined;
-        })
-        .catch((error) =>
-          console.error("Google sync failed:", error && error.message)
-        );
-
-      application.purchaseForms.push(entry);
-      await application.save();
-
-      const memberEmail = String(application.email || "").trim();
-
-      // Confirmation email to the member.
-      if (memberEmail && process.env.EMAIL_USER) {
-        if (process.env.ORDER_STATUS_EMAIL_DRY_RUN === "true") {
-          console.log("[dry-run] Purchase form confirmation email → " + memberEmail);
-        } else {
-          transporter
-            .sendMail({
-              from: '"DEALROOT Beauty" <' + process.env.EMAIL_USER + ">",
-              to: memberEmail,
-              subject: "✅ Cashback form submitted — Dealroot Tryouts",
-              html:
-                '<div style="font-family:Arial;padding:30px;max-width:620px;margin:auto">' +
-                '<h2 style="color:#1f2a4d;margin:0 0 6px">Your cashback form has been filled ✅</h2>' +
-                '<p style="color:#374151;line-height:1.7;margin:0 0 16px">Hi ' +
-                xmlEscape(application.name || "there") +
-                ',<br/>Thank you for submitting your purchase details. <b>Please do not cancel the order</b> — keep it active so we can verify it.' +
-                "</p>" +
-                '<div style="background:#f4f1ff;border:1px solid #e4defc;border-radius:12px;padding:16px 18px;font-size:14px;line-height:1.8">' +
-                '<b>What happens next:</b><br/>Our team will verify your order and <b>add it to your Tryout dashboard</b> shortly. Wait for the verification email before placing any more purchase-form submissions for the same order.' +
-                "</div>" +
-                '<p style="margin-top:18px;color:#6b7280;font-size:13px">You can track your submissions in your Tryout dashboard → Form Response History.</p>' +
-                "</div>",
-            })
-            .catch((err) =>
-              console.error("Purchase form member email failed:", err.message)
-            );
-        }
-      }
-
-      // Notify the owner with full details + screenshot.
-      if (process.env.ADMIN_EMAIL && process.env.EMAIL_USER) {
-        if (process.env.ORDER_STATUS_EMAIL_DRY_RUN === "true") {
-          console.log("[dry-run] Purchase form owner email → " + process.env.ADMIN_EMAIL);
-        } else {
-          transporter
-            .sendMail({
-              from: '"DEALROOT Beauty" <' + process.env.EMAIL_USER + ">",
-              to: process.env.ADMIN_EMAIL,
-              subject:
-                "🛍️ Tryout Purchase Form — " +
-                String(application.name || "Member"),
-              html:
-                '<div style="font-family:Arial;padding:30px;max-width:620px;margin:auto">' +
-                '<h2 style="color:#1f2a4d;margin:0 0 6px">New Tryout purchase form 🛍️</h2>' +
-                '<p style="color:#6b7280;margin:0 0 18px">A Tryout member submitted their purchase proof.</p>' +
-                '<table style="width:100%;border-collapse:collapse;font-size:14px;line-height:1.6">' +
-                '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold;width:180px">Member</td><td style="padding:8px 10px">' +
-                xmlEscape(application.name || "-") +
-                "</td></tr>" +
-                '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Email</td><td style="padding:8px 10px">' +
-                xmlEscape(memberEmail || "-") +
-                "</td></tr>" +
-                '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Phone at store</td><td style="padding:8px 10px">' +
-                xmlEscape(phoneAtStore || "-") +
-                "</td></tr>" +
-                '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Profile name</td><td style="padding:8px 10px">' +
-                xmlEscape(profileName || "-") +
-                "</td></tr>" +
-                '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Other info</td><td style="padding:8px 10px">' +
-                xmlEscape(otherInfo || "-") +
-                "</td></tr>" +
-                (screenshotUrl
-                  ? '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Screenshot</td><td style="padding:8px 10px"><a href="' +
-                    xmlEscape(screenshotUrl) +
-                    '" style="color:#246bfd">View order screenshot</a></td></tr>'
-                  : "") +
-                "</table>" +
-                '<p style="margin-top:18px;color:#6b7280;font-size:13px">Verify this order and add the cashback from the admin panel → Tryouts tab.</p>' +
-                "</div>",
-            })
-            .catch((err) =>
-              console.error("Purchase form owner email failed:", err.message)
-            );
-        }
-      }
-
-      res.status(201).json({
-        success: true,
-        message:
-          "Purchase form submitted — we have emailed you the confirmation. Please do not cancel your order.",
-        entry,
-      });
-    } catch (error) {
-      console.error("Purchase form submit failed:", error.message);
-      res.status(500).json({ success: false, message: "Could not submit the purchase form" });
-    }
-  }
-);
-
-// Customer: submit the refund form (delivery + review proof) after
-// receiving the Tryout product. Stores proofs and emails the member a
-// confirmation + notifies the owner for verification.
-app.post(
-  "/api/tryouts/refund-form",
-  requireUser,
-  (req, res, next) => {
-    refundUpload.fields([
-      { name: "deliveryScreenshot", maxCount: 1 },
-      { name: "reviewFiles", maxCount: 5 },
-    ])(req, res, (err) => {
-      if (err) {
-        return res.status(400).json({
-          success: false,
-          message:
-            err.code === "LIMIT_FILE_SIZE"
-              ? "One of the files is too large (max 10MB each). Please compress and try again."
-              : err.code === "LIMIT_UNEXPECTED_FILE"
-              ? "Too many files — you can attach 1 delivery screenshot and up to 5 review files."
-              : "Could not read the uploaded files. Please try again.",
-        });
-      }
-      next();
-    });
-  },
-  async (req, res) => {
-    try {
-      const application = await TryoutApplication.findOne({
-        user: req.user.userId,
-        status: "approved",
-      });
-
-      if (!application) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Only approved Tryout members can submit the refund form",
-        });
-      }
-
-      const orderId = String(req.body?.orderId || "").trim();
-      const orderAmount = Math.max(0, Number(req.body?.orderAmount) || 0);
-      const otherInfo = String(req.body?.otherInfo || "").trim();
-      const deliveryFile = req.files?.deliveryScreenshot?.[0];
-      const reviewFiles = req.files?.reviewFiles || [];
-
-      if (!orderId) {
-        return res.status(400).json({
-          success: false,
-          message: "Please enter your order id",
-        });
-      }
-      if (orderAmount <= 0) {
-        return res.status(400).json({
-          success: false,
-          message: "Please enter the order amount",
-        });
-      }
-      if (!deliveryFile) {
-        return res.status(400).json({
-          success: false,
-          message: "Please attach the delivery screenshot",
-        });
-      }
-      if (reviewFiles.length === 0) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Please attach at least one review file (product, 5 star rating, written content)",
-        });
-      }
-
-      let deliveryScreenshotUrl = "";
-
-      try {
-        deliveryScreenshotUrl = await uploadBufferToCloudinary(
-          deliveryFile.buffer
-        );
-      } catch {
-        return res.status(500).json({
-          success: false,
-          message:
-            "Your delivery screenshot could not be saved. Please try again in a moment.",
-        });
-      }
-
-      const reviewUrls = [];
-
-      for (const file of reviewFiles) {
-        try {
-          reviewUrls.push(await uploadBufferToCloudinary(file.buffer));
-        } catch {
-          // Best effort — one failed review file should not block the rest.
-        }
-      }
-
-      // The review proof is required — never accept a submission where none
-      // of the review files could be stored.
-      if (reviewUrls.length === 0) {
-        return res.status(500).json({
-          success: false,
-          message:
-            "Your review files could not be saved. Please try again in a moment.",
-        });
-      }
-
-      const entry = {
-        orderId,
-        orderAmount,
-        deliveryScreenshotUrl,
-        reviewFiles: reviewUrls,
-        otherInfo,
-        status: "submitted",
-        submittedAt: new Date(),
-      };
-
-      application.refundForms.push(entry);
-      await application.save();
-
-      const memberEmail = String(application.email || "").trim();
-
-      // Confirmation email to the member.
-      if (memberEmail && process.env.EMAIL_USER) {
-        if (process.env.ORDER_STATUS_EMAIL_DRY_RUN === "true") {
-          console.log("[dry-run] Refund form confirmation email → " + memberEmail);
-        } else {
-          transporter
-            .sendMail({
-              from: '"DEALROOT Beauty" <' + process.env.EMAIL_USER + ">",
-              to: memberEmail,
-              subject: "✅ Refund form submitted — Dealroot Tryouts",
-              html:
-                '<div style="font-family:Arial;padding:30px;max-width:620px;margin:auto">' +
-                '<h2 style="color:#1f2a4d;margin:0 0 6px">Your refund form has been filled ✅</h2>' +
-                '<p style="color:#374151;line-height:1.7;margin:0 0 16px">Hi ' +
-                xmlEscape(application.name || "there") +
-                ',<br/>Thank you for submitting your delivery and review proof for order <b>' +
-                xmlEscape(orderId) +
-                '</b>. <b>Please do not cancel your order</b> — keep it active while our team verifies it.' +
-                "</p>" +
-                '<div style="background:#f4f1ff;border:1px solid #e4defc;border-radius:12px;padding:16px 18px;font-size:14px;line-height:1.8">' +
-                '<b>What happens next:</b><br/>Our team will verify your delivery and review, then process your refund / cashback shortly. Wait for the verification email.' +
-                "</div>" +
-                '<p style="margin-top:18px;color:#6b7280;font-size:13px">You can track your submissions in your Tryout dashboard.</p>' +
-                "</div>",
-            })
-            .catch((err) =>
-              console.error("Refund form member email failed:", err.message)
-            );
-        }
-      }
-
-      // Notify the owner with full details + proof links.
-      if (process.env.ADMIN_EMAIL && process.env.EMAIL_USER) {
-        if (process.env.ORDER_STATUS_EMAIL_DRY_RUN === "true") {
-          console.log("[dry-run] Refund form owner email → " + process.env.ADMIN_EMAIL);
-        } else {
-          const reviewLinks = reviewUrls
-            .map(
-              (url, i) =>
-                '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Review file ' +
-                (i + 1) +
-                '</td><td style="padding:8px 10px"><a href="' +
-                xmlEscape(url) +
-                '" style="color:#246bfd">View file</a></td></tr>'
-            )
-            .join("");
-
-          transporter
-            .sendMail({
-              from: '"DEALROOT Beauty" <' + process.env.EMAIL_USER + ">",
-              to: process.env.ADMIN_EMAIL,
-              subject:
-                "📦 Tryout Refund Form — " +
-                String(application.name || "Member"),
-              html:
-                '<div style="font-family:Arial;padding:30px;max-width:620px;margin:auto">' +
-                '<h2 style="color:#1f2a4d;margin:0 0 6px">New Tryout refund form 📦</h2>' +
-                '<p style="color:#6b7280;margin:0 0 18px">A Tryout member submitted their delivery + review proof.</p>' +
-                '<table style="width:100%;border-collapse:collapse;font-size:14px;line-height:1.6">' +
-                '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold;width:180px">Member</td><td style="padding:8px 10px">' +
-                xmlEscape(application.name || "-") +
-                "</td></tr>" +
-                '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Email</td><td style="padding:8px 10px">' +
-                xmlEscape(memberEmail || "-") +
-                "</td></tr>" +
-                '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Order id</td><td style="padding:8px 10px">' +
-                xmlEscape(orderId || "-") +
-                "</td></tr>" +
-                '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Order amount</td><td style="padding:8px 10px">₹' +
-                (orderAmount || 0) +
-                "</td></tr>" +
-                (deliveryScreenshotUrl
-                  ? '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Delivery screenshot</td><td style="padding:8px 10px"><a href="' +
-                    xmlEscape(deliveryScreenshotUrl) +
-                    '" style="color:#246bfd">View screenshot</a></td></tr>'
-                  : "") +
-                reviewLinks +
-                '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Other info</td><td style="padding:8px 10px">' +
-                xmlEscape(otherInfo || "-") +
-                "</td></tr>" +
-                "</table>" +
-                '<p style="margin-top:18px;color:#6b7280;font-size:13px">Verify this delivery and review, then process the refund / cashback from the admin panel → Tryouts tab.</p>' +
-                "</div>",
-            })
-            .catch((err) =>
-              console.error("Refund form owner email failed:", err.message)
-            );
-        }
-      }
-
-      res.status(201).json({
-        success: true,
-        message:
-          "Refund form submitted — we have emailed you the confirmation. Please do not cancel your order.",
-        entry,
-      });
-    } catch (error) {
-      console.error("Refund form submit failed:", error.message);
-      res.status(500).json({ success: false, message: "Could not submit the refund form" });
-    }
-  }
-);
-
-// Customer: my Tryout application / status.
-app.get("/api/tryouts/my", requireUser, async (req, res) => {
-  try {
-    const application = await TryoutApplication.findOne({
-      user: req.user.userId,
-    }).sort({ requestedAt: -1 });
-
-    // Only count orders that contain Tryout-exclusive products — normal
-    // store orders should not show up in the Tryout dashboard.
-    const totalOrders = await Order.countDocuments({
-      user: req.user.userId,
-      tryoutOrder: true,
-    });
-
-    res.json({
-      success: true,
-      application,
-      approved: application?.status === "approved",
-      dashboard: application
-        ? {
-            totalOrders,
-            cashbackAvailable: application.cashbackAvailable || 0,
-            cashbackPending: application.cashbackPending || 0,
-            cashbackReceived: application.cashbackReceived || 0,
-            history: (application.cashbackHistory || []).slice().reverse(),
-            purchaseForms: (application.purchaseForms || [])
-              .slice()
-              .reverse(),
-            refundForms: (application.refundForms || [])
-              .slice()
-              .reverse(),
-            withdrawals: (application.withdrawals || [])
-              .slice()
-              .reverse(),
-          }
-        : null,
-    });
-  } catch {
-    res.status(500).json({ success: false, message: "Could not load your application" });
-  }
-});
-
-// Admin: all Tryout applications.
-app.get("/api/tryouts/applications", requireAdmin, async (req, res) => {
-  try {
-    const applications = await TryoutApplication.find()
-      .sort({ requestedAt: -1 })
-      .limit(200);
-    res.json({ success: true, applications });
-  } catch {
-    res.status(500).json({ success: false, message: "Could not load applications" });
-  }
-});
-
-// Admin: approve a Tryout application.
-app.post("/api/tryouts/:id/approve", requireAdmin, async (req, res) => {
-  try {
-    const application = await TryoutApplication.findById(req.params.id);
-    if (!application) {
-      return res.status(404).json({ success: false, message: "Application not found" });
-    }
-    if (application.status === "approved") {
-      return res.status(400).json({ success: false, message: "Already approved" });
-    }
-
-    application.status = "approved";
-    application.processedAt = new Date();
-    await application.save();
-
-    res.json({ success: true, message: "Application approved — member can now shop Tryout deals", application });
-  } catch {
-    res.status(500).json({ success: false, message: "Could not approve application" });
-  }
-});
-
-// Admin: reject a Tryout application.
-app.post("/api/tryouts/:id/reject", requireAdmin, async (req, res) => {
-  try {
-    const application = await TryoutApplication.findById(req.params.id);
-    if (!application) {
-      return res.status(404).json({ success: false, message: "Application not found" });
-    }
-
-    application.status = "rejected";
-    application.processedAt = new Date();
-    await application.save();
-
-    res.json({ success: true, message: "Application rejected", application });
-  } catch {
-    res.status(500).json({ success: false, message: "Could not reject application" });
-  }
-});
-
-// Admin: disqualify an approved Tryout member (revoke membership).
-app.post("/api/tryouts/:id/disqualify", requireAdmin, async (req, res) => {
-  try {
-    const application = await TryoutApplication.findById(req.params.id);
-    if (!application) {
-      return res.status(404).json({ success: false, message: "Application not found" });
-    }
-    if (application.status !== "approved") {
-      return res.status(400).json({ success: false, message: "Only approved members can be disqualified" });
-    }
-
-    application.status = "disqualified";
-    application.processedAt = new Date();
-    await application.save();
-
-    res.json({ success: true, message: "Member disqualified — Tryout deals are locked again", application });
-  } catch {
-    res.status(500).json({ success: false, message: "Could not disqualify member" });
-  }
-});
-
-// Admin: add cashback for an approved Tryout member (available balance).
-app.post("/api/tryouts/:id/cashback", requireAdmin, async (req, res) => {
-  try {
-    const application = await TryoutApplication.findById(req.params.id);
-    if (!application) {
-      return res.status(404).json({ success: false, message: "Application not found" });
-    }
-    if (application.status !== "approved") {
-      return res.status(400).json({ success: false, message: "Only approved members can receive cashback" });
-    }
-
-    const amount = Math.max(0, Number(req.body?.amount) || 0);
-    const note = String(req.body?.note || "").trim();
-    const productName = String(req.body?.productName || "").trim();
-    const trackId = String(req.body?.trackId || "").trim();
-
-    if (amount <= 0) {
-      return res.status(400).json({ success: false, message: "Please enter a valid cashback amount" });
-    }
-
-    application.cashbackHistory.push({
-      amount,
-      productName,
-      trackId,
-      note,
-      status: "pending",
-    });
-    application.cashbackPending = (application.cashbackPending || 0) + amount;
-    await application.save();
-
-    // Notify the member that cashback was added to their account.
-    if (application.email && process.env.EMAIL_USER) {
-      if (process.env.ORDER_STATUS_EMAIL_DRY_RUN === "true") {
-        console.log("[dry-run] Tryout cashback email → " + application.email);
-      } else {
-        transporter
-          .sendMail({
-            from: '"DEALROOT Beauty" <' + process.env.EMAIL_USER + ">",
-            to: application.email,
-            subject: "🎉 Cashback added to your account — Dealroot Tryouts",
-            html:
-              '<div style="font-family:Arial;padding:30px;max-width:620px;margin:auto">' +
-              '<h2 style="color:#1f2a4d;margin:0 0 6px">Cashback added to your account! 🎉</h2>' +
-              '<p style="color:#6b7280;margin:0 0 18px">Hi ' +
-              xmlEscape(application.name || "there") +
-              ", we have added cashback to your Dealroot Tryout account.</p>" +
-              '<table style="width:100%;border-collapse:collapse;font-size:14px;line-height:1.6">' +
-              '<tr><td style="padding:8px 10px;background:#f0fdf4;font-weight:bold;width:160px">Cashback added</td><td style="padding:8px 10px">₹' +
-              amount +
-              "</td></tr>" +
-              (note
-                ? '<tr><td style="padding:8px 10px;background:#f0fdf4;font-weight:bold">Note</td><td style="padding:8px 10px">' +
-                  xmlEscape(note) +
-                  "</td></tr>"
-                : "") +
-              (productName
-                ? '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Product</td><td style="padding:8px 10px">' +
-                  xmlEscape(productName) +
-                  "</td></tr>"
-                : "") +
-              (trackId
-                ? '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Track ID</td><td style="padding:8px 10px">' +
-                  xmlEscape(trackId) +
-                  "</td></tr>"
-                : "") +
-              '<tr><td style="padding:8px 10px;background:#fff7ed;font-weight:bold">Status</td><td style="padding:8px 10px;color:#d97706">⏳ Pending — waiting for admin confirmation</td></tr>' +
-              '<tr><td style="padding:8px 10px;background:#f0fdf4;font-weight:bold">Total pending</td><td style="padding:8px 10px">₹' +
-              (application.cashbackPending || 0) +
-              "</td></tr>" +
-              "</table>" +
-              '<p style="margin-top:18px;color:#6b7280;font-size:13px">You can view your full cashback summary and history in your Tryout dashboard on dealroot.store.</p>' +
-              "</div>",
-          })
-          .catch((err) =>
-            console.error("Tryout cashback member email failed:", err.message)
-          );
-      }
-    }
-
-    res.json({
-      success: true,
-      message: "Cashback added — member can now see it in their dashboard",
-      application,
-    });
-  } catch (error) {
-    console.error("Tryout cashback add failed:", error.message);
-    res.status(500).json({ success: false, message: "Could not add cashback" });
-  }
-});
-
-// Admin: confirm a cashback entry from pending to available. "received" is
-// deliberately not allowed here — a member's cashback only becomes received
-// through PATCH /api/tryouts/withdraw/:entryId, i.e. the member requests a
-// withdrawal and the admin approves it. That's the only path with a real
-// request/approval trail and the available-balance check; letting admin
-// jump an entry straight to "received" bypassed both.
-app.patch("/api/tryouts/cashback/:entryId", requireAdmin, async (req, res) => {
-  try {
-    const nextStatus = String(req.body?.status || "");
-    if (!["available", "pending"].includes(nextStatus)) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Invalid cashback status — cashback can only be marked received by approving a withdrawal request.",
-      });
-    }
-
-    const application = await TryoutApplication.findOne({
-      "cashbackHistory._id": req.params.entryId,
-    });
-    if (!application) {
-      return res.status(404).json({ success: false, message: "Cashback entry not found" });
-    }
-
-    const entry = application.cashbackHistory.id(req.params.entryId);
-    if (!entry) {
-      return res.status(404).json({ success: false, message: "Cashback entry not found" });
-    }
-
-    // Rebalance the totals from the current entry status to the new one.
-    const from = entry.status;
-    if (from !== nextStatus) {
-      const delta = entry.amount || 0;
-      const subtract = (key) => {
-        application[key] = Math.max(0, (application[key] || 0) - delta);
-      };
-      const add = (key) => {
-        application[key] = (application[key] || 0) + delta;
-      };
-
-      subtract("cashback" + from.charAt(0).toUpperCase() + from.slice(1));
-      add("cashback" + nextStatus.charAt(0).toUpperCase() + nextStatus.slice(1));
-
-      entry.status = nextStatus;
-      await application.save();
-    }
-
-    res.json({
-      success: true,
-      message: "Cashback status updated",
-      application,
-    });
-  } catch (error) {
-    console.error("Tryout cashback update failed:", error.message);
-    res.status(500).json({ success: false, message: "Could not update cashback" });
-  }
-});
-
-// Admin: verify or reject a member's purchase-form submission (screenshot
-// proof). After verifying, the admin adds cashback from the same screen.
-app.patch(
-  "/api/tryouts/:id/purchase-form/:formId",
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const nextStatus = String(req.body?.status || "").trim();
-      if (!["verified", "rejected"].includes(nextStatus)) {
-        return res
-          .status(400)
-          .json({ success: false, message: "Invalid purchase form status" });
-      }
-
-      const application = await TryoutApplication.findById(req.params.id);
-      if (!application) {
-        return res
-          .status(404)
-          .json({ success: false, message: "Application not found" });
-      }
-
-      const form = (application.purchaseForms || []).id(req.params.formId);
-      if (!form) {
-        return res
-          .status(404)
-          .json({ success: false, message: "Purchase form not found" });
-      }
-
-      const rejectionReason = String(
-        req.body?.rejectionReason || req.body?.reason || ""
-      ).trim();
-
-      if (nextStatus === "rejected" && !rejectionReason) {
-        return res.status(400).json({
-          success: false,
-          message: "Please write a reason for rejecting this purchase form",
-        });
-      }
-
-      form.status = nextStatus;
-      form.rejectionReason = nextStatus === "rejected" ? rejectionReason : "";
-      form.reviewedAt = new Date();
-      await application.save();
-
-      // Tell the member why their submission was rejected — and what to fix.
-      const memberEmail = String(application.email || "").trim();
-      if (nextStatus === "rejected" && memberEmail && process.env.EMAIL_USER) {
-        if (process.env.ORDER_STATUS_EMAIL_DRY_RUN === "true") {
-          console.log(
-            "[dry-run] Purchase form rejection email → " + memberEmail
-          );
-        } else {
-          transporter
-            .sendMail({
-              from: '"DEALROOT Beauty" <' + process.env.EMAIL_USER + ">",
-              to: memberEmail,
-              subject: "❌ Purchase form rejected — Dealroot Tryouts",
-              html:
-                '<div style="font-family:Arial;padding:30px;max-width:620px;margin:auto">' +
-                '<h2 style="color:#b91c1c;margin:0 0 6px">Your purchase form was rejected</h2>' +
-                '<p style="color:#374151;line-height:1.7;margin:0 0 16px">Hi ' +
-                xmlEscape(application.name || "there") +
-                ',<br/>We could not verify your recent Tryout purchase submission.' +
-                "</p>" +
-                '<div style="background:#fff1f2;border:1px solid #fecdd3;border-radius:12px;padding:16px 18px;font-size:14px;line-height:1.8;color:#7f1d1d">' +
-                '<b>Reason from our team:</b><br/>' +
-                xmlEscape(rejectionReason).replace(/\n/g, "<br/>") +
-                "</div>" +
-                '<div style="background:#f4f1ff;border:1px solid #e4defc;border-radius:12px;padding:16px 18px;font-size:14px;line-height:1.8;margin-top:14px">' +
-                "<b>What you can do:</b><br/>Order id: " +
-                xmlEscape(form.orderId || "-") +
-                "<br/>Fix the issue above and submit the purchase form again from your Tryout dashboard." +
-                "</div>" +
-                '<p style="margin-top:18px;color:#6b7280;font-size:13px">Need help? Reply to this email and our team will assist you.</p>' +
-                "</div>",
-            })
-            .catch((err) =>
-              console.error("Purchase form rejection email failed:", err.message)
-            );
-        }
-      }
-
-      res.json({
-        success: true,
-        message:
-          "Purchase form " +
-          (nextStatus === "verified" ? "verified" : "rejected"),
-        application,
-      });
-    } catch (error) {
-      console.error("Purchase form status update failed:", error.message);
-      res
-        .status(500)
-        .json({ success: false, message: "Could not update the purchase form" });
-    }
-  }
-);
-
-// Admin: verify or reject a member's refund-form submission.
-app.patch(
-  "/api/tryouts/:id/refund-form/:formId",
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const nextStatus = String(req.body?.status || "").trim();
-      if (!["verified", "rejected"].includes(nextStatus)) {
-        return res
-          .status(400)
-          .json({ success: false, message: "Invalid refund form status" });
-      }
-
-      const application = await TryoutApplication.findById(req.params.id);
-      if (!application) {
-        return res
-          .status(404)
-          .json({ success: false, message: "Application not found" });
-      }
-
-      const form = (application.refundForms || []).id(req.params.formId);
-      if (!form) {
-        return res
-          .status(404)
-          .json({ success: false, message: "Refund form not found" });
-      }
-
-      form.status = nextStatus;
-      await application.save();
-
-      res.json({
-        success: true,
-        message:
-          "Refund form " +
-          (nextStatus === "verified" ? "verified" : "rejected"),
-        application,
-      });
-    } catch (error) {
-      console.error("Refund form status update failed:", error.message);
-      res
-        .status(500)
-        .json({ success: false, message: "Could not update the refund form" });
-    }
-  }
-);
-
-// Customer: request a cashback withdrawal to their UPI. Moves the amount
-// from available → pending so it cannot be withdrawn twice, notifies the
-// owner with the member's UPI details, and confirms to the member.
-app.post("/api/tryouts/withdraw", requireUser, async (req, res) => {
-  try {
-    const application = await TryoutApplication.findOne({
-      user: req.user.userId,
-      status: "approved",
-    });
-
-    if (!application) {
-      return res.status(400).json({
-        success: false,
-        message: "Only approved Tryout members can request a withdrawal",
-      });
-    }
-
-    const amount = Math.floor(Number(req.body?.amount) || 0);
-    const upiId = String(req.body?.upiId || "").trim();
-
-    if (amount <= 0) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Please enter a valid amount" });
-    }
-    if (amount > (application.cashbackAvailable || 0)) {
-      return res.status(400).json({
-        success: false,
-        message: "Amount exceeds your available cashback",
-      });
-    }
-    if (!upiId || !upiId.includes("@")) {
-      return res.status(400).json({
-        success: false,
-        message: "Please enter a valid UPI ID (e.g. yourname@upi)",
-      });
-    }
-
-    application.cashbackAvailable =
-      (application.cashbackAvailable || 0) - amount;
-    application.cashbackPending =
-      (application.cashbackPending || 0) + amount;
-    application.withdrawals.push({
-      referenceId:
-        "REQ_" +
-        Array.from(crypto.randomBytes(6))
-          .map((byte) =>
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[byte % 36]
-          )
-          .join(""),
-      amount,
-      upiId,
-      status: "requested",
-      requestedAt: new Date(),
-    });
-
-    await application.save();
-
-    const memberEmail = String(application.email || "").trim();
-
-    // Confirm to the member.
-    if (memberEmail && process.env.EMAIL_USER) {
-      if (process.env.ORDER_STATUS_EMAIL_DRY_RUN === "true") {
-        console.log("[dry-run] Withdrawal member email → " + memberEmail);
-      } else {
-        transporter
-          .sendMail({
-            from: '"DEALROOT Beauty" <' + process.env.EMAIL_USER + ">",
-            to: memberEmail,
-            subject: "💳 Withdrawal request received — Dealroot Tryouts",
-            html:
-              '<div style="font-family:Arial;padding:30px;max-width:620px;margin:auto">' +
-              '<h2 style="color:#1f2a4d;margin:0 0 6px">Withdrawal request received 💳</h2>' +
-              '<p style="color:#374151;line-height:1.7;margin:0 0 16px">Hi ' +
-              xmlEscape(application.name || "there") +
-              ", we have received your cashback withdrawal request.</p>" +
-              '<table style="width:100%;border-collapse:collapse;font-size:14px;line-height:1.6">' +
-              '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold;width:160px">Reference</td><td style="padding:8px 10px">' +
-              xmlEscape(
-                (application.withdrawals[application.withdrawals.length - 1] || {})
-                  .referenceId || "-"
-              ) +
-              "</td></tr>" +
-              '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Amount</td><td style="padding:8px 10px">₹' +
-              amount +
-              "</td></tr>" +
-              '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">UPI ID</td><td style="padding:8px 10px">' +
-              xmlEscape(upiId) +
-              "</td></tr>" +
-              '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Status</td><td style="padding:8px 10px">Requested</td></tr>' +
-              "</table>" +
-              '<p style="margin-top:18px;color:#6b7280;font-size:13px">Our team will process your payout to the above UPI ID shortly. You can track it in your Tryout dashboard.</p>' +
-              "</div>",
-          })
-          .catch((err) =>
-            console.error("Withdrawal member email failed:", err.message)
-          );
-      }
-    }
-
-    // Notify the owner so they can pay out to the UPI.
-    if (process.env.ADMIN_EMAIL && process.env.EMAIL_USER) {
-      if (process.env.ORDER_STATUS_EMAIL_DRY_RUN === "true") {
-        console.log("[dry-run] Withdrawal owner email → " + process.env.ADMIN_EMAIL);
-      } else {
-        transporter
-          .sendMail({
-            from: '"DEALROOT Beauty" <' + process.env.EMAIL_USER + ">",
-            to: process.env.ADMIN_EMAIL,
-            subject:
-              "💳 Tryout Withdrawal Request — " +
-              String(application.name || "Member"),
-            html:
-              '<div style="font-family:Arial;padding:30px;max-width:620px;margin:auto">' +
-              '<h2 style="color:#1f2a4d;margin:0 0 6px">New Tryout withdrawal request 💳</h2>' +
-              '<p style="color:#6b7280;margin:0 0 18px">A Tryout member wants to withdraw their cashback.</p>' +
-              '<table style="width:100%;border-collapse:collapse;font-size:14px;line-height:1.6">' +
-              '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold;width:180px">Member</td><td style="padding:8px 10px">' +
-              xmlEscape(application.name || "-") +
-              "</td></tr>" +
-              '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Email</td><td style="padding:8px 10px">' +
-              xmlEscape(memberEmail || "-") +
-              "</td></tr>" +
-              '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">Amount</td><td style="padding:8px 10px">₹' +
-              amount +
-              "</td></tr>" +
-              '<tr><td style="padding:8px 10px;background:#f4f1ff;font-weight:bold">UPI ID</td><td style="padding:8px 10px">' +
-              xmlEscape(upiId) +
-              "</td></tr>" +
-              "</table>" +
-              '<p style="margin-top:18px;color:#6b7280;font-size:13px">Pay this amount to the UPI above, then mark it paid from the admin panel → Tryouts tab.</p>' +
-              "</div>",
-          })
-          .catch((err) =>
-            console.error("Withdrawal owner email failed:", err.message)
-          );
-      }
-    }
-
-    res.status(201).json({
-      success: true,
-      message:
-        "Withdrawal request submitted — our team will pay to your UPI shortly",
-      application,
-    });
-  } catch (error) {
-    console.error("Withdrawal request failed:", error.message);
-    res
-      .status(500)
-      .json({ success: false, message: "Could not submit the withdrawal request" });
-  }
-});
-
-// Admin: mark a withdrawal request as paid or rejected (rebalances totals).
-app.patch(
-  "/api/tryouts/withdraw/:entryId",
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const nextStatus = String(req.body?.status || "").trim();
-      if (!["paid", "rejected"].includes(nextStatus)) {
-        return res
-          .status(400)
-          .json({ success: false, message: "Invalid withdrawal status" });
-      }
-
-      const application = await TryoutApplication.findOne({
-        "withdrawals._id": req.params.entryId,
-      });
-      if (!application) {
-        return res
-          .status(404)
-          .json({ success: false, message: "Withdrawal not found" });
-      }
-
-      const entry = application.withdrawals.id(req.params.entryId);
-      if (!entry || entry.status !== "requested") {
-        return res
-          .status(400)
-          .json({ success: false, message: "Withdrawal is already processed" });
-      }
-
-      const delta = entry.amount || 0;
-
-      // pending is released when paid; returned to available when rejected.
-      application.cashbackPending = Math.max(
-        0,
-        (application.cashbackPending || 0) - delta
-      );
-
-      if (nextStatus === "paid") {
-        // The payout completed — count it as cashback the member received.
-        application.cashbackReceived =
-          (application.cashbackReceived || 0) + delta;
-      } else {
-        application.cashbackAvailable =
-          (application.cashbackAvailable || 0) + delta;
-      }
-
-      entry.status = nextStatus;
-      entry.processedAt = new Date();
-      await application.save();
-
-      // Notify the member that their withdrawal was processed.
-      const memberEmail = String(application.email || "").trim();
-
-      if (memberEmail && process.env.EMAIL_USER) {
-        if (process.env.ORDER_STATUS_EMAIL_DRY_RUN === "true") {
-          console.log("[dry-run] Withdrawal processed email → " + memberEmail);
-        } else {
-          transporter
-            .sendMail({
-              from: '"DEALROOT Beauty" <' + process.env.EMAIL_USER + ">",
-              to: memberEmail,
-              subject:
-                nextStatus === "paid"
-                  ? "✅ Withdrawal paid — Dealroot Tryouts"
-                  : "ℹ️ Withdrawal rejected — Dealroot Tryouts",
-              html:
-                '<div style="font-family:Arial;padding:30px;max-width:620px;margin:auto">' +
-                (nextStatus === "paid"
-                  ? '<h2 style="color:#1f2a4d;margin:0 0 6px">Your withdrawal has been paid ✅</h2>'
-                  : '<h2 style="color:#1f2a4d;margin:0 0 6px">Your withdrawal was rejected</h2>') +
-                '<p style="color:#374151;line-height:1.7;margin:0 0 16px">Hi ' +
-                xmlEscape(application.name || "there") +
-                ", your withdrawal request of <b>₹" +
-                delta +
-                "</b> has been " +
-                (nextStatus === "paid"
-                  ? "paid to " + xmlEscape(entry.upiId || "your UPI") + "."
-                  : "rejected. The amount has been returned to your available cashback.") +
-                "</p>" +
-                (nextStatus === "rejected"
-                  ? '<p style="color:#6b7280;font-size:13px">If you think this is a mistake, contact our team or submit a new withdrawal request.</p>'
-                  : '<p style="color:#6b7280;font-size:13px">Thank you for being a Dealroot Tryout member! You can view your updated balance in your dashboard.</p>') +
-                "</div>",
-            })
-            .catch((err) =>
-              console.error("Withdrawal processed email failed:", err.message)
-            );
-        }
-      }
-
-      res.json({
-        success: true,
-        message: "Withdrawal " + nextStatus,
-        application,
-      });
-    } catch (error) {
-      console.error("Withdrawal status update failed:", error.message);
-      res
-        .status(500)
-        .json({ success: false, message: "Could not update the withdrawal" });
-    }
-  }
-);
 
 // One-time (per boot) backfill: assigns a personal referral code to every
 // existing account that doesn't have one yet — new signups already get one
