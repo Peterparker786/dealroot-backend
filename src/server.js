@@ -4178,6 +4178,9 @@ app.get("/api/products", async (req, res) => {
       }));
     }
 
+    // Legacy data: products that belonged to the retired Tryout program are
+    // still hidden from shoppers, while the admin panel can list them so they
+    // can be edited or deleted.
     let viewer = null;
     const bearer = readBearerToken(req);
     if (bearer) {
@@ -4186,6 +4189,10 @@ app.get("/api/products", async (req, res) => {
       } catch {
         viewer = null;
       }
+    }
+
+    if (viewer?.role !== "admin") {
+      filter.tryoutOnly = { $ne: true };
     }
 
     const products = await Product.find(filter)
