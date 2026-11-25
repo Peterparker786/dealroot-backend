@@ -4026,6 +4026,43 @@ app.get("/api/auth/orders", requireUser, async (req, res) => {
   }
 });
 
+// The customer's own wallet: current balance plus the ledger behind it, so
+// "where did this money come from" is answerable without asking support.
+app.get("/api/auth/wallet", requireUser, async (req, res) => {
+  try {
+    const account = await User.findById(req.user.userId)
+      .select("walletBalance")
+      .lean();
+
+    if (!account) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Account not found" });
+    }
+
+    // buyerName (another customer's name, on referral entries) is deliberately
+    // not selected — it is not this customer's information.
+    const transactions = await WalletTransaction.find({
+      user: req.user.userId,
+    })
+      .select("type status amount orderNumber couponCode note createdAt approvedAt")
+      .sort({ createdAt: -1 })
+      .limit(100)
+      .lean();
+
+    res.json({
+      success: true,
+      balance: Number(account.walletBalance) || 0,
+      transactions,
+    });
+  } catch (error) {
+    console.error("Customer wallet could not be loaded:", error.message);
+    res
+      .status(500)
+      .json({ success: false, message: "Could not load your wallet" });
+  }
+});
+
 // Pincode → city/state autofill (proxied server-side so the browser never
 // calls the third-party API directly and we can normalise the response).
 // Uses India Post's public pincode API — no key needed.
